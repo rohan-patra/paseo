@@ -135,6 +135,34 @@ describe("OmpSubagentCardTracker", () => {
     expect(emitted).toEqual([PARENT_TOOL_CALL_ID, PARENT_TOOL_CALL_ID]);
   });
 
+  test("replaces stale tool activity with a thinking status while the child reasons", () => {
+    const scheduler = new ManualScheduler();
+    const emitted: string[] = [];
+    const tracker = new OmpSubagentCardTracker({
+      scheduler,
+      emitToolCall: (toolCallId) => {
+        emitted.push(toolCallId);
+        return true;
+      },
+    });
+    tracker.handleLifecycle(LIFECYCLE);
+    tracker.handleProgress(PROGRESS[0]!);
+    scheduler.advance(600);
+    tracker.handleEvent({
+      id: "EchoSubagent",
+      event: {
+        type: "message_update",
+        message: { role: "assistant", content: [] },
+        assistantMessageEvent: { type: "thinking_start" },
+      },
+    });
+
+    expect(emitted).toEqual([PARENT_TOOL_CALL_ID, PARENT_TOOL_CALL_ID]);
+    expect(tracker.detailFor(PARENT_TOOL_CALL_ID, { type: "sub_agent", log: "" }).log).toBe(
+      "EchoSubagent started\n[bash] echo subagent-hi\nThinking...",
+    );
+  });
+
   test("aggregates batch progress streams into one index-prefixed log", () => {
     const scheduler = new ManualScheduler();
     const emitted: string[] = [];

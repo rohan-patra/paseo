@@ -1668,6 +1668,9 @@ export class OmpAgentSession implements AgentSession {
     }
     if (event.type === "subagent_event") {
       const payload = (event as Extract<OmpRuntimeEvent, { type: "subagent_event" }>).payload;
+      this.subagentCardTracker.handleEvent(payload, (toolCallId) =>
+        this.emitActiveToolCall(toolCallId),
+      );
       for (const mapped of this.subagentIndex.handleEvent(this.runtimeSession, payload)) {
         this.emit(mapped);
       }

@@ -1,5 +1,9 @@
 import type { ToolCallDetail } from "../../agent-sdk-types.js";
-import type { OmpSubagentLifecyclePayload, OmpSubagentProgressPayload } from "./rpc-types.js";
+import type {
+  OmpSubagentEventPayload,
+  OmpSubagentLifecyclePayload,
+  OmpSubagentProgressPayload,
+} from "./rpc-types.js";
 
 export interface OmpSubagentCardTimer {
   readonly token: unknown;
@@ -22,11 +26,13 @@ interface OmpSubagentLogLine {
 }
 
 interface OmpSubagentCardItem {
+  id?: string;
   index: number;
   description?: string;
   agent?: string;
   status?: "pending" | "running" | "completed" | "failed" | "aborted";
   childSessionId?: string;
+  thinking: boolean;
   lines: OmpSubagentLogLine[];
   lineKeys: Set<string>;
 }
@@ -73,6 +79,7 @@ export class OmpSubagentCardTracker {
     }
     this.stateFor(parentToolCallId).emitToolCall = emitToolCall;
     const item = this.upsertItem(parentToolCallId, {
+      id: payload.id,
       index: payload.index,
       agent: payload.agent,
       description: payload.description,
@@ -87,6 +94,35 @@ export class OmpSubagentCardTracker {
     this.requestEmit(parentToolCallId);
   }
 
+  handleEvent(
+    payload: OmpSubagentEventPayload,
+    emitToolCall: (toolCallId: string) => boolean = this.emitToolCall,
+  ): void {
+    const event = payload.event;
+    const eventType =
+      event.type === "message_update" ? event.assistantMessageEvent.type : undefined;
+    const thinkingEvent =
+      eventType === "thinking_start" ||
+      eventType === "thinking_delta" ||
+      eventType === "thinking_end";
+    if (!thinkingEvent && event.type !== "tool_execution_start") {
+      return;
+    }
+    for (const [parentToolCallId, state] of this.states) {
+      const item = [...state.items.values()].find((candidate) => candidate.id === payload.id);
+      if (!item) {
+        continue;
+      }
+      state.emitToolCall = emitToolCall;
+      const thinking = thinkingEvent && eventType !== "thinking_end";
+      if (item.thinking === thinking) {
+        continue;
+      }
+      item.thinking = thinking;
+      this.requestEmit(parentToolCallId);
+    }
+  }
+
   handleProgress(
     payload: OmpSubagentProgressPayload,
     emitToolCall: (toolCallId: string) => boolean = this.emitToolCall,
@@ -97,6 +133,7 @@ export class OmpSubagentCardTracker {
     }
     this.stateFor(parentToolCallId).emitToolCall = emitToolCall;
     const item = this.upsertItem(parentToolCallId, {
+      id: payload.progress.id,
       index: payload.index,
       agent: payload.agent,
       description: payload.progress.description,
@@ -104,6 +141,9 @@ export class OmpSubagentCardTracker {
       childSessionId: payload.sessionFile,
     });
 
+    if (payload.progress.currentTool) {
+      item.thinking = false;
+    }
     const currentToolLine = summarizeTool(readRecord(payload.progress.currentTool));
     if (currentToolLine) {
       this.appendLine(item, `current:${currentToolLine.key}`, currentToolLine.text);
@@ -184,6 +224,7 @@ export class OmpSubagentCardTracker {
   private upsertItem(
     parentToolCallId: string,
     input: {
+      id?: string;
       index: number;
       agent?: string;
       status?: "pending" | "running" | "completed" | "failed" | "aborted";
@@ -194,6 +235,7 @@ export class OmpSubagentCardTracker {
     const state = this.stateFor(parentToolCallId);
     const existing = state.items.get(input.index);
     if (existing) {
+      existing.id = readTrimmedString(input.id) ?? existing.id;
       existing.agent = readTrimmedString(input.agent) ?? existing.agent;
       existing.status = input.status ?? existing.status;
       existing.description = readTrimmedString(input.description) ?? existing.description;
@@ -204,6 +246,8 @@ export class OmpSubagentCardTracker {
     const item: OmpSubagentCardItem = {
       index: input.index,
       lines: [],
+      thinking: false,
+      ...(readTrimmedString(input.id) ? { id: readTrimmedString(input.id) } : {}),
       lineKeys: new Set<string>(),
       ...(readTrimmedString(input.agent) ? { agent: readTrimmedString(input.agent) } : {}),
       ...(input.status ? { status: input.status } : {}),
@@ -285,7 +329,8 @@ function buildLog(items: OmpSubagentCardItem[], fallback: string): string {
   const itemCount = Math.max(...items.map((item) => item.index)) + 1;
   const lines = items.flatMap((item) => {
     const prefix = itemCount > 1 ? `[${item.index + 1}/${itemCount}] ` : "";
-    return item.lines.map((line) => `${prefix}${line.text}`);
+    const itemLines = item.lines.map((line) => `${prefix}${line.text}`);
+    return item.thinking ? [...itemLines, `${prefix}Thinking...`] : itemLines;
   });
   return lines.length > 0 ? lines.join("\n") : fallback;
 }
