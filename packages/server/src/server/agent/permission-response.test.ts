@@ -2,14 +2,11 @@ import { describe, expect, test } from "vitest";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import type {
-  AgentEnqueueBehavior,
-  AgentEnqueueResult,
   AgentPromptInput,
   AgentPermissionResult,
   AgentRunOptions,
   AgentPermissionResponse,
 } from "./agent-sdk-types.js";
-import type { ManagedAgent } from "./agent-manager.js";
 import type { AgentStreamEvent } from "../messages.js";
 import { respondToAgentPermission } from "./permission-response.js";
 
@@ -17,12 +14,6 @@ class FakePermissionAgentManager {
   permissionResult: AgentPermissionResult | void;
   hasRunInFlight = false;
   outOfBandHandled = false;
-  agentSnapshot: ManagedAgent | null = null;
-  enqueueRequests: Array<{
-    agentId: string;
-    prompt: AgentPromptInput;
-    options: { behavior: AgentEnqueueBehavior; clientMessageId?: string };
-  }> = [];
   permissionResponses: Array<{
     agentId: string;
     requestId: string;
@@ -46,16 +37,7 @@ class FakePermissionAgentManager {
   }
 
   getAgent() {
-    return this.agentSnapshot;
-  }
-
-  async enqueueAgentPrompt(
-    agentId: string,
-    prompt: AgentPromptInput,
-    options: { behavior: AgentEnqueueBehavior; clientMessageId?: string },
-  ): Promise<AgentEnqueueResult> {
-    this.enqueueRequests.push({ agentId, prompt, options });
-    return { accepted: true, behavior: options.behavior, queue: [] };
+    return undefined;
   }
 
   hasInFlightRun(): boolean {
@@ -154,31 +136,6 @@ describe("respondToAgentPermission", () => {
       {
         agentId: "agent-1",
         prompt: "continue after approval",
-      },
-    ]);
-  });
-
-  test("follow-up prompts never queue behind an active run, even for queue-capable sessions", async () => {
-    const agentManager = new FakePermissionAgentManager();
-    agentManager.hasRunInFlight = true;
-    agentManager.agentSnapshot = {
-      capabilities: { supportsMessageQueue: true },
-    } as unknown as ManagedAgent;
-    agentManager.permissionResult = { followUpPrompt: "implement the approved plan" };
-
-    await respondToAgentPermission({
-      agentManager,
-      agentId: "agent-1",
-      requestId: "permission-1",
-      response: { behavior: "allow" },
-      logger,
-    });
-
-    expect(agentManager.enqueueRequests).toEqual([]);
-    expect(agentManager.replacementRuns).toEqual([
-      {
-        agentId: "agent-1",
-        prompt: "implement the approved plan",
       },
     ]);
   });

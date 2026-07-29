@@ -24,7 +24,6 @@ import type {
   FetchAgentTimelineDirection,
   FetchAgentTimelinePayload,
   FetchAgentTimelineProjection,
-  SendAgentMessageAck,
 } from "./daemon-client.js";
 
 export { DaemonClient };
@@ -197,12 +196,6 @@ export interface PaseoAgentSendOptions {
   messageId?: string;
   images?: Array<{ data: string; mimeType: string }>;
   attachments?: SendAgentMessageRequest["attachments"];
-  /**
-   * Explicit routing intent while the agent is running ("steer" or
-   * "follow_up"). Requires `server_info.features.agentMessageQueue`; older
-   * daemons drop the field and keep legacy routing.
-   */
-  delivery?: SendAgentMessageRequest["delivery"];
 }
 
 export type PaseoAgentUpdate = Extract<SessionOutboundMessage, { type: "agent_update" }>["payload"];
@@ -236,7 +229,7 @@ export interface PaseoAgentHandle {
   readonly timeline: PaseoAgentTimelineHandle;
   latest(): PaseoAgent | null;
   refetch(requestId?: string): Promise<PaseoAgentRefetchResult | null>;
-  send(text: string, options?: PaseoAgentSendOptions): Promise<SendAgentMessageAck>;
+  send(text: string, options?: PaseoAgentSendOptions): Promise<void>;
   archive(): Promise<{ archivedAt: string }>;
   detach(): Promise<void>;
   subscribe(handler: (update: PaseoAgentUpdate) => void): () => void;
@@ -485,7 +478,7 @@ function createAgentHandleFactory(daemonClient: DaemonClient): AgentHandleFactor
         latest = result?.agent ?? null;
         return result;
       },
-      send: (text, options) => daemonClient.sendAgentMessageWithAck(id, text, options),
+      send: (text, options) => daemonClient.sendAgentMessage(id, text, options),
       archive: async () => {
         const result = await daemonClient.archiveAgent(id);
         if (latest) {

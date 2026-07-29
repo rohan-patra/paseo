@@ -21,10 +21,9 @@ export type AgentRunController = Pick<
 /**
  * How to deliver a prompt when the agent already has an in-flight run and the
  * session supports message queueing (`capabilities.supportsMessageQueue`):
- * - "steer" (default — user semantics): fold into the active turn.
+ * - "steer": fold into the active turn.
  * - "followUp": run after the active turn completes.
- * - "never": skip queueing entirely and preserve the interrupt-and-replace
- *   behavior (for system/internal callers that must not queue).
+ * - "never" (default): skip queueing and preserve interrupt-and-replace.
  * Providers without queue support are unaffected by this option.
  */
 export type StartAgentRunEnqueueBehavior = AgentEnqueueBehavior | "never";
@@ -237,10 +236,9 @@ export interface SendPromptToAgentParams {
   /** Optional mode to set on the agent before the run starts. */
   sessionMode?: string;
   /**
-   * Queue delivery when the agent is mid-run and the session supports message
-   * queueing. Defaults to "steer" (user semantics); system/internal callers
-   * may pass "followUp" or "never". No effect on providers without queue
-   * support.
+   * Queue delivery when the agent is mid-run and the session supports it.
+   * Defaults to "never" so internal callers preserve replacement semantics;
+   * the external client-message boundary explicitly requests "steer".
    */
   enqueueBehavior?: StartAgentRunEnqueueBehavior;
   /**

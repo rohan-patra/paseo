@@ -20,7 +20,6 @@ import {
   type UserMessageItem,
 } from "@/types/stream";
 import type { PickedImageAttachmentInput } from "@/hooks/image-attachment-picker";
-import type { ComposerMessageDelivery } from "@/composer/queue-behavior";
 import { i18n } from "@/i18n/i18next";
 
 export interface QueuedComposerMessage {
@@ -51,7 +50,6 @@ export interface ComposerSendClient {
       messageId: string;
       images: Array<{ data: string; mimeType: string }>;
       attachments: ReturnType<typeof splitComposerAttachmentsForSubmit>["attachments"];
-      delivery?: ComposerMessageDelivery;
     },
   ) => Promise<void>;
   uploadFile: (input: { fileName: string; mimeType: string; bytes: Uint8Array }) => Promise<{
@@ -168,7 +166,6 @@ export interface DispatchComposerAgentMessageInput {
   text: string;
   attachments: ComposerAttachment[];
   attachmentSubmitFormat?: ComposerAttachmentSubmitFormat;
-  delivery?: ComposerMessageDelivery;
   encodeImages: (
     images: AttachmentMetadata[],
   ) => Promise<Array<{ data: string; mimeType: string }> | undefined>;
@@ -200,7 +197,6 @@ export async function dispatchComposerAgentMessage(
       messageId,
       images: imagesData ?? [],
       attachments: wirePayload.attachments,
-      ...(input.delivery ? { delivery: input.delivery } : {}),
     });
   } catch (error) {
     rollbackOptimisticMessage();

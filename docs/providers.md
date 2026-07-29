@@ -32,52 +32,6 @@ Pi MCP support depends on the open-source `pi-mcp-adapter` extension being loade
 
 Pi import discovery reads Pi's persisted JSONL session files because Pi RPC does not expose a recent-session listing command. Resume and full history hydration still go through `pi --mode rpc` using the session file as `nativeHandle`.
 
-### Pi per-model thinking levels
-
-Pi model catalog records carry a `thinkingLevelMap` (`off` through `max`). A `null` value disables a
-level, omitted standard levels use Pi's default mapping, and extended `xhigh`/`max` levels are opt-in.
-The Pi adapter mirrors Pi's `getSupportedThinkingLevels` and `clampThinkingLevel` semantics when it
-builds each model definition, so the picker contains only options that model supports. Catalog
-mapping uses `get_available_models`; it does not switch through every model. For the active session,
-`get_available_thinking_levels` validates the selected model and `get_state.thinkingLevel` remains
-authoritative after Pi silently clamps a request. Paseo stores that effective value and emits a
-provider notice when it differs from the requested value.
-
-OMP follows a similar pattern using `model.thinking.efforts` and remains a useful parity reference.
-
-### Pi native steer/follow-up wiring
-
-When a Pi agent already has an active run, the shared `AgentSession.enqueuePrompt` seam sends Pi's
-`prompt` RPC with `streamingBehavior: "steer" | "followUp"`. Using `prompt` rather than the bare
-`steer`/`follow_up` verbs preserves Pi's extension-command and prompt-template handling and safely
-handles the race where the previous run becomes idle first. Normal running sends default to steering;
-the explicit queue action requests follow-up. Other providers retain their existing behavior unless
-they advertise `supportsMessageQueue`.
-
-Pi `queue_update`, `agent_end.willRetry`, and `agent_settled` events are decoded by the adapter. The
-adapter emits provider turn events while `AgentRunState` and `AgentManager` remain the sole owners of
-Paseo run settlement. A prompt accepted at the idle boundary is adopted as a provider-owned turn so
-its stream remains attributable and interruptible.
-
-### The abort RPC does not clear queued steer/follow-up messages
-
-Upstream `AgentSession.abort()` only calls `this.agent.abort()` (aborts the in-flight run's
-`AbortController`) and `waitForIdle()` — it does **not** call `clearSteeringQueue()`,
-`clearFollowUpQueue()`, or `clearAllQueues()`. Those are separate, explicit methods on the underlying
-agent loop, and Pi RPC exposes no command to invoke them or to inspect/clear the queues remotely
-(`get_available_thinking_levels`-style introspection doesn't exist for queues; only the interactive
-TUI's own `queue_update` event stream reflects current queue contents, and even that is push-only).
-On `continue()`, any still-queued steering messages are drained and run first, then follow-ups —
-so a queued message can survive an abort/interrupt and be delivered on the _next_ turn without the
-user having asked for that.
-
-This matters directly for any plan adding steer/follow-up to Paseo's Pi adapter: wiring `interrupt()`
-to Pi's `abort` RPC alone is not sufficient to give users a clean "stop and discard everything"
-action once steer/follow-up queuing exists. The plan needs an explicit decision (and, if Pi RPC lacks
-the verb, a documented limitation) for what happens to queued-but-undelivered steer/follow-up
-messages when a user hits Stop — silently replaying them on the next prompt is a likely surprise bug
-if this is left unaddressed.
-
 OMP is a first-class built-in provider, disabled by default. Its launch contract, typed runtime, agent/session behavior, history, permissions, imports, and test fake live under `providers/omp/`; only the provider-neutral JSONL child-process transport is shared with Pi. It launches `omp --mode rpc-ui`, uses OMP's `get_available_commands` RPC for slash-command discovery, bridges OMP `rpc-ui` approval dialogs into Paseo permissions, and imports terminal-started sessions from `~/.omp/agent/sessions` when enabled.
 
 OMP supports native Paseo host tools. The adapter registers the full caller-scoped Paseo tool catalog directly with OMP, matching providers such as Claude that expose the full catalog through MCP. Serialize every OMP host definition with `loadMode: "essential"` so `create_agent`, `send_agent_prompt`, `wait_for_agent`, and related tools remain direct calls; omitting the field makes OMP mount non-built-in names under `xd://` instead. OMP's provider-managed task subagents are surfaced as Paseo subagents through `child_session` imports; the parent keeps the subagents track while the child runtime stays owned by OMP. Custom OMP profiles should extend `omp`; other Pi-compatible forks can still extend `pi`, override `command`, and set `params.sessionDir` to their JSONL session directory.

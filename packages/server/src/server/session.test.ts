@@ -100,6 +100,62 @@ function createBinaryMessageHandler(
   };
 }
 
+test("legacy client send steers an active queue-capable agent without a delivery field", async () => {
+  const agentId = "11111111-1111-4111-8111-111111111111";
+  const messages: SessionOutboundMessage[] = [];
+  const enqueueAgentPrompt = vi.fn(async () => ({
+    accepted: true as const,
+    behavior: "steer" as const,
+    queue: [],
+  }));
+  const snapshot = {
+    id: agentId,
+    provider: "pi" as const,
+    lifecycle: "running" as const,
+    capabilities: { supportsMessageQueue: true },
+    persistence: null,
+    activeForegroundTurnId: "turn-1",
+  };
+  const session = createSessionForTest({
+    messages,
+    agentManager: {
+      listAgents: vi.fn(() => [snapshot]),
+      getAgent: vi.fn(() => snapshot),
+      tryRunOutOfBand: vi.fn(() => false),
+      hasInFlightRun: vi.fn(() => true),
+      enqueueAgentPrompt,
+      waitForAgentClose: vi.fn().mockResolvedValue(undefined),
+    },
+    agentStorage: {
+      list: vi.fn().mockResolvedValue([{ id: agentId, provider: "pi", internal: false }]),
+      get: vi.fn().mockResolvedValue({ id: agentId, provider: "pi" }),
+    },
+  });
+
+  await session.handleMessage({
+    type: "send_agent_message_request",
+    requestId: "request-1",
+    agentId,
+    text: "adjust the active turn",
+    messageId: "message-1",
+    attachments: [],
+  });
+
+  expect(messages, JSON.stringify(messages)).toContainEqual({
+    type: "send_agent_message_response",
+    payload: {
+      requestId: "request-1",
+      agentId,
+      accepted: true,
+      error: null,
+    },
+  });
+  expect(enqueueAgentPrompt).toHaveBeenCalledWith(agentId, "adjust the active turn", {
+    behavior: "steer",
+    clientMessageId: "message-1",
+  });
+});
+
 test("interruptAgentIfRunning rejects when graceful cancellation is refused", async () => {
   const agentId = "11111111-1111-4111-8111-111111111111";
   const session = createSessionForTest({

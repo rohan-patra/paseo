@@ -993,26 +993,6 @@ const ImageAttachmentSchema = z.object({
   mimeType: z.string(), // e.g., "image/jpeg", "image/png"
 });
 
-// COMPAT(agentMessageQueue): added in v0.2.4, drop the gate when daemon floor >= v0.2.4.
-// Explicit routing intent for a message sent while the agent is running:
-// - "steer": inject into the active turn.
-// - "follow_up": place on the agent's native message queue for the next turn.
-// Omitted keeps the legacy daemon-default routing, so old clients stay valid
-// and old daemons simply drop the unknown field.
-export const AgentMessageDeliverySchema = z.enum(["steer", "follow_up"]);
-export type AgentMessageDelivery = z.infer<typeof AgentMessageDeliverySchema>;
-
-// COMPAT(agentMessageQueue): projection of the agent's native message queue
-// after the daemon accepted a message. Only sent by daemons that declare
-// server_info.features.agentMessageQueue.
-export const AgentMessageQueueProjectionSchema = z.object({
-  /** 0-based position of the acknowledged message in the native queue. */
-  position: z.number().int().nonnegative(),
-  /** Total messages sitting in the native queue after this acknowledgement. */
-  depth: z.number().int().nonnegative(),
-});
-export type AgentMessageQueueProjection = z.infer<typeof AgentMessageQueueProjectionSchema>;
-
 export const SendAgentMessageSchema = z.object({
   type: z.literal("send_agent_message"),
   agentId: z.string(),
@@ -1020,8 +1000,6 @@ export const SendAgentMessageSchema = z.object({
   messageId: z.string().optional(), // Client-provided ID for deduplication
   images: z.array(ImageAttachmentSchema).optional(),
   attachments: AgentAttachmentsSchema,
-  // COMPAT(agentMessageQueue): added in v0.2.4, drop the gate when daemon floor >= v0.2.4.
-  delivery: AgentMessageDeliverySchema.optional(),
 });
 
 // ============================================================================
@@ -1139,8 +1117,6 @@ export const SendAgentMessageRequestSchema = z.object({
   messageId: z.string().optional(), // Client-provided ID for deduplication
   images: z.array(ImageAttachmentSchema).optional(),
   attachments: AgentAttachmentsSchema,
-  // COMPAT(agentMessageQueue): added in v0.2.4, drop the gate when daemon floor >= v0.2.4.
-  delivery: AgentMessageDeliverySchema.optional(),
 });
 
 export const WaitForFinishRequestSchema = z.object({
@@ -2856,8 +2832,6 @@ export const ServerInfoStatusPayloadSchema = z
         stableProjectIdentity: z.boolean().optional(),
         // COMPAT(workspaceScriptManagement): added in v0.1.105, remove gate after 2027-01-10.
         workspaceScriptManagement: z.boolean().optional(),
-        // COMPAT(agentMessageQueue): added in v0.2.4, drop the gate when daemon floor >= v0.2.4.
-        agentMessageQueue: z.boolean().optional(),
       })
       .optional(),
   })
@@ -3736,11 +3710,6 @@ export const SendAgentMessageResponseMessageSchema = z.object({
     agentId: z.string(),
     accepted: z.boolean(),
     error: z.string().nullable(),
-    // COMPAT(agentMessageQueue): added in v0.2.4, drop the gate when daemon
-    // floor >= v0.2.4. Acknowledges how the daemon actually routed the
-    // accepted message; old daemons omit both fields.
-    delivery: AgentMessageDeliverySchema.optional(),
-    queue: AgentMessageQueueProjectionSchema.optional(),
   }),
 });
 

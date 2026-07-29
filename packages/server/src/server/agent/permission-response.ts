@@ -33,11 +33,8 @@ export async function respondToAgentPermission(
 
   if (result?.followUpPrompt) {
     logger.debug({ agentId }, "Permission response requires follow-up turn, starting agent stream");
-    // Permission follow-ups are internal continuations of the resolved
-    // request — never queue them behind the active run; keep replacement.
     await startAgentRun(agentManager, agentId, result.followUpPrompt, logger, {
       replaceRunning: true,
-      enqueueBehavior: "never",
     });
   }
 }

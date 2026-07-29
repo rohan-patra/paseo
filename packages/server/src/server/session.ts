@@ -6312,9 +6312,6 @@ export class Session {
         },
         "agent.session.send_agent_message",
       );
-      let enqueueBehavior: "steer" | "followUp" | undefined;
-      if (msg.delivery === "steer") enqueueBehavior = "steer";
-      if (msg.delivery === "follow_up") enqueueBehavior = "followUp";
       let dispatchResult: Awaited<ReturnType<typeof sendPromptToAgent>>;
       try {
         dispatchResult = await sendPromptToAgent({
@@ -6323,7 +6320,10 @@ export class Session {
           agentId,
           prompt,
           messageId: msg.messageId,
-          enqueueBehavior,
+          // Legacy clients have no delivery field: an active queue-capable
+          // session (currently Pi only) interprets their immediate send as a
+          // steer. Unsupported providers retain interrupt-and-replace.
+          enqueueBehavior: "steer",
           logger: this.sessionLogger,
         });
       } catch (error) {
@@ -6349,9 +6349,6 @@ export class Session {
             agentId,
             accepted: true,
             error: null,
-            ...(dispatchResult.delivery
-              ? { delivery: dispatchResult.delivery === "followUp" ? "follow_up" : "steer" }
-              : {}),
           },
         });
         return;
