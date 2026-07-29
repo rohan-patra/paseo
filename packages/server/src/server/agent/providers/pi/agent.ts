@@ -32,6 +32,7 @@ import {
   type AgentSlashCommand,
   type AgentSlashCommandKind,
   type AgentStreamEvent,
+  type AgentTimelineItem,
   type AgentUsage,
   type FetchCatalogOptions,
   type ImportableProviderSession,
@@ -1023,6 +1024,81 @@ function isExtensionUiRequestEvent(
   return event.type === "extension_ui_request" && typeof event.id === "string";
 }
 
+function extensionUiText(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = stripAnsi(value).trim();
+  return text || undefined;
+}
+
+function extensionUiLines(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.flatMap((line) => {
+        const text = extensionUiText(line);
+        return text ? [text] : [];
+      })
+    : [];
+}
+
+function extensionUiCallId(method: string, event: Record<string, unknown>): string {
+  let keyedId: string | undefined;
+  if (method === "setStatus") keyedId = extensionUiText(event.statusKey);
+  if (method === "setWidget") keyedId = extensionUiText(event.widgetKey);
+  return keyedId
+    ? `pi-extension-ui:keyed:${method}:${keyedId}`
+    : `pi-extension-ui:event:${event.id}`;
+}
+
+function mapExtensionUiSideEffect(
+  event: Extract<PiRuntimeEvent, { type: "extension_ui_request" }>,
+): Extract<AgentTimelineItem, { type: "tool_call" }> | null {
+  let label: string;
+  let text: string | undefined;
+
+  switch (event.method) {
+    case "notify": {
+      const message = extensionUiText(event.message);
+      if (!message) return null;
+      const level = extensionUiText(event.notifyType);
+      label = level && level !== "info" ? `Notification · ${level}` : "Notification";
+      text = message;
+      break;
+    }
+    case "setStatus": {
+      const key = extensionUiText(event.statusKey) ?? "extension";
+      label = `Status · ${key}`;
+      text = extensionUiText(event.statusText) ?? "Cleared";
+      break;
+    }
+    case "setWidget": {
+      const key = extensionUiText(event.widgetKey) ?? "extension";
+      const lines = extensionUiLines(event.widgetLines);
+      label = `Widget · ${key}`;
+      text = lines.length > 0 ? lines.join("\n") : "Cleared";
+      break;
+    }
+    case "setTitle":
+      label = "Session title";
+      text = extensionUiText(event.title) ?? "Cleared";
+      break;
+    case "set_editor_text":
+      label = "Editor draft";
+      text = extensionUiText(event.text) ?? "Cleared";
+      break;
+    default:
+      return null;
+  }
+
+  return {
+    type: "tool_call",
+    callId: extensionUiCallId(event.method, event),
+    name: "Pi extension UI",
+    status: "completed",
+    error: null,
+    detail: { type: "plain_text", label, text, icon: "sparkles" },
+    metadata: { source: "pi_extension_ui", method: event.method },
+  };
+}
+
 function isProcessExitEvent(
   event: PiRuntimeEvent,
 ): event is Extract<PiRuntimeEvent, { type: "process_exit" }> {
@@ -1255,6 +1331,7 @@ export class PiRpcAgentSession implements AgentSession {
   private activeForegroundPromptText: string | null = null;
   private activeNoTurnPromptText: string | null = null;
   private readonly pendingNoTurnOutputs: Array<{ turnId: string; message: string }> = [];
+  private readonly pendingNoTurnUiItems: Array<{ turnId: string; item: AgentTimelineItem }> = [];
   private activePromptRequestId: string | null = null;
   private readonly pendingPromptResults = new Map<string, boolean>();
   private lastKnownThinkingOptionId: string | null;
@@ -1765,11 +1842,13 @@ export class PiRpcAgentSession implements AgentSession {
     this.activeNoTurnPromptText = null;
     this.activePromptRequestId = null;
     this.pendingNoTurnOutputs.splice(0, this.pendingNoTurnOutputs.length);
+    this.pendingNoTurnUiItems.splice(0, this.pendingNoTurnUiItems.length);
   }
 
   private emitBufferedNoTurnOutputs(turnId: string): void {
     const promptText = this.activeNoTurnPromptText;
     const outputs = this.pendingNoTurnOutputs.filter((output) => output.turnId === turnId);
+    const uiItems = this.pendingNoTurnUiItems.filter((entry) => entry.turnId === turnId);
     this.clearNoTurnBuffers();
     if (promptText) {
       this.emit({
@@ -1792,6 +1871,14 @@ export class PiRpcAgentSession implements AgentSession {
           type: "assistant_message",
           text: output.message,
         },
+      });
+    }
+    for (const entry of uiItems) {
+      this.emit({
+        type: "timeline",
+        provider: this.provider,
+        turnId,
+        item: entry.item,
       });
     }
   }
@@ -2044,15 +2131,29 @@ export class PiRpcAgentSession implements AgentSession {
     event: Extract<PiRuntimeEvent, { type: "extension_ui_request" }>,
   ): void {
     const message = optionalString(event.message);
-    if (event.method === "notify" && message) {
-      if (
-        this.handleSubmittedUserEntryMarker(message) ||
+    if (
+      event.method === "notify" &&
+      message &&
+      (this.handleSubmittedUserEntryMarker(message) ||
         this.handleEntryCaptureMarker(message) ||
-        this.handleCommandResultMarker(message)
-      ) {
-        return;
+        this.handleCommandResultMarker(message))
+    ) {
+      return;
+    }
+
+    const sideEffect = mapExtensionUiSideEffect(event);
+    if (sideEffect) {
+      if (this.activeTurnId && !this.activeTurnStarted) {
+        this.pendingNoTurnUiItems.push({ turnId: this.activeTurnId, item: sideEffect });
+      } else {
+        this.emit({
+          type: "timeline",
+          provider: this.provider,
+          turnId: this.currentTurnIdForEvent(),
+          item: sideEffect,
+        });
       }
-      this.bufferNoTurnOutput(message);
+      return;
     }
 
     if (this.respondToCombinedAskUserFollowUp(event)) {

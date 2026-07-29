@@ -470,19 +470,120 @@ describe("PiRpcAgentSession", () => {
     ]);
   });
 
-  test("ignores Pi RPC fire-and-forget extension UI requests", async () => {
-    const { pi } = await createSession();
+  test("surfaces Pi RPC notifications as portable timeline items", async () => {
+    const { pi, events } = await createSession();
     const fakeSession = pi.latestSession();
 
     fakeSession.emit({
       type: "extension_ui_request",
       id: "notify-1",
       method: "notify",
-      message: "hello",
+      message: "\u001b[31mCommand blocked\u001b[0m",
+      notifyType: "warning",
     });
 
+    expect(events.timelineItems()).toEqual([
+      {
+        type: "tool_call",
+        callId: "pi-extension-ui:event:notify-1",
+        name: "Pi extension UI",
+        status: "completed",
+        error: null,
+        detail: {
+          type: "plain_text",
+          label: "Notification · warning",
+          text: "Command blocked",
+          icon: "sparkles",
+        },
+        metadata: { source: "pi_extension_ui", method: "notify" },
+      },
+    ]);
     expect(fakeSession.extensionUiResponses).toEqual([]);
     expect(fakeSession.canceledExtensionUiRequests).toEqual([]);
+  });
+
+  test("surfaces keyed Pi RPC status and widget updates with stable timeline identities", async () => {
+    const { pi, events } = await createSession();
+    const fakeSession = pi.latestSession();
+
+    fakeSession.emit({
+      type: "extension_ui_request",
+      id: "status-1",
+      method: "setStatus",
+      statusKey: "auto-mode",
+      statusText: "Enabled",
+    });
+    fakeSession.emit({
+      type: "extension_ui_request",
+      id: "status-2",
+      method: "setStatus",
+      statusKey: "auto-mode",
+    });
+    fakeSession.emit({
+      type: "extension_ui_request",
+      id: "widget-1",
+      method: "setWidget",
+      widgetKey: "background-work",
+      widgetLines: ["Background work", "\u001b[32m✓ child done\u001b[0m"],
+      widgetPlacement: "aboveEditor",
+    });
+
+    expect(events.timelineItems()).toMatchObject([
+      {
+        type: "tool_call",
+        callId: "pi-extension-ui:keyed:setStatus:auto-mode",
+        detail: { type: "plain_text", label: "Status · auto-mode", text: "Enabled" },
+      },
+      {
+        type: "tool_call",
+        callId: "pi-extension-ui:keyed:setStatus:auto-mode",
+        detail: { type: "plain_text", label: "Status · auto-mode", text: "Cleared" },
+      },
+      {
+        type: "tool_call",
+        callId: "pi-extension-ui:keyed:setWidget:background-work",
+        detail: {
+          type: "plain_text",
+          label: "Widget · background-work",
+          text: "Background work\n✓ child done",
+        },
+      },
+    ]);
+  });
+
+  test("surfaces Pi RPC title and editor draft updates", async () => {
+    const { pi, events } = await createSession();
+    const fakeSession = pi.latestSession();
+
+    fakeSession.emit({
+      type: "extension_ui_request",
+      id: "title-1",
+      method: "setTitle",
+      title: "pi - project",
+    });
+    fakeSession.emit({
+      type: "extension_ui_request",
+      id: "editor-1",
+      method: "set_editor_text",
+      text: "Continue with the portable implementation",
+    });
+
+    expect(events.timelineItems()).toMatchObject([
+      {
+        type: "tool_call",
+        callId: "pi-extension-ui:event:title-1",
+        detail: { type: "plain_text", label: "Session title", text: "pi - project" },
+      },
+      {
+        type: "tool_call",
+        callId: "pi-extension-ui:event:editor-1",
+        detail: {
+          type: "plain_text",
+          label: "Editor draft",
+          text: "Continue with the portable implementation",
+        },
+      },
+    ]);
   });
 
   test("streams assistant text, reasoning, and tool calls from Pi events", async () => {
@@ -1127,9 +1228,16 @@ describe("PiRpcAgentSession", () => {
     await flushTurnScheduling();
     const completion = await events.nextTurnCompletion();
     expect(completion).toMatchObject({ type: "turn_completed", turnId });
-    expect(events.timelineAndCompletionEvents()).toEqual([
+    expect(events.timelineAndCompletionEvents()).toMatchObject([
       { type: "timeline", item: { type: "user_message", text: "/plan on" } },
-      { type: "timeline", item: { type: "assistant_message", text: "Plan mode enabled" } },
+      {
+        type: "timeline",
+        item: {
+          type: "tool_call",
+          callId: "pi-extension-ui:event:notify-plan",
+          detail: { type: "plain_text", label: "Notification", text: "Plan mode enabled" },
+        },
+      },
       { type: "turn_completed" },
     ]);
   });
