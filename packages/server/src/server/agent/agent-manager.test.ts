@@ -22,7 +22,10 @@ import type { StoredAgentRecord } from "./agent-storage.js";
 import type {
   AgentClient,
   AgentCreateSessionOptions,
+  AgentEnqueueOptions,
+  AgentEnqueueResult,
   AgentFeature,
+  AgentQueuedMessage,
   AgentLaunchContext,
   AgentPromptInput,
   AgentProvider,
@@ -8466,4 +8469,246 @@ test("onWorkspaceStateMayHaveChanged is not called for running shell tool calls"
   await manager.runAgent(snapshot.id, { text: "merge it" });
 
   expect(onWorkspaceStateMayHaveChanged).not.toHaveBeenCalled();
+});
+
+// --- Message queue orchestration -------------------------------------------
+
+class QueueingAgentSession extends TestAgentSession {
+  override readonly capabilities = { ...TEST_CAPABILITIES, supportsMessageQueue: true };
+  readonly enqueueCalls: Array<{ prompt: AgentPromptInput; options: AgentEnqueueOptions }> = [];
+  acceptEnqueues = true;
+  activeTurnId: string | null = null;
+  private readonly queued: AgentQueuedMessage[] = [];
+
+  override async startTurn(): Promise<{ turnId: string }> {
+    const turnId = `turn-queue-${this.enqueueCalls.length}-${randomUUID()}`;
+    this.activeTurnId = turnId;
+    setTimeout(() => {
+      this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+    }, 0);
+    return { turnId };
+  }
+
+  completeActiveTurn(): void {
+    const turnId = this.activeTurnId;
+    if (!turnId) {
+      throw new Error("no active turn to complete");
+    }
+    this.activeTurnId = null;
+    this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+  }
+
+  async enqueuePrompt(
+    prompt: AgentPromptInput,
+    options: AgentEnqueueOptions,
+  ): Promise<AgentEnqueueResult> {
+    this.enqueueCalls.push({ prompt, options });
+    if (!this.acceptEnqueues) {
+      return { accepted: false };
+    }
+    this.queued.push({
+      clientMessageId: options.clientMessageId,
+      behavior: options.behavior,
+      text: typeof prompt === "string" ? prompt : "",
+    });
+    return { accepted: true, behavior: options.behavior, queue: [...this.queued] };
+  }
+}
+
+interface QueueFixture {
+  manager: AgentManager;
+  session: QueueingAgentSession;
+  agentId: string;
+  cleanup: () => void;
+}
+
+async function createQueueFixture(): Promise<QueueFixture> {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-queue-"));
+  let session!: QueueingAgentSession;
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      session = new QueueingAgentSession(config);
+      return session;
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: new AgentStorage(join(workdir, "agents"), logger),
+    logger,
+  });
+  const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  return {
+    manager,
+    session,
+    agentId: snapshot.id,
+    cleanup: () => rmSync(workdir, { recursive: true, force: true }),
+  };
+}
+
+function countCanonicalUserRows(
+  manager: AgentManager,
+  agentId: string,
+  clientMessageId: string,
+): number {
+  return manager
+    .getTimeline(agentId)
+    .filter((item) => item.type === "user_message" && item.clientMessageId === clientMessageId)
+    .length;
+}
+
+test("enqueueAgentPrompt persists one canonical user row and allocates no competing run", async () => {
+  const fixture = await createQueueFixture();
+  try {
+    const { manager, session, agentId } = fixture;
+
+    const drained = (async () => {
+      for await (const _ of manager.streamAgent(agentId, "first prompt")) {
+        // drain
+      }
+    })();
+    await vi.waitFor(() => {
+      expect(manager.getAgent(agentId)?.lifecycle).toBe("running");
+    });
+    const foregroundTurnId = manager.getAgent(agentId)?.activeForegroundTurnId;
+    expect(foregroundTurnId).not.toBeNull();
+
+    const result = await manager.enqueueAgentPrompt(agentId, "queued message", {
+      behavior: "steer",
+      clientMessageId: "cmid-1",
+    });
+
+    expect(result).toEqual({
+      accepted: true,
+      behavior: "steer",
+      queue: [{ clientMessageId: "cmid-1", behavior: "steer", text: "queued message" }],
+    });
+    expect(session.enqueueCalls).toEqual([
+      { prompt: "queued message", options: { behavior: "steer", clientMessageId: "cmid-1" } },
+    ]);
+    // Exactly one canonical user row, and the foreground run is untouched.
+    expect(countCanonicalUserRows(manager, agentId, "cmid-1")).toBe(1);
+    expect(manager.getAgent(agentId)?.activeForegroundTurnId).toBe(foregroundTurnId);
+
+    // A provider echo of the queued message must not duplicate the row.
+    session.pushEvent({
+      type: "timeline",
+      provider: session.provider,
+      turnId: foregroundTurnId ?? undefined,
+      item: { type: "user_message", text: "queued message", clientMessageId: "cmid-1" },
+    });
+    session.pushEvent({
+      type: "timeline",
+      provider: session.provider,
+      turnId: foregroundTurnId ?? undefined,
+      item: { type: "assistant_message", text: "echo marker" },
+    });
+    await vi.waitFor(() => {
+      expect(
+        manager
+          .getTimeline(agentId)
+          .some((item) => item.type === "assistant_message" && item.text === "echo marker"),
+      ).toBe(true);
+    });
+    expect(countCanonicalUserRows(manager, agentId, "cmid-1")).toBe(1);
+
+    session.completeActiveTurn();
+    await drained;
+    expect(manager.getAgent(agentId)?.lifecycle).toBe("idle");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("queued follow-up adoption tracks the provider-owned turn without broadcasting", async () => {
+  const fixture = await createQueueFixture();
+  try {
+    const { manager, session, agentId } = fixture;
+    const streamed: AgentStreamEvent[] = [];
+    const unsubscribe = manager.subscribe(
+      (event) => {
+        if (event.type === "agent_stream") {
+          streamed.push(event.event);
+        }
+      },
+      { agentId, replayState: false },
+    );
+
+    session.pushEvent({
+      type: "queued_message_adopted",
+      provider: session.provider,
+      clientMessageId: "cmid-follow",
+      behavior: "followUp",
+      turnId: "turn-follow-1",
+    });
+    await vi.waitFor(() => {
+      expect(manager.getAgent(agentId)?.lifecycle).toBe("running");
+    });
+    expect(manager.hasInFlightRun(agentId)).toBe(true);
+    // The adopted turn is provider-owned: no manager foreground turn exists.
+    expect(manager.getAgent(agentId)?.activeForegroundTurnId).toBeNull();
+
+    session.pushEvent({
+      type: "turn_completed",
+      provider: session.provider,
+      turnId: "turn-follow-1",
+    });
+    await vi.waitFor(() => {
+      expect(manager.getAgent(agentId)?.lifecycle).toBe("idle");
+    });
+    expect(manager.hasInFlightRun(agentId)).toBe(false);
+    expect(streamed.some((event) => event.type === "queued_message_adopted")).toBe(false);
+    unsubscribe();
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("enqueueAgentPrompt declines for sessions without queue support", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-queue-unsupported-"));
+  try {
+    const manager = new AgentManager({ clients: { codex: new TestAgentClient() }, logger });
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+
+    const result = await manager.enqueueAgentPrompt(snapshot.id, "hello", {
+      behavior: "steer",
+      clientMessageId: "cmid-unsupported",
+    });
+
+    expect(result).toEqual({ accepted: false });
+    expect(countCanonicalUserRows(manager, snapshot.id, "cmid-unsupported")).toBe(0);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a declined enqueue leaves later provider user rows untouched", async () => {
+  const fixture = await createQueueFixture();
+  try {
+    const { manager, session, agentId } = fixture;
+    session.acceptEnqueues = false;
+
+    const result = await manager.enqueueAgentPrompt(agentId, "declined message", {
+      behavior: "followUp",
+      clientMessageId: "cmid-declined",
+    });
+    expect(result).toEqual({ accepted: false });
+    expect(countCanonicalUserRows(manager, agentId, "cmid-declined")).toBe(0);
+
+    // The dedup registration must be rolled back: a provider-emitted user row
+    // with the same id persists normally afterwards.
+    session.pushEvent({
+      type: "timeline",
+      provider: session.provider,
+      item: { type: "user_message", text: "declined message", clientMessageId: "cmid-declined" },
+    });
+    await vi.waitFor(() => {
+      expect(countCanonicalUserRows(manager, agentId, "cmid-declined")).toBe(1);
+    });
+  } finally {
+    fixture.cleanup();
+  }
 });

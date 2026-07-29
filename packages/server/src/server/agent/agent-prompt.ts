@@ -1,6 +1,6 @@
 import type { Logger } from "pino";
 
-import type { AgentPromptInput, AgentRunOptions } from "./agent-sdk-types.js";
+import type { AgentEnqueueBehavior, AgentPromptInput, AgentRunOptions } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
@@ -10,12 +10,35 @@ export type AgentUnarchiveController = Pick<AgentManager, "notifyAgentState" | "
 
 export type AgentRunController = Pick<
   AgentManager,
-  "getAgent" | "tryRunOutOfBand" | "hasInFlightRun" | "replaceAgentRun" | "streamAgent"
+  | "getAgent"
+  | "tryRunOutOfBand"
+  | "hasInFlightRun"
+  | "replaceAgentRun"
+  | "streamAgent"
+  | "enqueueAgentPrompt"
 >;
+
+/**
+ * How to deliver a prompt when the agent already has an in-flight run and the
+ * session supports message queueing (`capabilities.supportsMessageQueue`):
+ * - "steer" (default — user semantics): fold into the active turn.
+ * - "followUp": run after the active turn completes.
+ * - "never": skip queueing entirely and preserve the interrupt-and-replace
+ *   behavior (for system/internal callers that must not queue).
+ * Providers without queue support are unaffected by this option.
+ */
+export type StartAgentRunEnqueueBehavior = AgentEnqueueBehavior | "never";
 
 export interface StartAgentRunOptions {
   replaceRunning?: boolean;
   runOptions?: AgentRunOptions;
+  enqueueBehavior?: StartAgentRunEnqueueBehavior;
+}
+
+export interface StartAgentRunResult {
+  outOfBand: boolean;
+  /** True when the prompt was queued onto the active run instead of starting one. */
+  enqueued: boolean;
 }
 
 export async function startAgentRun(
@@ -24,7 +47,7 @@ export async function startAgentRun(
   prompt: AgentPromptInput,
   logger: Logger,
   options?: StartAgentRunOptions,
-): Promise<{ outOfBand: boolean }> {
+): Promise<StartAgentRunResult> {
   const snapshot = agentManager.getAgent(agentId);
   logger.trace(
     {
@@ -42,7 +65,13 @@ export async function startAgentRun(
   // in-flight turn — replaceAgentRun would interrupt the running turn. The
   // intercept lives at this layer so it covers every prompt entrypoint.
   if (agentManager.tryRunOutOfBand(agentId, prompt)) {
-    return { outOfBand: true };
+    return { outOfBand: true, enqueued: false };
+  }
+  // Sessions that support message queueing take precedence over replacement:
+  // an active run keeps going and the prompt is queued against it. "never"
+  // opts out and preserves the interrupt-and-replace path below.
+  if (await tryEnqueueOnActiveRun({ agentManager, agentId, prompt, logger, options, snapshot })) {
+    return { outOfBand: false, enqueued: true };
   }
   const shouldReplace = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
   const runOptions = options?.runOptions;
@@ -84,7 +113,48 @@ export async function startAgentRun(
       logger.error({ err: error, agentId }, "Agent stream failed");
     }
   })();
-  return { outOfBand: false };
+  return { outOfBand: false, enqueued: false };
+}
+
+/**
+ * Attempt to queue the prompt onto the agent's active run. Returns true only
+ * when the session accepted the enqueue; a decline (e.g. the turn just ended)
+ * falls back to the normal run path.
+ */
+async function tryEnqueueOnActiveRun(params: {
+  agentManager: AgentRunController;
+  agentId: string;
+  prompt: AgentPromptInput;
+  logger: Logger;
+  options: StartAgentRunOptions | undefined;
+  snapshot: ManagedAgent | null;
+}): Promise<boolean> {
+  const { agentManager, agentId, prompt, logger, options, snapshot } = params;
+  const enqueueBehavior = options?.enqueueBehavior ?? "steer";
+  if (
+    enqueueBehavior === "never" ||
+    !snapshot?.capabilities?.supportsMessageQueue ||
+    !agentManager.hasInFlightRun(agentId)
+  ) {
+    return false;
+  }
+  const enqueueResult = await agentManager.enqueueAgentPrompt(agentId, prompt, {
+    behavior: enqueueBehavior,
+    clientMessageId: options?.runOptions?.clientMessageId,
+  });
+  if (!enqueueResult.accepted) {
+    return false;
+  }
+  logger.trace(
+    {
+      agentId,
+      provider: snapshot.provider,
+      requestedBehavior: enqueueBehavior,
+      behavior: enqueueResult.behavior,
+    },
+    "agent.session.start_stream.enqueued",
+  );
+  return true;
 }
 
 /**
@@ -129,6 +199,13 @@ export interface SendPromptToAgentParams {
   runOptions?: AgentRunOptions;
   /** Optional mode to set on the agent before the run starts. */
   sessionMode?: string;
+  /**
+   * Queue delivery when the agent is mid-run and the session supports message
+   * queueing. Defaults to "steer" (user semantics); system/internal callers
+   * may pass "followUp" or "never". No effect on providers without queue
+   * support.
+   */
+  enqueueBehavior?: StartAgentRunEnqueueBehavior;
   /**
    * Default true. When false, archived agents are skipped instead of being
    * unarchived. Use false for system-injected prompts (chat mentions,
@@ -176,13 +253,13 @@ export async function waitForAgentRunStartWithTimeout(
  */
 export async function sendPromptToAgent(
   params: SendPromptToAgentParams,
-): Promise<{ outOfBand: boolean }> {
+): Promise<StartAgentRunResult> {
   const unarchive = params.unarchive ?? true;
 
   const record = await params.agentStorage.get(params.agentId);
   if (record?.archivedAt) {
     if (!unarchive) {
-      return { outOfBand: false };
+      return { outOfBand: false, enqueued: false };
     }
     await unarchiveAgentState(params.agentStorage, params.agentManager, params.agentId);
   }
@@ -204,6 +281,7 @@ export async function sendPromptToAgent(
   return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
     replaceRunning: true,
     runOptions,
+    enqueueBehavior: params.enqueueBehavior,
   });
 }
 
@@ -229,7 +307,7 @@ export async function startCreatedAgentInitialPrompt(
     },
   );
 
-  if (!dispatchResult.outOfBand) {
+  if (!dispatchResult.outOfBand && !dispatchResult.enqueued) {
     await waitForAgentRunStartWithTimeout(params.agentManager, params.agentId);
   }
 

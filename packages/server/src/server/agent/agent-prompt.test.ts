@@ -9,8 +9,11 @@ import {
   isSystemInjectedEnvelope,
   sendPromptToAgent,
   setupFinishNotification,
+  startAgentRun,
+  type StartAgentRunEnqueueBehavior,
 } from "./agent-prompt.js";
 import type { AgentManagerEvent, ManagedAgent } from "./agent-manager.js";
+import type { AgentEnqueueResult } from "./agent-sdk-types.js";
 
 interface CapturedLogger {
   logger: Logger;
@@ -192,6 +195,115 @@ test("sendPromptToAgent forwards the client message id as run options", async ()
     outputSchema: { type: "object" },
     clientMessageId: "msg-client-1",
   });
+});
+
+interface QueueRunFakeManager {
+  agentManager: AgentManager;
+  enqueueSpy: ReturnType<typeof vi.fn>;
+  streamAgentSpy: ReturnType<typeof vi.fn>;
+  replaceAgentRunSpy: ReturnType<typeof vi.fn>;
+}
+
+function createQueueRunFakeManager(options?: {
+  supportsMessageQueue?: boolean;
+  hasInFlightRun?: boolean;
+  enqueueResult?: AgentEnqueueResult;
+}): QueueRunFakeManager {
+  const agent: ManagedAgent = Object.create(null);
+  Reflect.set(agent, "id", "agent-1");
+  Reflect.set(agent, "provider", "pi");
+  Reflect.set(agent, "capabilities", {
+    supportsMessageQueue: options?.supportsMessageQueue ?? true,
+  });
+
+  const enqueueSpy = vi.fn(
+    async (): Promise<AgentEnqueueResult> =>
+      options?.enqueueResult ?? { accepted: true, behavior: "steer", queue: [] },
+  );
+  const streamAgentSpy = vi.fn(() => (async function* noop() {})());
+  const replaceAgentRunSpy = vi.fn(async () => (async function* noop() {})());
+
+  const agentManager: AgentManager = Object.create(AgentManager.prototype);
+  Reflect.set(agentManager, "getAgent", () => agent);
+  Reflect.set(agentManager, "tryRunOutOfBand", () => false);
+  Reflect.set(agentManager, "hasInFlightRun", () => options?.hasInFlightRun ?? true);
+  Reflect.set(agentManager, "enqueueAgentPrompt", enqueueSpy);
+  Reflect.set(agentManager, "streamAgent", streamAgentSpy);
+  Reflect.set(agentManager, "replaceAgentRun", replaceAgentRunSpy);
+
+  return { agentManager, enqueueSpy, streamAgentSpy, replaceAgentRunSpy };
+}
+
+test("startAgentRun steers onto an active queue-capable run by default", async () => {
+  const fake = createQueueRunFakeManager();
+
+  const result = await startAgentRun(fake.agentManager, "agent-1", "hello", createTestLogger(), {
+    replaceRunning: true,
+    runOptions: { clientMessageId: "msg-1" },
+  });
+
+  expect(result).toEqual({ outOfBand: false, enqueued: true });
+  expect(fake.enqueueSpy).toHaveBeenCalledWith("agent-1", "hello", {
+    behavior: "steer",
+    clientMessageId: "msg-1",
+  });
+  expect(fake.streamAgentSpy).not.toHaveBeenCalled();
+  expect(fake.replaceAgentRunSpy).not.toHaveBeenCalled();
+});
+
+test("startAgentRun passes a requested followUp queue behavior through", async () => {
+  const fake = createQueueRunFakeManager({
+    enqueueResult: { accepted: true, behavior: "followUp", queue: [] },
+  });
+
+  const result = await startAgentRun(fake.agentManager, "agent-1", "later", createTestLogger(), {
+    replaceRunning: true,
+    enqueueBehavior: "followUp",
+  });
+
+  expect(result).toEqual({ outOfBand: false, enqueued: true });
+  expect(fake.enqueueSpy).toHaveBeenCalledWith("agent-1", "later", {
+    behavior: "followUp",
+    clientMessageId: undefined,
+  });
+  expect(fake.replaceAgentRunSpy).not.toHaveBeenCalled();
+});
+
+test("startAgentRun enqueueBehavior 'never' preserves replacement", async () => {
+  const fake = createQueueRunFakeManager();
+
+  const result = await startAgentRun(fake.agentManager, "agent-1", "urgent", createTestLogger(), {
+    replaceRunning: true,
+    enqueueBehavior: "never" satisfies StartAgentRunEnqueueBehavior,
+  });
+
+  expect(result).toEqual({ outOfBand: false, enqueued: false });
+  expect(fake.enqueueSpy).not.toHaveBeenCalled();
+  expect(fake.replaceAgentRunSpy).toHaveBeenCalledWith("agent-1", "urgent", undefined);
+});
+
+test("startAgentRun falls back to replacement when the session declines the enqueue", async () => {
+  const fake = createQueueRunFakeManager({ enqueueResult: { accepted: false } });
+
+  const result = await startAgentRun(fake.agentManager, "agent-1", "hello", createTestLogger(), {
+    replaceRunning: true,
+  });
+
+  expect(result).toEqual({ outOfBand: false, enqueued: false });
+  expect(fake.enqueueSpy).toHaveBeenCalledTimes(1);
+  expect(fake.replaceAgentRunSpy).toHaveBeenCalledWith("agent-1", "hello", undefined);
+});
+
+test("startAgentRun never queues for sessions without queue support", async () => {
+  const fake = createQueueRunFakeManager({ supportsMessageQueue: false });
+
+  const result = await startAgentRun(fake.agentManager, "agent-1", "hello", createTestLogger(), {
+    replaceRunning: true,
+  });
+
+  expect(result).toEqual({ outOfBand: false, enqueued: false });
+  expect(fake.enqueueSpy).not.toHaveBeenCalled();
+  expect(fake.replaceAgentRunSpy).toHaveBeenCalledWith("agent-1", "hello", undefined);
 });
 
 test("finish notifications tell the parent the child's last assistant message", async () => {

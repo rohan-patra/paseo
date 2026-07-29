@@ -18,6 +18,8 @@ import {
   getAgentStreamEventTurnId,
   type AgentCapabilityFlags,
   type AgentClient,
+  type AgentEnqueueBehavior,
+  type AgentEnqueueResult,
   type AgentCreateSessionOptions,
   type AgentResumeSessionOptions,
   type AgentFeature,
@@ -326,6 +328,12 @@ interface ManagedAgentBase {
   >;
   inFlightPermissionResponses: Set<string>;
   pendingReplacement: boolean;
+  /**
+   * Client message ids whose canonical `user_message` row was persisted by the
+   * manager at enqueue time. Any live provider echo of a user message carrying
+   * one of these ids is dropped so the queue never produces duplicate rows.
+   */
+  queuedCanonicalMessageIds: Set<string>;
   persistence: AgentPersistenceHandle | null;
   historyPrimed: boolean;
   lastUserMessageAt: Date | null;
@@ -539,6 +547,16 @@ function resolveImportedAgentTitle(
     initialPrompt,
   });
   return explicitTitle ?? provisionalTitle ?? null;
+}
+
+function promptInputToUserMessageText(prompt: AgentPromptInput): string {
+  if (typeof prompt === "string") {
+    return prompt;
+  }
+  return prompt
+    .map((block) => (block.type === "text" ? block.text : ""))
+    .filter((text) => text.length > 0)
+    .join("\n");
 }
 
 function getFirstUserMessageTextFromRows(rows: readonly AgentTimelineRow[]): string | null {
@@ -1522,6 +1540,7 @@ export class AgentManager {
         bufferedPermissionResolutions: new Map(),
         inFlightPermissionResponses: new Set(),
         pendingReplacement: false,
+        queuedCanonicalMessageIds: new Set(),
         activeForegroundTurnId: null,
         foregroundTurnWaiters: new Set(),
         finalizedForegroundTurnIds: new Set(),
@@ -1907,6 +1926,66 @@ export class AgentManager {
       }
     })();
     return true;
+  }
+
+  /**
+   * Queue a prompt on a session that supports mid-turn message queueing.
+   * Persists exactly one canonical `user_message` timeline row (keyed by
+   * clientMessageId) and allocates no manager-side run — the provider adopts
+   * the message into the active turn (steer) or into a provider-owned
+   * follow-up turn, reported back via the `queued_message_adopted` stream
+   * event. Returns `{ accepted: false }` when the session cannot queue, so
+   * callers can fall back to a normal run.
+   */
+  async enqueueAgentPrompt(
+    agentId: string,
+    prompt: AgentPromptInput,
+    options: { behavior: AgentEnqueueBehavior; clientMessageId?: string },
+  ): Promise<AgentEnqueueResult> {
+    const agent = this.requireSessionAgent(agentId);
+    const enqueue = agent.session.enqueuePrompt?.bind(agent.session);
+    if (!agent.capabilities.supportsMessageQueue || !enqueue) {
+      return { accepted: false };
+    }
+    const clientMessageId = options.clientMessageId ?? this.idFactory();
+    // Register before calling the provider so any echo of the queued message
+    // (however quickly it arrives) is deduplicated against the canonical row.
+    agent.queuedCanonicalMessageIds.add(clientMessageId);
+    let result: AgentEnqueueResult;
+    try {
+      result = await enqueue(prompt, { behavior: options.behavior, clientMessageId });
+    } catch (error) {
+      agent.queuedCanonicalMessageIds.delete(clientMessageId);
+      throw error;
+    }
+    if (!result.accepted) {
+      agent.queuedCanonicalMessageIds.delete(clientMessageId);
+      return result;
+    }
+    this.logger.trace(
+      {
+        agentId,
+        provider: agent.provider,
+        requestedBehavior: options.behavior,
+        behavior: result.behavior,
+        clientMessageId,
+        queueLength: result.queue.length,
+      },
+      "agent.manager.enqueue.accepted",
+    );
+    this.touchUpdatedAt(agent);
+    this.recordAndDispatchTimelineItem(
+      agentId,
+      {
+        type: "user_message",
+        text: promptInputToUserMessageText(prompt),
+        clientMessageId,
+      },
+      agent.provider,
+    );
+    agent.lastUserMessageAt = new Date();
+    this.emitState(agent);
+    return result;
   }
 
   async appendTimelineItem(agentId: string, item: AgentTimelineItem): Promise<void> {
@@ -2838,6 +2917,7 @@ export class AgentManager {
       bufferedPermissionResolutions: new Map(),
       inFlightPermissionResponses: new Set(),
       pendingReplacement: false,
+      queuedCanonicalMessageIds: new Set<string>(),
       activeForegroundTurnId: null,
       foregroundTurnWaiters: new Set<ForegroundTurnWaiter>(),
       finalizedForegroundTurnIds: new Set<string>(),
@@ -2897,6 +2977,7 @@ export class AgentManager {
       bufferedPermissionResolutions: new Map(),
       inFlightPermissionResponses: new Set(),
       pendingReplacement: false,
+      queuedCanonicalMessageIds: new Set(),
       foregroundTurnWaiters: new Set(),
       finalizedForegroundTurnIds: new Set(),
       unsubscribeSession: null,
@@ -3481,6 +3562,9 @@ export class AgentManager {
       case "turn_started":
         this.onStreamTurnStarted({ agent, eventTurnId, isForegroundEvent });
         return undefined;
+      case "queued_message_adopted":
+        this.onStreamQueuedMessageAdopted({ agent, event, isForegroundEvent, flags });
+        return undefined;
       case "permission_requested":
         this.onStreamPermissionRequested(agent, event);
         return undefined;
@@ -3514,6 +3598,18 @@ export class AgentManager {
     const { agent, event, options, flags } = params;
 
     if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
+      flags.shouldDispatchEvent = false;
+      flags.shouldNotifyWaiters = false;
+      return;
+    }
+
+    // The manager already persisted the canonical user row for enqueued
+    // prompts — drop provider echoes so the queue never duplicates it.
+    if (
+      event.item.type === "user_message" &&
+      event.item.clientMessageId &&
+      agent.queuedCanonicalMessageIds.has(event.item.clientMessageId)
+    ) {
       flags.shouldDispatchEvent = false;
       flags.shouldNotifyWaiters = false;
       return;
@@ -3666,6 +3762,37 @@ export class AgentManager {
       agent.lifecycle = "running";
       this.emitState(agent);
     }
+  }
+
+  private onStreamQueuedMessageAdopted(params: {
+    agent: ActiveManagedAgent;
+    event: Extract<AgentStreamEvent, { type: "queued_message_adopted" }>;
+    isForegroundEvent: boolean;
+    flags: StreamEventFlags;
+  }): void {
+    const { agent, event, isForegroundEvent, flags } = params;
+    // Manager-internal bookkeeping — never broadcast to protocol subscribers.
+    flags.shouldDispatchEvent = false;
+    flags.shouldNotifyWaiters = false;
+    this.logger.trace(
+      {
+        agentId: agent.id,
+        provider: agent.provider,
+        clientMessageId: event.clientMessageId,
+        behavior: event.behavior,
+        turnId: event.turnId,
+      },
+      "agent.manager.queued_message.adopted",
+    );
+    if (!event.turnId || isForegroundEvent) {
+      return;
+    }
+    // The provider allocated the follow-up turn itself. Track it like any
+    // other provider-owned run so lifecycle/interrupt work while the manager
+    // allocates no competing foreground run for the queued message.
+    this.runs.trackAutonomousRun(agent.id, event.turnId);
+    agent.lifecycle = "running";
+    this.emitState(agent);
   }
 
   private onStreamPermissionRequested(

@@ -178,6 +178,12 @@ export interface AgentCapabilityFlags {
   supportsRewindConversation?: boolean;
   supportsRewindFiles?: boolean;
   supportsRewindBoth?: boolean;
+  /**
+   * Session can queue prompts while a turn is active via `enqueuePrompt`
+   * (steer into the running turn or run as a follow-up) instead of requiring
+   * the manager to interrupt-and-replace the active run.
+   */
+  supportsMessageQueue?: boolean;
 }
 
 export interface AgentPersistenceHandle {
@@ -201,6 +207,40 @@ export interface AgentRunOptions {
   maxThinkingTokens?: number;
   clientMessageId?: string;
 }
+
+/** How a queued prompt is delivered relative to the session's active turn. */
+export type AgentEnqueueBehavior = "steer" | "followUp";
+
+export interface AgentEnqueueOptions {
+  behavior: AgentEnqueueBehavior;
+  /**
+   * Canonical id of the queued user message. The manager persists exactly one
+   * user timeline row keyed by this id; providers must tag any echo of the
+   * same message with this id and must NOT emit their own `user_message`
+   * timeline item for it.
+   */
+  clientMessageId: string;
+}
+
+export interface AgentQueuedMessage {
+  clientMessageId: string;
+  behavior: AgentEnqueueBehavior;
+  text: string;
+}
+
+export type AgentEnqueueResult =
+  | {
+      /** Session cannot queue right now — caller falls back to a normal run. */
+      accepted: false;
+    }
+  | {
+      /** Prompt was queued; no manager-side run may be allocated for it. */
+      accepted: true;
+      /** Behavior the provider actually applied (it may coerce the request). */
+      behavior: AgentEnqueueBehavior;
+      /** Session's pending queue after this enqueue, oldest first. */
+      queue: AgentQueuedMessage[];
+    };
 
 export interface AgentUsage {
   inputTokens?: number;
@@ -432,6 +472,19 @@ export type AgentStreamEvent =
       type: "provider_subagent";
       provider: AgentProvider;
       event: import("./provider-subagents/store.js").ProviderSubagentInputEvent;
+    }
+  | {
+      /**
+       * A previously enqueued prompt was adopted by the provider — folded into
+       * the active turn (steer) or started as a provider-owned follow-up turn
+       * (followUp, with the provider-allocated `turnId`). Manager-internal
+       * bookkeeping; never broadcast to clients.
+       */
+      type: "queued_message_adopted";
+      provider: AgentProvider;
+      clientMessageId: string;
+      behavior: AgentEnqueueBehavior;
+      turnId?: string;
     };
 
 export function getAgentStreamEventTurnId(event: AgentStreamEvent): string | undefined {
@@ -656,6 +709,21 @@ export interface AgentSession {
   tryHandleOutOfBand?(prompt: AgentPromptInput): {
     run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void>;
   } | null;
+  /**
+   * Queue a prompt against the active turn instead of starting a competing
+   * run. Only meaningful when `capabilities.supportsMessageQueue` is true.
+   * Return `{ accepted: false }` when the session cannot queue right now
+   * (e.g. the turn already ended) — the caller falls back to a normal run.
+   * When the provider adopts the queued message — steering it into the active
+   * turn or starting its own follow-up turn — it must emit a
+   * `queued_message_adopted` stream event (including the follow-up's turnId
+   * when it allocated one) so the manager can track the provider-owned turn
+   * without allocating a competing run.
+   */
+  enqueuePrompt?(
+    prompt: AgentPromptInput,
+    options: AgentEnqueueOptions,
+  ): Promise<AgentEnqueueResult>;
 }
 
 export type FetchCatalogOptions =
