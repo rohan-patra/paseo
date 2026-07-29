@@ -95,6 +95,7 @@ import type {
   SessionInboundMessage,
   SessionOutboundMessage,
   SendAgentMessageRequest,
+  SendAgentMessageResponseMessage,
   PaseoConfigRaw,
   PaseoConfigRevision,
   WorkspaceCreateRequest,
@@ -322,7 +323,24 @@ export interface SendMessageOptions {
   messageId?: string;
   images?: Array<{ data: string; mimeType: string }>;
   attachments?: SendAgentMessageRequest["attachments"];
+  /**
+   * Explicit routing intent while the agent is running: "steer" injects into
+   * the active turn, "follow_up" targets the agent's native message queue.
+   * Requires `server_info.features.agentMessageQueue`; older daemons drop the
+   * field and keep legacy routing. Omit for the daemon default.
+   */
+  delivery?: SendAgentMessageRequest["delivery"];
 }
+
+/**
+ * Acknowledgement returned by the daemon for an accepted agent message.
+ * Both fields are absent on daemons without
+ * `server_info.features.agentMessageQueue`.
+ */
+export type SendAgentMessageAck = Pick<
+  SendAgentMessageResponseMessage["payload"],
+  "delivery" | "queue"
+>;
 
 export interface AgentAttentionRequiredNotification {
   agentId: string;
@@ -2855,11 +2873,30 @@ export class DaemonClient {
   // Agent Interaction
   // ============================================================================
 
+  /**
+   * Legacy void-returning send. Kept with this exact shape because existing
+   * consumers type it as `(...) => Promise<void>`. Use
+   * {@link sendAgentMessageWithAck} to observe the daemon's queue
+   * acknowledgement.
+   */
   async sendAgentMessage(
     agentId: string,
     text: string,
     options?: SendMessageOptions,
   ): Promise<void> {
+    await this.sendAgentMessageWithAck(agentId, text, options);
+  }
+
+  /**
+   * Send a message and return the daemon's acknowledgement, including the
+   * optional delivery routing and native queue projection. Daemons without
+   * `server_info.features.agentMessageQueue` resolve with an empty ack.
+   */
+  async sendAgentMessageWithAck(
+    agentId: string,
+    text: string,
+    options?: SendMessageOptions,
+  ): Promise<SendAgentMessageAck> {
     const requestId = this.createRequestId();
     const messageId = options?.messageId ?? crypto.randomUUID();
     const message = SessionInboundMessageSchema.parse({
@@ -2870,6 +2907,9 @@ export class DaemonClient {
       ...(messageId ? { messageId } : {}),
       ...(options?.images ? { images: options.images } : {}),
       ...(options?.attachments ? { attachments: options.attachments } : {}),
+      // COMPAT(agentMessageQueue): added in v0.2.4 — omitted entirely for the
+      // legacy request shape so old daemons keep legacy routing.
+      ...(options?.delivery ? { delivery: options.delivery } : {}),
     });
     const payload = await this.sendRequest({
       requestId,
@@ -2888,6 +2928,10 @@ export class DaemonClient {
     if (!payload.accepted) {
       throw new Error(payload.error ?? "sendAgentMessage rejected");
     }
+    return {
+      ...(payload.delivery !== undefined ? { delivery: payload.delivery } : {}),
+      ...(payload.queue !== undefined ? { queue: payload.queue } : {}),
+    };
   }
 
   async sendMessage(agentId: string, text: string, options?: SendMessageOptions): Promise<void> {
