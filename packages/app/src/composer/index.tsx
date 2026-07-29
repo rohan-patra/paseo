@@ -91,6 +91,11 @@ import { useKeyboardActionHandler } from "@/hooks/use-keyboard-action-handler";
 import type { KeyboardActionDefinition } from "@/keyboard/keyboard-action-dispatcher";
 import type { MessageInputKeyboardActionKind } from "@/keyboard/actions";
 import { submitAgentInput } from "@/composer/submit";
+import {
+  type ComposerQueueBehavior,
+  daemonSupportsAgentNativeMessageQueue,
+  resolveComposerQueueBehavior,
+} from "@/composer/queue-behavior";
 import { ComposerKeyboardScopeProvider } from "@/composer/keyboard-scope";
 import { useAppSettings } from "@/hooks/use-settings";
 import { isWeb, isNative } from "@/constants/platform";
@@ -1109,6 +1114,9 @@ export function Composer({
   const supportsForgeSearch = useSessionStore(
     (state) => state.sessions[serverId]?.serverInfo?.features?.forgeSearch === true,
   );
+  const daemonSupportsNativeQueue = useSessionStore((state) =>
+    daemonSupportsAgentNativeMessageQueue(state.sessions[serverId]?.serverInfo),
+  );
   const githubAutoAttach = useComposerGithubAutoAttach({
     text: userInput,
     remoteUrl: resolveCheckoutRemoteUrl(checkoutStatusQuery.status),
@@ -1204,7 +1212,13 @@ export function Composer({
   const { pickFiles } = useFilePicker();
   const agentIdRef = useRef(agentId);
   const sendAgentMessageRef = useRef<
-    ((agentId: string, text: string, attachments: ComposerAttachment[]) => Promise<void>) | null
+    | ((
+        agentId: string,
+        text: string,
+        attachments: ComposerAttachment[],
+        queueBehavior?: ComposerQueueBehavior,
+      ) => Promise<void>)
+    | null
   >(null);
   const onSubmitMessageRef = useRef(onSubmitMessage);
 
@@ -1256,7 +1270,11 @@ export function Composer({
   }, [focusInput, onFocusInput]);
 
   const submitMessage = useCallback(
-    async (text: string, submitAttachments: ComposerAttachment[]) => {
+    async (
+      text: string,
+      submitAttachments: ComposerAttachment[],
+      queueBehavior?: ComposerQueueBehavior,
+    ) => {
       onMessageSent?.();
       if (onSubmitMessageRef.current) {
         await onSubmitMessageRef.current({ text, attachments: submitAttachments, cwd });
@@ -1265,7 +1283,7 @@ export function Composer({
       if (!sendAgentMessageRef.current) {
         throw new Error(t("workspace.terminal.hostDisconnected"));
       }
-      await sendAgentMessageRef.current(agentIdRef.current, text, submitAttachments);
+      await sendAgentMessageRef.current(agentIdRef.current, text, submitAttachments, queueBehavior);
     },
     [cwd, onMessageSent, t],
   );
@@ -1279,6 +1297,7 @@ export function Composer({
       targetAgentId: string,
       text: string,
       sendAttachments: ComposerAttachment[],
+      queueBehavior?: ComposerQueueBehavior,
     ) => {
       if (!client) {
         throw new Error(t("workspace.terminal.hostDisconnected"));
@@ -1297,6 +1316,7 @@ export function Composer({
         attachmentSubmitFormat: resolveComposerAttachmentSubmitFormat({
           supportsForgeAttachments: supportsForgeSearch,
         }),
+        queueBehavior,
         encodeImages,
         stream,
       });
@@ -1357,13 +1377,25 @@ export function Composer({
       outgoingMessage: string,
       outgoingAttachments: ComposerAttachment[],
       forceSend?: boolean,
+      queueBehaviorOverride?: ComposerQueueBehavior,
     ) => {
+      // A Pi agent on a native-queue daemon steers the running turn instead of
+      // interrupting it (or queueing app-locally); Stop remains cancelAgent.
+      const queueBehavior =
+        queueBehaviorOverride ??
+        resolveComposerQueueBehavior({
+          provider: agentState.provider,
+          isAgentRunning,
+          daemonSupportsNativeQueue,
+          action: "send",
+        });
       const result = await submitAgentInput({
         message: outgoingMessage,
         attachments: outgoingAttachments,
         hasExternalContent,
         allowEmptySubmit,
         forceSend,
+        queueBehavior,
         submitBehavior,
         isAgentRunning,
         // Parent-managed submits are still valid submit paths even when the
@@ -1372,11 +1404,15 @@ export function Composer({
         queueMessage: ({ message: queuedText, attachments: queuedAttachments }) => {
           queueMessage(queuedText, queuedAttachments);
         },
-        submitMessage: async ({ message: submitText, attachments: submitAttachments }) => {
+        submitMessage: async ({
+          message: submitText,
+          attachments: submitAttachments,
+          queueBehavior: submitQueueBehavior,
+        }) => {
           if (submitBehavior !== "preserve-and-lock") {
             beginSubmit(submitAttachments);
           }
-          await submitMessage(submitText, submitAttachments);
+          await submitMessage(submitText, submitAttachments, submitQueueBehavior);
         },
         clearDraft,
         setUserInput,
@@ -1396,10 +1432,12 @@ export function Composer({
       });
     },
     [
+      agentState.provider,
       allowEmptySubmit,
       beginSubmit,
       clearDraft,
       completeSubmit,
+      daemonSupportsNativeQueue,
       hasExternalContent,
       isAgentRunning,
       queueMessage,
@@ -1681,9 +1719,32 @@ export function Composer({
       if (clientSlashCommand && runClientSlashCommand(clientSlashCommand)) {
         return;
       }
+      const nativeQueueBehavior = resolveComposerQueueBehavior({
+        provider: agentState.provider,
+        isAgentRunning,
+        daemonSupportsNativeQueue,
+        action: "queue",
+      });
+      if (nativeQueueBehavior) {
+        // The daemon owns the queue: send now as a follow-up instead of parking
+        // the message app-locally. The daemon has no queue projection on the
+        // agent snapshot, so there is nothing extra to render — the message
+        // shows up in the timeline like any other send.
+        void sendMessageWithContent(payload.text, outgoingAttachments, true, nativeQueueBehavior);
+        return;
+      }
       queueMessage(payload.text, outgoingAttachments);
     },
-    [attachments, buildOutgoingAttachments, queueMessage, runClientSlashCommand],
+    [
+      agentState.provider,
+      attachments,
+      buildOutgoingAttachments,
+      daemonSupportsNativeQueue,
+      isAgentRunning,
+      queueMessage,
+      runClientSlashCommand,
+      sendMessageWithContent,
+    ],
   );
 
   const hasSendableContent = userInput.trim().length > 0 || selectedAttachments.length > 0;

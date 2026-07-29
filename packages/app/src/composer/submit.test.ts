@@ -141,6 +141,114 @@ describe("submitAgentInput", () => {
     expect(clearDraft).not.toHaveBeenCalled();
   });
 
+  it("submits natively as steer instead of app-local queueing while the agent runs", async () => {
+    const queueMessage = vi.fn();
+    const submitMessage = vi.fn(async () => {});
+    const clearDraft = vi.fn();
+    const setUserInput = vi.fn();
+    const setAttachments = vi.fn();
+    const setSendError = vi.fn();
+    const setIsProcessing = vi.fn();
+
+    await expect(
+      submitAgentInput({
+        message: "  steer the run  ",
+        attachments: [],
+        isAgentRunning: true,
+        queueBehavior: "steer",
+        canSubmit: true,
+        queueMessage,
+        submitMessage,
+        clearDraft,
+        setUserInput,
+        setAttachments,
+        setSendError,
+        setIsProcessing,
+      }),
+    ).resolves.toBe("submitted");
+
+    expect(queueMessage).not.toHaveBeenCalled();
+    expect(submitMessage).toHaveBeenCalledWith({
+      message: "steer the run",
+      attachments: [],
+      queueBehavior: "steer",
+    });
+    expect(clearDraft).toHaveBeenCalledWith("sent");
+  });
+
+  it("submits natively as followUp for the explicit queue action while the agent runs", async () => {
+    const queueMessage = vi.fn();
+    const submitMessage = vi.fn(async () => {});
+    const clearDraft = vi.fn();
+    const setUserInput = vi.fn();
+    const setAttachments = vi.fn();
+    const setSendError = vi.fn();
+    const setIsProcessing = vi.fn();
+
+    await expect(
+      submitAgentInput({
+        message: "queued follow-up",
+        attachments: [],
+        isAgentRunning: true,
+        queueBehavior: "followUp",
+        canSubmit: true,
+        queueMessage,
+        submitMessage,
+        clearDraft,
+        setUserInput,
+        setAttachments,
+        setSendError,
+        setIsProcessing,
+      }),
+    ).resolves.toBe("submitted");
+
+    expect(queueMessage).not.toHaveBeenCalled();
+    expect(submitMessage).toHaveBeenCalledWith({
+      message: "queued follow-up",
+      attachments: [],
+      queueBehavior: "followUp",
+    });
+  });
+
+  it("omits queueBehavior from submitMessage when routing is not native", async () => {
+    const queueMessage = vi.fn();
+    const submitMessage = vi.fn(
+      async (_input: {
+        message: string;
+        attachments: unknown[];
+        queueBehavior?: "steer" | "followUp";
+      }) => {},
+    );
+    const clearDraft = vi.fn();
+    const setUserInput = vi.fn();
+    const setAttachments = vi.fn();
+    const setSendError = vi.fn();
+    const setIsProcessing = vi.fn();
+
+    await expect(
+      submitAgentInput({
+        message: "plain send",
+        attachments: [],
+        isAgentRunning: false,
+        queueBehavior: null,
+        canSubmit: true,
+        queueMessage,
+        submitMessage,
+        clearDraft,
+        setUserInput,
+        setAttachments,
+        setSendError,
+        setIsProcessing,
+      }),
+    ).resolves.toBe("submitted");
+
+    expect(submitMessage).toHaveBeenCalledWith({
+      message: "plain send",
+      attachments: [],
+    });
+    expect(submitMessage.mock.calls.map((call) => "queueBehavior" in call[0])).toEqual([false]);
+  });
+
   it("restores the composer when submit fails", async () => {
     const submitError = new Error("No host selected");
     const queueMessage = vi.fn();
