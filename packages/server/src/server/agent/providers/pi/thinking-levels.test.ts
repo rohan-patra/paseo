@@ -71,12 +71,9 @@ describe("clampPiThinkingLevel", () => {
     expect(clampPiThinkingLevel("medium", ["off", "medium", "high"])).toBe("medium");
   });
 
-  test("clamps down to the nearest supported level", () => {
+  test("clamps upward first, then downward when no higher level exists", () => {
+    expect(clampPiThinkingLevel("medium", ["off", "high", "max"])).toBe("high");
     expect(clampPiThinkingLevel("xhigh", ["off", "minimal", "low", "medium", "high"])).toBe("high");
-    expect(clampPiThinkingLevel("medium", ["off", "high", "max"])).toBe("off");
-  });
-
-  test("clamps up when nothing lower is supported", () => {
     expect(clampPiThinkingLevel("off", ["minimal", "low", "medium", "high"])).toBe("minimal");
   });
 

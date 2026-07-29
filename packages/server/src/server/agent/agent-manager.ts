@@ -1950,6 +1950,11 @@ export class AgentManager {
     const clientMessageId = options.clientMessageId ?? this.idFactory();
     // Register before calling the provider so any echo of the queued message
     // (however quickly it arrives) is deduplicated against the canonical row.
+    while (agent.queuedCanonicalMessageIds.size >= 50) {
+      const oldest = agent.queuedCanonicalMessageIds.values().next().value;
+      if (oldest === undefined) break;
+      agent.queuedCanonicalMessageIds.delete(oldest);
+    }
     agent.queuedCanonicalMessageIds.add(clientMessageId);
     let result: AgentEnqueueResult;
     try {
@@ -3610,6 +3615,7 @@ export class AgentManager {
       event.item.clientMessageId &&
       agent.queuedCanonicalMessageIds.has(event.item.clientMessageId)
     ) {
+      agent.queuedCanonicalMessageIds.delete(event.item.clientMessageId);
       flags.shouldDispatchEvent = false;
       flags.shouldNotifyWaiters = false;
       return;
@@ -3733,6 +3739,7 @@ export class AgentManager {
     if (!isForegroundEvent && !agent.pendingReplacement) {
       agent.lifecycle = "idle";
     }
+    agent.queuedCanonicalMessageIds.clear();
     agent.lastError = undefined;
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Interrupted");
     if (!isForegroundEvent) {

@@ -234,15 +234,16 @@ function createQueueRunFakeManager(options?: {
   return { agentManager, enqueueSpy, streamAgentSpy, replaceAgentRunSpy };
 }
 
-test("startAgentRun steers onto an active queue-capable run by default", async () => {
+test("startAgentRun steers when the caller explicitly requests native delivery", async () => {
   const fake = createQueueRunFakeManager();
 
   const result = await startAgentRun(fake.agentManager, "agent-1", "hello", createTestLogger(), {
     replaceRunning: true,
+    enqueueBehavior: "steer",
     runOptions: { clientMessageId: "msg-1" },
   });
 
-  expect(result).toEqual({ outOfBand: false, enqueued: true });
+  expect(result).toMatchObject({ outOfBand: false, enqueued: true, delivery: "steer" });
   expect(fake.enqueueSpy).toHaveBeenCalledWith("agent-1", "hello", {
     behavior: "steer",
     clientMessageId: "msg-1",
@@ -261,7 +262,7 @@ test("startAgentRun passes a requested followUp queue behavior through", async (
     enqueueBehavior: "followUp",
   });
 
-  expect(result).toEqual({ outOfBand: false, enqueued: true });
+  expect(result).toMatchObject({ outOfBand: false, enqueued: true, delivery: "followUp" });
   expect(fake.enqueueSpy).toHaveBeenCalledWith("agent-1", "later", {
     behavior: "followUp",
     clientMessageId: undefined,
@@ -287,6 +288,7 @@ test("startAgentRun falls back to replacement when the session declines the enqu
 
   const result = await startAgentRun(fake.agentManager, "agent-1", "hello", createTestLogger(), {
     replaceRunning: true,
+    enqueueBehavior: "steer",
   });
 
   expect(result).toEqual({ outOfBand: false, enqueued: false });

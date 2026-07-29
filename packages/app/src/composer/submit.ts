@@ -1,5 +1,5 @@
 import { i18n } from "@/i18n/i18next";
-import type { ComposerQueueBehavior } from "@/composer/queue-behavior";
+import type { ComposerMessageDelivery } from "@/composer/queue-behavior";
 
 export type AgentInputSubmitResult = "noop" | "queued" | "submitted" | "failed";
 
@@ -11,14 +11,14 @@ export interface AgentInputSubmitActionInput<TAttachment> {
   submitBehavior?: "clear" | "preserve-and-lock";
   forceSend?: boolean;
   /** When set, the daemon queues/steers natively — the app-local queue must not be used. */
-  queueBehavior?: ComposerQueueBehavior | null;
+  delivery?: ComposerMessageDelivery | null;
   isAgentRunning: boolean;
   canSubmit: boolean;
   queueMessage: (input: { message: string; attachments: TAttachment[] }) => void;
   submitMessage: (input: {
     message: string;
     attachments: TAttachment[];
-    queueBehavior?: ComposerQueueBehavior;
+    delivery?: ComposerMessageDelivery;
   }) => Promise<void>;
   clearDraft: (lifecycle: "sent" | "abandoned") => void;
   setUserInput: (text: string) => void;
@@ -49,7 +49,7 @@ export async function submitAgentInput<TAttachment>(
     return "noop";
   }
 
-  if (input.isAgentRunning && !input.forceSend && !input.queueBehavior) {
+  if (input.isAgentRunning && !input.forceSend && !input.delivery) {
     input.queueMessage({ message: trimmedMessage, attachments });
     if (shouldClearOnSubmit) {
       input.setUserInput("");
@@ -70,7 +70,7 @@ export async function submitAgentInput<TAttachment>(
     await input.submitMessage({
       message: trimmedMessage,
       attachments,
-      ...(input.queueBehavior ? { queueBehavior: input.queueBehavior } : {}),
+      ...(input.delivery ? { delivery: input.delivery } : {}),
     });
     input.clearDraft("sent");
     input.setIsProcessing(false);

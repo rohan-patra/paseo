@@ -6312,7 +6312,10 @@ export class Session {
         },
         "agent.session.send_agent_message",
       );
-      let dispatchResult: { outOfBand: boolean };
+      let enqueueBehavior: "steer" | "followUp" | undefined;
+      if (msg.delivery === "steer") enqueueBehavior = "steer";
+      if (msg.delivery === "follow_up") enqueueBehavior = "followUp";
+      let dispatchResult: Awaited<ReturnType<typeof sendPromptToAgent>>;
       try {
         dispatchResult = await sendPromptToAgent({
           agentManager: this.agentManager,
@@ -6320,6 +6323,7 @@ export class Session {
           agentId,
           prompt,
           messageId: msg.messageId,
+          enqueueBehavior,
           logger: this.sessionLogger,
         });
       } catch (error) {
@@ -6337,7 +6341,7 @@ export class Session {
         return;
       }
 
-      if (dispatchResult.outOfBand) {
+      if (dispatchResult.outOfBand || dispatchResult.enqueued) {
         this.emit({
           type: "send_agent_message_response",
           payload: {
@@ -6345,6 +6349,9 @@ export class Session {
             agentId,
             accepted: true,
             error: null,
+            ...(dispatchResult.delivery
+              ? { delivery: dispatchResult.delivery === "followUp" ? "follow_up" : "steer" }
+              : {}),
           },
         });
         return;

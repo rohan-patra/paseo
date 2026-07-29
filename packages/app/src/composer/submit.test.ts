@@ -155,7 +155,7 @@ describe("submitAgentInput", () => {
         message: "  steer the run  ",
         attachments: [],
         isAgentRunning: true,
-        queueBehavior: "steer",
+        delivery: "steer",
         canSubmit: true,
         queueMessage,
         submitMessage,
@@ -171,12 +171,12 @@ describe("submitAgentInput", () => {
     expect(submitMessage).toHaveBeenCalledWith({
       message: "steer the run",
       attachments: [],
-      queueBehavior: "steer",
+      delivery: "steer",
     });
     expect(clearDraft).toHaveBeenCalledWith("sent");
   });
 
-  it("submits natively as followUp for the explicit queue action while the agent runs", async () => {
+  it("submits natively as follow_up for the explicit queue action while the agent runs", async () => {
     const queueMessage = vi.fn();
     const submitMessage = vi.fn(async () => {});
     const clearDraft = vi.fn();
@@ -190,7 +190,7 @@ describe("submitAgentInput", () => {
         message: "queued follow-up",
         attachments: [],
         isAgentRunning: true,
-        queueBehavior: "followUp",
+        delivery: "follow_up",
         canSubmit: true,
         queueMessage,
         submitMessage,
@@ -206,17 +206,17 @@ describe("submitAgentInput", () => {
     expect(submitMessage).toHaveBeenCalledWith({
       message: "queued follow-up",
       attachments: [],
-      queueBehavior: "followUp",
+      delivery: "follow_up",
     });
   });
 
-  it("omits queueBehavior from submitMessage when routing is not native", async () => {
+  it("omits delivery from submitMessage when routing is not native", async () => {
     const queueMessage = vi.fn();
     const submitMessage = vi.fn(
       async (_input: {
         message: string;
         attachments: unknown[];
-        queueBehavior?: "steer" | "followUp";
+        delivery?: "steer" | "follow_up";
       }) => {},
     );
     const clearDraft = vi.fn();
@@ -230,7 +230,7 @@ describe("submitAgentInput", () => {
         message: "plain send",
         attachments: [],
         isAgentRunning: false,
-        queueBehavior: null,
+        delivery: null,
         canSubmit: true,
         queueMessage,
         submitMessage,
@@ -246,7 +246,7 @@ describe("submitAgentInput", () => {
       message: "plain send",
       attachments: [],
     });
-    expect(submitMessage.mock.calls.map((call) => "queueBehavior" in call[0])).toEqual([false]);
+    expect(submitMessage.mock.calls.map((call) => "delivery" in call[0])).toEqual([false]);
   });
 
   it("restores the composer when submit fails", async () => {

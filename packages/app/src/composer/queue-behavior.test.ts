@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   daemonSupportsAgentNativeMessageQueue,
-  resolveComposerQueueBehavior,
+  resolveComposerMessageDelivery,
 } from "./queue-behavior";
 
 describe("daemonSupportsAgentNativeMessageQueue", () => {
   it("returns true only when the daemon advertises the feature", () => {
     expect(
       daemonSupportsAgentNativeMessageQueue({
-        features: { agentNativeMessageQueue: true },
+        features: { agentMessageQueue: true },
       }),
     ).toBe(true);
   });
@@ -17,7 +17,7 @@ describe("daemonSupportsAgentNativeMessageQueue", () => {
     expect(daemonSupportsAgentNativeMessageQueue({ features: {} })).toBe(false);
     expect(
       daemonSupportsAgentNativeMessageQueue({
-        features: { agentNativeMessageQueue: false },
+        features: { agentMessageQueue: false },
       }),
     ).toBe(false);
     expect(daemonSupportsAgentNativeMessageQueue({ features: undefined })).toBe(false);
@@ -26,7 +26,7 @@ describe("daemonSupportsAgentNativeMessageQueue", () => {
   });
 });
 
-describe("resolveComposerQueueBehavior", () => {
+describe("resolveComposerMessageDelivery", () => {
   const nativeQueueReady = {
     provider: "pi",
     isAgentRunning: true,
@@ -34,29 +34,35 @@ describe("resolveComposerQueueBehavior", () => {
   } as const;
 
   it("routes a normal send to a running Pi agent as a native steer", () => {
-    expect(resolveComposerQueueBehavior({ ...nativeQueueReady, action: "send" })).toBe("steer");
+    expect(resolveComposerMessageDelivery({ ...nativeQueueReady, action: "send" })).toBe("steer");
   });
 
   it("routes the explicit queue action to a running Pi agent as a native follow-up", () => {
-    expect(resolveComposerQueueBehavior({ ...nativeQueueReady, action: "queue" })).toBe("followUp");
+    expect(resolveComposerMessageDelivery({ ...nativeQueueReady, action: "queue" })).toBe(
+      "follow_up",
+    );
   });
 
   it("returns null when the agent is not running", () => {
     expect(
-      resolveComposerQueueBehavior({ ...nativeQueueReady, isAgentRunning: false, action: "send" }),
+      resolveComposerMessageDelivery({
+        ...nativeQueueReady,
+        isAgentRunning: false,
+        action: "send",
+      }),
     ).toBeNull();
   });
 
   it("returns null when the daemon lacks the capability", () => {
     expect(
-      resolveComposerQueueBehavior({
+      resolveComposerMessageDelivery({
         ...nativeQueueReady,
         daemonSupportsNativeQueue: false,
         action: "send",
       }),
     ).toBeNull();
     expect(
-      resolveComposerQueueBehavior({
+      resolveComposerMessageDelivery({
         ...nativeQueueReady,
         daemonSupportsNativeQueue: false,
         action: "queue",
@@ -66,10 +72,10 @@ describe("resolveComposerQueueBehavior", () => {
 
   it("returns null for non-Pi providers even on a capable daemon", () => {
     expect(
-      resolveComposerQueueBehavior({ ...nativeQueueReady, provider: "claude", action: "send" }),
+      resolveComposerMessageDelivery({ ...nativeQueueReady, provider: "claude", action: "send" }),
     ).toBeNull();
     expect(
-      resolveComposerQueueBehavior({ ...nativeQueueReady, provider: null, action: "queue" }),
+      resolveComposerMessageDelivery({ ...nativeQueueReady, provider: null, action: "queue" }),
     ).toBeNull();
   });
 });

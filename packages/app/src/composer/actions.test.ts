@@ -164,7 +164,7 @@ interface FakeSendCall {
     messageId: string;
     images: Array<{ data: string; mimeType: string }>;
     attachments: AgentAttachment[];
-    queueBehavior?: "steer" | "followUp";
+    delivery?: "steer" | "follow_up";
   };
 }
 
@@ -406,7 +406,7 @@ describe("dispatchComposerAgentMessage", () => {
     expect(userMessage.optimistic).toBe(true);
   });
 
-  it("forwards the native queueBehavior to the send client and omits it otherwise", async () => {
+  it("forwards the native delivery to the send client and omits it otherwise", async () => {
     const client = createFakeSendClient();
     const stream = createFakeStream();
 
@@ -415,7 +415,7 @@ describe("dispatchComposerAgentMessage", () => {
       agentId: "agent",
       text: "steer the run",
       attachments: [],
-      queueBehavior: "steer",
+      delivery: "steer",
       encodeImages: passthroughEncodeImages,
       stream,
     });
@@ -429,8 +429,8 @@ describe("dispatchComposerAgentMessage", () => {
     });
 
     expect(client.calls).toHaveLength(2);
-    expect(client.calls[0].options.queueBehavior).toBe("steer");
-    expect("queueBehavior" in client.calls[1].options).toBe(false);
+    expect(client.calls[0].options.delivery).toBe("steer");
+    expect("delivery" in client.calls[1].options).toBe(false);
   });
 
   it("can send legacy GitHub attachment payloads for old daemons", async () => {

@@ -39,6 +39,7 @@ export interface StartAgentRunResult {
   outOfBand: boolean;
   /** True when the prompt was queued onto the active run instead of starting one. */
   enqueued: boolean;
+  delivery?: AgentEnqueueBehavior;
 }
 
 export async function startAgentRun(
@@ -70,14 +71,33 @@ export async function startAgentRun(
   // Sessions that support message queueing take precedence over replacement:
   // an active run keeps going and the prompt is queued against it. "never"
   // opts out and preserves the interrupt-and-replace path below.
-  if (await tryEnqueueOnActiveRun({ agentManager, agentId, prompt, logger, options, snapshot })) {
-    return { outOfBand: false, enqueued: true };
+  const enqueueResult = await tryEnqueueOnActiveRun({
+    agentManager,
+    agentId,
+    prompt,
+    logger,
+    options,
+    snapshot,
+  });
+  if (enqueueResult?.accepted) {
+    return toEnqueuedRunResult(enqueueResult, options?.runOptions?.clientMessageId);
   }
+  return startNormalAgentRun({ agentManager, agentId, prompt, logger, options, snapshot });
+}
+
+async function startNormalAgentRun(input: {
+  agentManager: AgentRunController;
+  agentId: string;
+  prompt: AgentPromptInput;
+  logger: Logger;
+  options: StartAgentRunOptions | undefined;
+  snapshot: ManagedAgent | null;
+}): Promise<StartAgentRunResult> {
+  const { agentManager, agentId, prompt, logger, options, snapshot } = input;
   const shouldReplace = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
-  const runOptions = options?.runOptions;
   const iterator = shouldReplace
-    ? await agentManager.replaceAgentRun(agentId, prompt, runOptions)
-    : agentManager.streamAgent(agentId, prompt, runOptions);
+    ? await agentManager.replaceAgentRun(agentId, prompt, options?.runOptions)
+    : agentManager.streamAgent(agentId, prompt, options?.runOptions);
   logger.trace(
     {
       agentId,
@@ -87,33 +107,50 @@ export async function startAgentRun(
     },
     "agent.session.start_stream.iterator_returned",
   );
-  void (async () => {
-    try {
-      for await (const _ of iterator) {
-        // Events are broadcast via AgentManager subscribers.
-      }
-      logger.trace(
-        {
-          agentId,
-          provider: snapshot?.provider,
-          providerSessionId: snapshot?.persistence?.sessionId ?? undefined,
-        },
-        "agent.session.iterator.drained",
-      );
-    } catch (error) {
-      logger.trace(
-        {
-          agentId,
-          provider: snapshot?.provider,
-          providerSessionId: snapshot?.persistence?.sessionId ?? undefined,
-          err: error,
-        },
-        "agent.session.iterator.error",
-      );
-      logger.error({ err: error, agentId }, "Agent stream failed");
-    }
-  })();
+  void drainAgentIterator(iterator, { agentId, logger, snapshot });
   return { outOfBand: false, enqueued: false };
+}
+
+async function drainAgentIterator(
+  iterator: AsyncIterable<unknown>,
+  input: { agentId: string; logger: Logger; snapshot: ManagedAgent | null },
+): Promise<void> {
+  const { agentId, logger, snapshot } = input;
+  try {
+    for await (const _ of iterator) {
+      // Events are broadcast via AgentManager subscribers.
+    }
+    logger.trace(
+      {
+        agentId,
+        provider: snapshot?.provider,
+        providerSessionId: snapshot?.persistence?.sessionId ?? undefined,
+      },
+      "agent.session.iterator.drained",
+    );
+  } catch (error) {
+    logger.trace(
+      {
+        agentId,
+        provider: snapshot?.provider,
+        providerSessionId: snapshot?.persistence?.sessionId ?? undefined,
+        err: error,
+      },
+      "agent.session.iterator.error",
+    );
+    logger.error({ err: error, agentId }, "Agent stream failed");
+  }
+}
+
+function toEnqueuedRunResult(
+  result: Extract<import("./agent-sdk-types.js").AgentEnqueueResult, { accepted: true }>,
+  _clientMessageId: string | undefined,
+): StartAgentRunResult {
+  return {
+    outOfBand: false,
+    enqueued: true,
+    delivery: result.behavior,
+  };
 }
 
 /**
@@ -128,22 +165,22 @@ async function tryEnqueueOnActiveRun(params: {
   logger: Logger;
   options: StartAgentRunOptions | undefined;
   snapshot: ManagedAgent | null;
-}): Promise<boolean> {
+}): Promise<import("./agent-sdk-types.js").AgentEnqueueResult | null> {
   const { agentManager, agentId, prompt, logger, options, snapshot } = params;
-  const enqueueBehavior = options?.enqueueBehavior ?? "steer";
+  const enqueueBehavior = options?.enqueueBehavior ?? "never";
   if (
     enqueueBehavior === "never" ||
     !snapshot?.capabilities?.supportsMessageQueue ||
     !agentManager.hasInFlightRun(agentId)
   ) {
-    return false;
+    return null;
   }
   const enqueueResult = await agentManager.enqueueAgentPrompt(agentId, prompt, {
     behavior: enqueueBehavior,
     clientMessageId: options?.runOptions?.clientMessageId,
   });
   if (!enqueueResult.accepted) {
-    return false;
+    return enqueueResult;
   }
   logger.trace(
     {
@@ -154,7 +191,7 @@ async function tryEnqueueOnActiveRun(params: {
     },
     "agent.session.start_stream.enqueued",
   );
-  return true;
+  return enqueueResult;
 }
 
 /**

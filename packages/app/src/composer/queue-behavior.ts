@@ -1,9 +1,9 @@
 /**
  * How a send to a running agent should be routed through the daemon's native
- * message queue: "steer" injects into the active run, "followUp" queues the
+ * message queue: "steer" injects into the active run, "follow_up" queues the
  * message daemon-side for after the current run.
  */
-export type ComposerQueueBehavior = "steer" | "followUp";
+export type ComposerMessageDelivery = "steer" | "follow_up";
 
 export type ComposerSendAction = "send" | "queue";
 
@@ -12,7 +12,7 @@ export type ComposerSendAction = "send" | "queue";
 // send-interrupts-run behavior.
 const NATIVE_MESSAGE_QUEUE_PROVIDERS: ReadonlySet<string> = new Set(["pi"]);
 
-// COMPAT(agentNativeMessageQueue): optional daemon feature. Older daemons (and
+// COMPAT(agentMessageQueue): optional daemon feature. Older daemons (and
 // protocol floors that predate the flag) simply omit it, so read features as a
 // plain boolean record instead of depending on the protocol feature type.
 export interface AgentNativeQueueServerInfo {
@@ -22,10 +22,10 @@ export interface AgentNativeQueueServerInfo {
 export function daemonSupportsAgentNativeMessageQueue(
   serverInfo: AgentNativeQueueServerInfo | null | undefined,
 ): boolean {
-  return serverInfo?.features?.agentNativeMessageQueue === true;
+  return serverInfo?.features?.agentMessageQueue === true;
 }
 
-export interface ResolveComposerQueueBehaviorInput {
+export interface ResolveComposerMessageDeliveryInput {
   provider: string | null;
   isAgentRunning: boolean;
   daemonSupportsNativeQueue: boolean;
@@ -41,14 +41,14 @@ export interface ResolveComposerQueueBehaviorInput {
  * interrupt-and-replace) otherwise. Stop is unaffected either way — it always
  * cancels the agent.
  */
-export function resolveComposerQueueBehavior(
-  input: ResolveComposerQueueBehaviorInput,
-): ComposerQueueBehavior | null {
+export function resolveComposerMessageDelivery(
+  input: ResolveComposerMessageDeliveryInput,
+): ComposerMessageDelivery | null {
   if (!input.isAgentRunning || !input.daemonSupportsNativeQueue) {
     return null;
   }
   if (input.provider === null || !NATIVE_MESSAGE_QUEUE_PROVIDERS.has(input.provider)) {
     return null;
   }
-  return input.action === "queue" ? "followUp" : "steer";
+  return input.action === "queue" ? "follow_up" : "steer";
 }

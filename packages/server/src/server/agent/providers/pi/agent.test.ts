@@ -1934,7 +1934,7 @@ describe("PiRpcAgentSession thinking levels", () => {
       "max",
     ]);
     await session.setThinkingOption("xhigh");
-    expect(fakeSession.setThinkingLevelRequests).toEqual(["high"]);
+    expect(fakeSession.setThinkingLevelRequests).toEqual(["max"]);
   });
 });
 
@@ -1954,7 +1954,7 @@ describe("PiRpcAgentSession queueing and settlement", () => {
     expect(result).toEqual({
       accepted: true,
       behavior: "steer",
-      queue: { steering: ["focus on tests"], followUp: [] },
+      queue: [{ clientMessageId: "cm-steer", behavior: "steer", text: "focus on tests" }],
     });
     expect(fakeSession.prompts).toEqual([
       { message: "start work", imageCount: 0 },
@@ -1988,18 +1988,56 @@ describe("PiRpcAgentSession queueing and settlement", () => {
     });
   });
 
+  test("does not let a queued steer steal the foreground prompt marker", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    await session.startTurn("start work", { clientMessageId: "cm-foreground" });
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "turn_start" });
+
+    await session.enqueuePrompt("focus on tests", {
+      behavior: "steer",
+      clientMessageId: "cm-steer",
+    });
+    fakeSession.finishSubmittedUserMessage({
+      id: "entry-foreground",
+      parentId: null,
+      text: "start work",
+    });
+    fakeSession.deliverQueuedPrompt("steer", "focus on tests");
+    fakeSession.finishSubmittedUserMessage({
+      id: "entry-steer",
+      parentId: "entry-foreground",
+      text: "focus on tests",
+    });
+
+    expect(events.timelineItems().filter((item) => item.type === "user_message")).toEqual([
+      {
+        type: "user_message",
+        text: "start work",
+        messageId: "entry-foreground",
+        clientMessageId: "cm-foreground",
+      },
+      {
+        type: "user_message",
+        text: "focus on tests",
+        messageId: "entry-steer",
+        clientMessageId: "cm-steer",
+      },
+    ]);
+  });
+
   test("reports a rejected enqueue without accepting it", async () => {
     const { pi, session } = await createSession();
     const fakeSession = pi.latestSession();
     fakeSession.promptError = new Error("streamingBehavior is required");
 
-    const result = await session.enqueuePrompt("nope", { behavior: "followUp" });
-
-    expect(result).toEqual({
-      accepted: false,
+    const result = await session.enqueuePrompt("nope", {
       behavior: "followUp",
-      queue: { steering: [], followUp: [] },
+      clientMessageId: "cm-rejected",
     });
+
+    expect(result).toEqual({ accepted: false });
   });
 
   test("settles the turn on agent_settled instead of agent_end when willRetry is reported", async () => {

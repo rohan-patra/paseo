@@ -32,60 +32,32 @@ Pi MCP support depends on the open-source `pi-mcp-adapter` extension being loade
 
 Pi import discovery reads Pi's persisted JSONL session files because Pi RPC does not expose a recent-session listing command. Resume and full history hydration still go through `pi --mode rpc` using the session file as `nativeHandle`.
 
-### Pi per-model thinking levels are not yet capability-aware
+### Pi per-model thinking levels
 
-Upstream Pi's `models.json` schema carries a per-model `thinkingLevelMap` (`off` through `max`) that
-remaps or disables abstract levels for that specific model — an unmapped `xhigh`/`max` means the
-level is unsupported (opt-in), while a level explicitly mapped to `null` means it's opt-out. Pi's
-own `agent-session.ts` (`getSupportedThinkingLevels` / `clampThinkingLevel`, backed by
-`@earendil-works/pi-ai`'s `getSupportedThinkingLevels`/`clampThinkingLevel`) uses this to filter the
-levels it will actually honor per model, and Pi RPC exposes `get_available_thinking_levels` so a
-client can ask before rendering a picker. **Paseo's Pi adapter (`providers/pi/agent.ts`) never calls
-that RPC.** `PI_THINKING_OPTIONS` is a fixed, hardcoded array of all seven levels, and
-`fetchCatalog` (`thinkingOptions: model.reasoning ? PI_THINKING_OPTIONS.map(...) : undefined`) offers
-every level whenever a model merely has `reasoning: true`, regardless of what that model's
-`thinkingLevelMap` actually supports. `PiModel` in `pi/rpc-types.ts` also has no field carrying the
-map, so the RPC's `get_available_models` response can't currently convey it even if the adapter
-wanted to read it locally instead of calling `get_available_thinking_levels`.
+Pi model catalog records carry a `thinkingLevelMap` (`off` through `max`). A `null` value disables a
+level, omitted standard levels use Pi's default mapping, and extended `xhigh`/`max` levels are opt-in.
+The Pi adapter mirrors Pi's `getSupportedThinkingLevels` and `clampThinkingLevel` semantics when it
+builds each model definition, so the picker contains only options that model supports. Catalog
+mapping uses `get_available_models`; it does not switch through every model. For the active session,
+`get_available_thinking_levels` validates the selected model and `get_state.thinkingLevel` remains
+authoritative after Pi silently clamps a request. Paseo stores that effective value and emits a
+provider notice when it differs from the requested value.
 
-Practical effect: selecting an option the model's `thinkingLevelMap` doesn't support isn't rejected —
-Pi's `setThinkingLevel`/`clampThinkingLevel` silently snaps to the nearest supported level (searching
-upward then downward through the abstract ladder). The Paseo UI will show the level the user picked
-as selected, while the underlying session may actually be running at a different level, with no
-provider notice surfaced (`setThinkingOption` doesn't return an `AgentProviderNotice` for this case).
+OMP follows a similar pattern using `model.thinking.efforts` and remains a useful parity reference.
 
-Paseo's sibling **OMP** provider (`providers/omp/map-omp-model.ts`, `resolveOmpThinkingConfig`)
-already solves this correctly: OMP's model catalog RPC reports `model.thinking.efforts` and
-`model.thinking.defaultLevel` per model (falling back to the full static list only for older OMP
-binaries that don't report it), and `mapOmpModel` filters `OMP_THINKING_OPTIONS` down to the
-reported set before it ever reaches the client. Any plan to fix per-model thinking levels for Pi
-should follow that OMP pattern — either read an equivalent field from Pi's model catalog once Pi's
-RPC reports one, or call `get_available_thinking_levels` per selected model — rather than reinventing
-filtering logic. Confirm first whether Pi's `get_available_models` response actually carries
-thinking-map data before assuming a new field needs to round-trip an extra RPC per model.
+### Pi native steer/follow-up wiring
 
-### Pi has no native steer/follow-up wiring; OMP already does
+When a Pi agent already has an active run, the shared `AgentSession.enqueuePrompt` seam sends Pi's
+`prompt` RPC with `streamingBehavior: "steer" | "followUp"`. Using `prompt` rather than the bare
+`steer`/`follow_up` verbs preserves Pi's extension-command and prompt-template handling and safely
+handles the race where the previous run becomes idle first. Normal running sends default to steering;
+the explicit queue action requests follow-up. Other providers retain their existing behavior unless
+they advertise `supportsMessageQueue`.
 
-Upstream Pi's `AgentSession` supports mid-turn message queuing through two RPC verbs, `steer` and
-`follow_up` (plus `set_steering_mode`/`set_follow_up_mode` and a `queue_update` event stream), backed
-by `agent.steer()`/`agent.followUp()` in `pi-agent-core`. `steer()` messages are delivered after the
-current assistant turn finishes its tool calls but before the next LLM call; `follow_up()` messages
-are delivered only once the agent has no more tool calls or steering messages queued — i.e. genuinely
-after the agent would otherwise stop.
-
-**`PiRuntimeSession` (`providers/pi/runtime.ts`) has no `steer`/`followUp` methods at all**, and
-`providers/pi/agent.ts#startTurn` throws `"A Pi turn is already active"` if a prompt arrives while
-`this.activeTurnId` is set — there is no queuing path, native or Paseo-level, for messages submitted
-to a running Pi turn today.
-
-OMP's adapter (`providers/omp/runtime.ts` / `providers/omp/agent.ts`) already wires this: its
-`OmpRuntimeSession` has real `steer(message, images?)` / `followUp(message, images?)` methods, and
-`tryHandleOutOfBand` recognizes `/steer` and `/follow-up` slash-command input and calls them directly
-— but only as user-typed slash commands, not as a first-class composer affordance (no mode toggle, no
-surfaced `queue_update` state in the Paseo protocol). Any plan wiring native steer/follow-up into Pi
-should treat OMP's implementation as the reference shape, but note it is itself only a partial
-integration (slash-command triggered, no queue visibility) — don't assume OMP already proves out the
-full UX.
+Pi `queue_update`, `agent_end.willRetry`, and `agent_settled` events are decoded by the adapter. The
+adapter emits provider turn events while `AgentRunState` and `AgentManager` remain the sole owners of
+Paseo run settlement. A prompt accepted at the idle boundary is adopted as a provider-owned turn so
+its stream remains attributable and interruptible.
 
 ### The abort RPC does not clear queued steer/follow-up messages
 

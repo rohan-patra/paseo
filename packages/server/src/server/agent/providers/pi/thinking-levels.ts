@@ -58,10 +58,9 @@ export function supportedPiThinkingLevels(model: PiModel | null | undefined): Pi
 }
 
 /**
- * Clamp a requested level to the supported set: prefer the nearest supported
- * level at or below the request, then the nearest above (for models where low
- * levels such as "off" cannot be selected). Returns the request unchanged when
- * nothing is supported so the runtime stays the final authority.
+ * Clamp exactly as Pi does: prefer the first supported level at or above the
+ * request, then search downward. Returns the request unchanged when nothing is
+ * supported so the runtime stays the final authority.
  */
 export function clampPiThinkingLevel(
   level: PiThinkingLevel,
@@ -71,13 +70,13 @@ export function clampPiThinkingLevel(
     return level;
   }
   const index = PI_THINKING_LEVELS.indexOf(level);
-  for (let candidate = index - 1; candidate >= 0; candidate -= 1) {
+  for (let candidate = index; candidate < PI_THINKING_LEVELS.length; candidate += 1) {
     const candidateLevel = PI_THINKING_LEVELS[candidate]!;
     if (supported.includes(candidateLevel)) {
       return candidateLevel;
     }
   }
-  for (let candidate = index + 1; candidate < PI_THINKING_LEVELS.length; candidate += 1) {
+  for (let candidate = index - 1; candidate >= 0; candidate -= 1) {
     const candidateLevel = PI_THINKING_LEVELS[candidate]!;
     if (supported.includes(candidateLevel)) {
       return candidateLevel;

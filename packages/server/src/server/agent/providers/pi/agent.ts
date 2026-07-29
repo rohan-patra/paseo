@@ -9,6 +9,9 @@ import { z } from "zod";
 import {
   type AgentCapabilityFlags,
   type AgentClient,
+  type AgentEnqueueOptions,
+  type AgentEnqueueResult,
+  type AgentQueuedMessage,
   type AgentFeature,
   type AgentLaunchContext,
   type AgentMetadata,
@@ -167,6 +170,7 @@ const PI_CAPABILITIES: AgentCapabilityFlags = {
   supportsRewindConversation: true,
   supportsRewindFiles: false,
   supportsRewindBoth: false,
+  supportsMessageQueue: true,
 };
 
 const PI_THINKING_OPTIONS: ReadonlyArray<{
@@ -292,28 +296,15 @@ interface PiSlashCommandInvocation {
   args?: string;
 }
 
-// Agreed AgentSession.enqueuePrompt interface (interface addition owned by the
-// agent-manager/protocol slices): enqueue a prompt against a running turn with
-// Pi streamingBehavior semantics and report the resulting prompt queue.
-export interface PiEnqueuePromptOptions {
-  behavior: PiStreamingBehavior;
-  clientMessageId?: string;
-}
-
 export interface PiPromptQueueSnapshot {
   steering: string[];
   followUp: string[];
 }
 
-export interface PiEnqueuePromptResult {
-  accepted: boolean;
-  behavior: PiStreamingBehavior;
-  queue: PiPromptQueueSnapshot;
-}
-
 interface PiPendingEnqueuedPrompt {
   text: string;
-  clientMessageId: string | null;
+  clientMessageId: string;
+  behavior: PiStreamingBehavior;
 }
 
 type AutoCompactMode = boolean | "toggle" | "unknown";
@@ -1261,6 +1252,7 @@ export class PiRpcAgentSession implements AgentSession {
   private activeClientMessageId: string | null = null;
   private activeAssistantMessageId: string | null = null;
   private activeTurnStarted = false;
+  private activeForegroundPromptText: string | null = null;
   private activeNoTurnPromptText: string | null = null;
   private readonly pendingNoTurnOutputs: Array<{ turnId: string; message: string }> = [];
   private activePromptRequestId: string | null = null;
@@ -1344,6 +1336,7 @@ export class PiRpcAgentSession implements AgentSession {
     this.activeAssistantMessageId = null;
     this.activeTurnStarted = false;
     this.activePromptRequestId = null;
+    this.activeForegroundPromptText = payload.text;
     this.clearNoTurnBuffers();
     this.activeNoTurnPromptText = payload.text;
     const shouldProbeForNoTurnPrompt = this.parseSlashCommandInput(payload.text) !== null;
@@ -1511,6 +1504,11 @@ export class PiRpcAgentSession implements AgentSession {
       }
       throw error;
     }
+    // Pi RPC currently has no clear_queue command. Forget local correlation so
+    // any native message that survives abort is surfaced honestly if Pi later
+    // replays it instead of being silently treated as the old queued row.
+    this.pendingEnqueuedPrompts.splice(0, this.pendingEnqueuedPrompts.length);
+    this.promptQueue = { steering: [], followUp: [] };
     if (turnId && this.activeTurnId === turnId) {
       this.activeTurnId = null;
       this.activeClientMessageId = null;
@@ -1671,12 +1669,13 @@ export class PiRpcAgentSession implements AgentSession {
 
   async enqueuePrompt(
     prompt: AgentPromptInput,
-    options: PiEnqueuePromptOptions,
-  ): Promise<PiEnqueuePromptResult> {
+    options: AgentEnqueueOptions,
+  ): Promise<AgentEnqueueResult> {
     const payload = convertPromptInput(prompt, { model: this.state.model });
     const pending: PiPendingEnqueuedPrompt = {
       text: payload.text,
-      clientMessageId: options.clientMessageId ?? null,
+      clientMessageId: options.clientMessageId,
+      behavior: options.behavior,
     };
     this.pendingEnqueuedPrompts.push(pending);
     try {
@@ -1685,14 +1684,29 @@ export class PiRpcAgentSession implements AgentSession {
       await this.runtimeSession.prompt(payload.text, payload.images, {
         streamingBehavior: options.behavior,
       });
+      const nativeQueue =
+        options.behavior === "steer" ? this.promptQueue.steering : this.promptQueue.followUp;
+      pending.text = nativeQueue.at(-1) ?? pending.text;
     } catch {
       const index = this.pendingEnqueuedPrompts.indexOf(pending);
       if (index !== -1) {
         this.pendingEnqueuedPrompts.splice(index, 1);
       }
-      return { accepted: false, behavior: options.behavior, queue: this.getPromptQueue() };
+      return { accepted: false };
     }
-    return { accepted: true, behavior: options.behavior, queue: this.getPromptQueue() };
+    return {
+      accepted: true,
+      behavior: options.behavior,
+      queue: this.getQueuedMessages(),
+    };
+  }
+
+  private getQueuedMessages(): AgentQueuedMessage[] {
+    return this.pendingEnqueuedPrompts.map((pending) => ({
+      clientMessageId: pending.clientMessageId,
+      behavior: pending.behavior,
+      text: pending.text,
+    }));
   }
 
   getPromptQueue(): PiPromptQueueSnapshot {
@@ -1972,10 +1986,16 @@ export class PiRpcAgentSession implements AgentSession {
     if (!entry) {
       return true;
     }
-    // Enqueued prompts carry their own client message id; the active turn's id
-    // belongs to the foreground submission only.
-    const enqueued = this.takeEnqueuedPrompt(entry.text);
-    const clientMessageId = enqueued ? enqueued.clientMessageId : this.activeClientMessageId;
+    // Match an exact queued echo first, but never let the FIFO fallback steal
+    // the foreground prompt when a steer was accepted before its marker arrived.
+    let enqueued = this.takeExactEnqueuedPrompt(entry.text);
+    let clientMessageId = enqueued?.clientMessageId ?? null;
+    if (!clientMessageId && entry.text === this.activeForegroundPromptText) {
+      clientMessageId = this.activeClientMessageId;
+    } else if (!enqueued) {
+      enqueued = this.pendingEnqueuedPrompts.shift() ?? null;
+      clientMessageId = enqueued?.clientMessageId ?? null;
+    }
     this.emit({
       type: "timeline",
       provider: this.provider,
@@ -2281,8 +2301,8 @@ export class PiRpcAgentSession implements AgentSession {
       case "agent_settled": {
         const settlement = this.pendingSettlement;
         this.pendingSettlement = null;
-        if (settlement || this.activeTurnId) {
-          this.completeTurn(settlement?.turnId ?? turnId, settlement?.messages ?? []);
+        if (settlement && settlement.turnId === this.activeTurnId && this.activeTurnStarted) {
+          this.completeTurn(settlement.turnId, settlement.messages);
         }
         return true;
       }
@@ -2300,6 +2320,16 @@ export class PiRpcAgentSession implements AgentSession {
       return;
     }
     this.activeTurnId = randomUUID();
+    const [pending] = this.pendingEnqueuedPrompts;
+    if (pending) {
+      this.emit({
+        type: "queued_message_adopted",
+        provider: this.provider,
+        clientMessageId: pending.clientMessageId,
+        behavior: pending.behavior,
+        turnId: this.activeTurnId,
+      });
+    }
     this.lastInterruptedTurnId = null;
     this.activeClientMessageId = null;
     this.activeAssistantMessageId = null;
@@ -2307,12 +2337,12 @@ export class PiRpcAgentSession implements AgentSession {
     this.clearNoTurnBuffers();
   }
 
-  private takeEnqueuedPrompt(text: string): PiPendingEnqueuedPrompt | null {
-    const index = this.pendingEnqueuedPrompts.findIndex((pending) => pending.text === text);
-    if (index === -1) {
+  private takeExactEnqueuedPrompt(text: string): PiPendingEnqueuedPrompt | null {
+    const exactIndex = this.pendingEnqueuedPrompts.findIndex((pending) => pending.text === text);
+    if (exactIndex === -1) {
       return null;
     }
-    return this.pendingEnqueuedPrompts.splice(index, 1)[0] ?? null;
+    return this.pendingEnqueuedPrompts.splice(exactIndex, 1)[0] ?? null;
   }
 
   private handleToolExecutionEnd(
@@ -2484,6 +2514,7 @@ export class PiRpcAgentSession implements AgentSession {
     this.activeClientMessageId = null;
     this.activeAssistantMessageId = null;
     this.activeTurnStarted = false;
+    this.activeForegroundPromptText = null;
     this.clearNoTurnBuffers();
     const errorMessage = latestPiErrorMessage(messages);
     if (typeof errorMessage === "string" && errorMessage.length > 0) {

@@ -92,9 +92,9 @@ import type { KeyboardActionDefinition } from "@/keyboard/keyboard-action-dispat
 import type { MessageInputKeyboardActionKind } from "@/keyboard/actions";
 import { submitAgentInput } from "@/composer/submit";
 import {
-  type ComposerQueueBehavior,
+  type ComposerMessageDelivery,
   daemonSupportsAgentNativeMessageQueue,
-  resolveComposerQueueBehavior,
+  resolveComposerMessageDelivery,
 } from "@/composer/queue-behavior";
 import { ComposerKeyboardScopeProvider } from "@/composer/keyboard-scope";
 import { useAppSettings } from "@/hooks/use-settings";
@@ -1216,7 +1216,7 @@ export function Composer({
         agentId: string,
         text: string,
         attachments: ComposerAttachment[],
-        queueBehavior?: ComposerQueueBehavior,
+        delivery?: ComposerMessageDelivery,
       ) => Promise<void>)
     | null
   >(null);
@@ -1273,7 +1273,7 @@ export function Composer({
     async (
       text: string,
       submitAttachments: ComposerAttachment[],
-      queueBehavior?: ComposerQueueBehavior,
+      delivery?: ComposerMessageDelivery,
     ) => {
       onMessageSent?.();
       if (onSubmitMessageRef.current) {
@@ -1283,7 +1283,7 @@ export function Composer({
       if (!sendAgentMessageRef.current) {
         throw new Error(t("workspace.terminal.hostDisconnected"));
       }
-      await sendAgentMessageRef.current(agentIdRef.current, text, submitAttachments, queueBehavior);
+      await sendAgentMessageRef.current(agentIdRef.current, text, submitAttachments, delivery);
     },
     [cwd, onMessageSent, t],
   );
@@ -1297,7 +1297,7 @@ export function Composer({
       targetAgentId: string,
       text: string,
       sendAttachments: ComposerAttachment[],
-      queueBehavior?: ComposerQueueBehavior,
+      delivery?: ComposerMessageDelivery,
     ) => {
       if (!client) {
         throw new Error(t("workspace.terminal.hostDisconnected"));
@@ -1316,7 +1316,7 @@ export function Composer({
         attachmentSubmitFormat: resolveComposerAttachmentSubmitFormat({
           supportsForgeAttachments: supportsForgeSearch,
         }),
-        queueBehavior,
+        delivery,
         encodeImages,
         stream,
       });
@@ -1377,13 +1377,13 @@ export function Composer({
       outgoingMessage: string,
       outgoingAttachments: ComposerAttachment[],
       forceSend?: boolean,
-      queueBehaviorOverride?: ComposerQueueBehavior,
+      deliveryOverride?: ComposerMessageDelivery,
     ) => {
       // A Pi agent on a native-queue daemon steers the running turn instead of
       // interrupting it (or queueing app-locally); Stop remains cancelAgent.
-      const queueBehavior =
-        queueBehaviorOverride ??
-        resolveComposerQueueBehavior({
+      const delivery =
+        deliveryOverride ??
+        resolveComposerMessageDelivery({
           provider: agentState.provider,
           isAgentRunning,
           daemonSupportsNativeQueue,
@@ -1395,7 +1395,7 @@ export function Composer({
         hasExternalContent,
         allowEmptySubmit,
         forceSend,
-        queueBehavior,
+        delivery,
         submitBehavior,
         isAgentRunning,
         // Parent-managed submits are still valid submit paths even when the
@@ -1407,7 +1407,7 @@ export function Composer({
         submitMessage: async ({
           message: submitText,
           attachments: submitAttachments,
-          queueBehavior: submitQueueBehavior,
+          delivery: submitQueueBehavior,
         }) => {
           if (submitBehavior !== "preserve-and-lock") {
             beginSubmit(submitAttachments);
@@ -1719,7 +1719,7 @@ export function Composer({
       if (clientSlashCommand && runClientSlashCommand(clientSlashCommand)) {
         return;
       }
-      const nativeQueueBehavior = resolveComposerQueueBehavior({
+      const nativeQueueBehavior = resolveComposerMessageDelivery({
         provider: agentState.provider,
         isAgentRunning,
         daemonSupportsNativeQueue,
