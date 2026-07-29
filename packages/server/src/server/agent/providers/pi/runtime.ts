@@ -6,6 +6,8 @@ import type {
   PiRuntimeEvent,
   PiSessionState,
   PiSessionStats,
+  PiStreamingBehavior,
+  PiThinkingLevel,
 } from "./rpc-types.js";
 import type { ProviderRuntimeSettings } from "../../provider-launch-config.js";
 
@@ -38,11 +40,21 @@ export interface PiStartSessionInput {
   extraArgs?: string[];
 }
 
+export interface PiPromptOptions {
+  /**
+   * Required by Pi when the agent is already streaming: queue the message as a
+   * steering interjection or a follow-up delivered after the agent stops.
+   * Harmless when the agent is idle — Pi starts a normal run.
+   */
+  streamingBehavior?: PiStreamingBehavior;
+}
+
 export interface PiRuntimeSession {
   onEvent(callback: (event: PiRuntimeEvent) => void): () => void;
   prompt(
     message: string,
     images?: Array<{ type: "image"; data: string; mimeType: string }>,
+    options?: PiPromptOptions,
   ): Promise<PiPromptAck>;
   compact(customInstructions?: string): Promise<void>;
   setAutoCompaction(enabled: boolean): Promise<void>;
@@ -52,6 +64,7 @@ export interface PiRuntimeSession {
   getAvailableModels(timeoutMs?: number | null): Promise<PiModel[]>;
   setModel(provider: string, modelId: string): Promise<PiModel>;
   setThinkingLevel(level: string): Promise<void>;
+  getAvailableThinkingLevels(): Promise<PiThinkingLevel[]>;
   getSessionStats(): Promise<PiSessionStats>;
   getCommands(): Promise<PiRpcSlashCommand[]>;
   request(

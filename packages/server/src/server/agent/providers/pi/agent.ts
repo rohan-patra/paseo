@@ -74,8 +74,14 @@ import type {
   PiRuntimeEvent,
   PiSessionStats,
   PiSessionState,
+  PiStreamingBehavior,
   PiThinkingLevel,
 } from "./rpc-types.js";
+import {
+  clampPiThinkingLevel,
+  normalizePiThinkingOption,
+  supportedPiThinkingLevels,
+} from "./thinking-levels.js";
 import {
   mapToolDetail,
   parseToolArgs,
@@ -286,6 +292,30 @@ interface PiSlashCommandInvocation {
   args?: string;
 }
 
+// Agreed AgentSession.enqueuePrompt interface (interface addition owned by the
+// agent-manager/protocol slices): enqueue a prompt against a running turn with
+// Pi streamingBehavior semantics and report the resulting prompt queue.
+export interface PiEnqueuePromptOptions {
+  behavior: PiStreamingBehavior;
+  clientMessageId?: string;
+}
+
+export interface PiPromptQueueSnapshot {
+  steering: string[];
+  followUp: string[];
+}
+
+export interface PiEnqueuePromptResult {
+  accepted: boolean;
+  behavior: PiStreamingBehavior;
+  queue: PiPromptQueueSnapshot;
+}
+
+interface PiPendingEnqueuedPrompt {
+  text: string;
+  clientMessageId: string | null;
+}
+
 type AutoCompactMode = boolean | "toggle" | "unknown";
 
 function normalizePiModelLabel(label: string): string {
@@ -318,25 +348,6 @@ export function transformPiModels(models: AgentModelDefinition[]): AgentModelDef
   });
 }
 
-function isPiThinkingLevel(value: string | null | undefined): value is PiThinkingLevel {
-  return (
-    value === "off" ||
-    value === "minimal" ||
-    value === "low" ||
-    value === "medium" ||
-    value === "high" ||
-    value === "xhigh" ||
-    value === "max"
-  );
-}
-
-function normalizePiThinkingOption(value: string | null | undefined): PiThinkingLevel | null {
-  if (!value) {
-    return null;
-  }
-  return isPiThinkingLevel(value) ? value : null;
-}
-
 function parseAutoCompactMode(value: string | undefined): AutoCompactMode {
   const mode = (value ?? "toggle").trim().toLowerCase();
   if (mode === "on" || mode === "true" || mode === "enable" || mode === "enabled") {
@@ -364,6 +375,11 @@ function mapThinkingOption(option: (typeof PI_THINKING_OPTIONS)[number]) {
     };
   }
   return mappedOption;
+}
+
+function describePiModelForNotice(model: PiModel | null | undefined): string {
+  const id = modelToId(model);
+  return id ? `model '${id}'` : "the current model";
 }
 
 function toAgentUsage(stats: PiSessionStats): AgentUsage | undefined {
@@ -798,12 +814,18 @@ function isPiRequestAbortError(error: unknown): boolean {
   return /\brequest was aborted\b|\babort(ed)?\b/i.test(toDiagnosticErrorMessage(error));
 }
 
+// Effective get_state precedence: the runtime's reported thinkingLevel is the
+// effective value (Pi may clamp a requested level to the model's supported
+// set); the locally cached option is only a fallback for Pi-compatible
+// runtimes that omit it from state.
 function resolveThinkingOptionId(
   cachedThinkingOptionId: string | null,
-  sessionThinkingLevel: PiThinkingLevel,
+  sessionThinkingLevel: PiThinkingLevel | undefined,
 ): PiThinkingLevel | null {
-  const currentThinking = cachedThinkingOptionId ?? sessionThinkingLevel;
-  return normalizePiThinkingOption(currentThinking);
+  return (
+    normalizePiThinkingOption(sessionThinkingLevel) ??
+    normalizePiThinkingOption(cachedThinkingOptionId)
+  );
 }
 
 function modelToId(model: PiModel | null | undefined): string | null {
@@ -1029,6 +1051,8 @@ function isPiAgentSessionEvent(event: PiRuntimeEvent): event is PiAgentSessionEv
     case "compaction_start":
     case "compaction_end":
     case "agent_end":
+    case "agent_settled":
+    case "queue_update":
       return true;
     default:
       return false;
@@ -1194,6 +1218,7 @@ function buildExtensionUiResponse(
 }
 
 function mapPiModel(model: PiModel, provider: AgentProvider): AgentModelDefinition {
+  const supportedLevels = supportedPiThinkingLevels(model);
   return {
     provider,
     id: `${model.provider}/${model.id}`,
@@ -1203,8 +1228,14 @@ function mapPiModel(model: PiModel, provider: AgentProvider): AgentModelDefiniti
       provider: model.provider,
       modelId: model.id,
     },
-    thinkingOptions: model.reasoning ? PI_THINKING_OPTIONS.map(mapThinkingOption) : undefined,
-    defaultThinkingOptionId: model.reasoning ? DEFAULT_PI_THINKING_LEVEL : undefined,
+    thinkingOptions: model.reasoning
+      ? PI_THINKING_OPTIONS.filter((option) => supportedLevels.includes(option.id)).map(
+          mapThinkingOption,
+        )
+      : undefined,
+    defaultThinkingOptionId: model.reasoning
+      ? clampPiThinkingLevel(DEFAULT_PI_THINKING_LEVEL, supportedLevels)
+      : undefined,
   };
 }
 
@@ -1244,6 +1275,14 @@ export class PiRpcAgentSession implements AgentSession {
   private outOfBandCompactionCompleted = false;
   private commandCache: AgentSlashCommand[] | null = null;
   private state: PiSessionState;
+  // Latest queue_update snapshot of Pi's pending steering/follow-up queue.
+  private promptQueue: PiPromptQueueSnapshot = { steering: [], followUp: [] };
+  // Prompts accepted via enqueuePrompt whose user-message delivery (and
+  // possibly their own agent run) is still outstanding.
+  private readonly pendingEnqueuedPrompts: PiPendingEnqueuedPrompt[] = [];
+  // agent_end payload held back until agent_settled confirms the run is done.
+  private pendingSettlement: { turnId: string | undefined; messages: PiAgentMessage[] } | null =
+    null;
   private readonly currentModeId: string | null;
   private closed = false;
   // Pi reports an aborted OpenAI Responses stream before the abort RPC resolves.
@@ -1478,6 +1517,9 @@ export class PiRpcAgentSession implements AgentSession {
       this.activeTurnStarted = false;
       this.activeAssistantMessageId = null;
       this.clearNoTurnBuffers();
+      if (this.pendingSettlement?.turnId === turnId) {
+        this.pendingSettlement = null;
+      }
       this.emit({
         type: "turn_canceled",
         provider: this.provider,
@@ -1588,14 +1630,75 @@ export class PiRpcAgentSession implements AgentSession {
     this.config.model = `${model.provider}/${model.id}`;
   }
 
-  async setThinkingOption(thinkingOptionId: string | null): Promise<void> {
-    const thinkingLevel = normalizePiThinkingOption(thinkingOptionId) ?? DEFAULT_PI_THINKING_LEVEL;
-    await this.runtimeSession.setThinkingLevel(thinkingLevel);
-    this.lastKnownThinkingOptionId = thinkingLevel;
-    this.config.thinkingOptionId = thinkingLevel;
+  async setThinkingOption(thinkingOptionId: string | null): Promise<void | AgentProviderNotice> {
+    const requested = normalizePiThinkingOption(thinkingOptionId) ?? DEFAULT_PI_THINKING_LEVEL;
+    const supportedLevels = await this.getAvailableThinkingLevels();
+    const clamped = clampPiThinkingLevel(requested, supportedLevels);
+    await this.runtimeSession.setThinkingLevel(clamped);
+    // Effective get_state precedence: Pi may clamp beyond our supported-level
+    // view (e.g. per-provider mapping quirks); the runtime's reported level is
+    // the effective one.
+    await this.refreshState().catch(() => undefined);
+    const effective = normalizePiThinkingOption(this.state.thinkingLevel) ?? clamped;
+    this.lastKnownThinkingOptionId = effective;
+    this.config.thinkingOptionId = effective;
     this.state = {
       ...this.state,
-      thinkingLevel,
+      thinkingLevel: effective,
+    };
+    if (effective !== requested) {
+      return {
+        type: "info",
+        message: `Thinking level '${requested}' is not supported by ${describePiModelForNotice(this.state.model)}; using '${effective}'.`,
+      };
+    }
+  }
+
+  async getAvailableThinkingLevels(): Promise<PiThinkingLevel[]> {
+    try {
+      const levels = await this.runtimeSession.getAvailableThinkingLevels();
+      if (levels.length > 0) {
+        return levels;
+      }
+    } catch {
+      // COMPAT(piAvailableThinkingLevels): added in v0.2.3 — older Pi binaries
+      // lack the `get_available_thinking_levels` RPC; derive supported levels
+      // from the model's thinkingLevelMap below. Remove after 2026-08-01 once
+      // the supported Pi floor includes the RPC.
+    }
+    return supportedPiThinkingLevels(this.state.model);
+  }
+
+  async enqueuePrompt(
+    prompt: AgentPromptInput,
+    options: PiEnqueuePromptOptions,
+  ): Promise<PiEnqueuePromptResult> {
+    const payload = convertPromptInput(prompt, { model: this.state.model });
+    const pending: PiPendingEnqueuedPrompt = {
+      text: payload.text,
+      clientMessageId: options.clientMessageId ?? null,
+    };
+    this.pendingEnqueuedPrompts.push(pending);
+    try {
+      // Pi emits queue_update before acknowledging the prompt, so the snapshot
+      // returned below already includes the accepted message.
+      await this.runtimeSession.prompt(payload.text, payload.images, {
+        streamingBehavior: options.behavior,
+      });
+    } catch {
+      const index = this.pendingEnqueuedPrompts.indexOf(pending);
+      if (index !== -1) {
+        this.pendingEnqueuedPrompts.splice(index, 1);
+      }
+      return { accepted: false, behavior: options.behavior, queue: this.getPromptQueue() };
+    }
+    return { accepted: true, behavior: options.behavior, queue: this.getPromptQueue() };
+  }
+
+  getPromptQueue(): PiPromptQueueSnapshot {
+    return {
+      steering: [...this.promptQueue.steering],
+      followUp: [...this.promptQueue.followUp],
     };
   }
 
@@ -1869,6 +1972,10 @@ export class PiRpcAgentSession implements AgentSession {
     if (!entry) {
       return true;
     }
+    // Enqueued prompts carry their own client message id; the active turn's id
+    // belongs to the foreground submission only.
+    const enqueued = this.takeEnqueuedPrompt(entry.text);
+    const clientMessageId = enqueued ? enqueued.clientMessageId : this.activeClientMessageId;
     this.emit({
       type: "timeline",
       provider: this.provider,
@@ -1877,7 +1984,7 @@ export class PiRpcAgentSession implements AgentSession {
         type: "user_message",
         text: entry.text,
         messageId: entry.id,
-        ...(this.activeClientMessageId ? { clientMessageId: this.activeClientMessageId } : {}),
+        ...(clientMessageId ? { clientMessageId } : {}),
       },
     });
     return true;
@@ -2042,6 +2149,9 @@ export class PiRpcAgentSession implements AgentSession {
 
   private handleProcessExit(error: string): void {
     this.rejectAllExtensionResults(new Error(error));
+    this.pendingSettlement = null;
+    this.pendingEnqueuedPrompts.splice(0, this.pendingEnqueuedPrompts.length);
+    this.promptQueue = { steering: [], followUp: [] };
     if (!this.activeTurnId) {
       return;
     }
@@ -2059,27 +2169,12 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   private handleSessionEvent(event: PiAgentSessionEvent): void {
+    if (this.handleRunLifecycleEvent(event)) {
+      return;
+    }
     const turnId = this.currentTurnIdForEvent();
 
     switch (event.type) {
-      case "agent_start":
-        this.activeTurnStarted = true;
-        this.clearNoTurnBuffers();
-        this.emit({
-          type: "thread_started",
-          provider: this.provider,
-          sessionId: this.state.sessionId,
-        });
-        return;
-      case "turn_start":
-        this.activeTurnStarted = true;
-        this.clearNoTurnBuffers();
-        this.emit({
-          type: "turn_started",
-          provider: this.provider,
-          turnId,
-        });
-        return;
       case "message_start":
         this.handleMessageStart(event);
         return;
@@ -2130,12 +2225,94 @@ export class PiRpcAgentSession implements AgentSession {
           },
         });
         return;
-      case "agent_end":
-        this.completeTurn(turnId, event.messages ?? []);
-        return;
       default:
         return;
     }
+  }
+
+  /** Run lifecycle: start, settlement, and queue events. Returns true when handled. */
+  private handleRunLifecycleEvent(event: PiAgentSessionEvent): boolean {
+    const turnId = this.currentTurnIdForEvent();
+
+    switch (event.type) {
+      case "agent_start":
+        this.pendingSettlement = null;
+        this.maybeAdoptEnqueuedTurn();
+        this.activeTurnStarted = true;
+        this.clearNoTurnBuffers();
+        this.emit({
+          type: "thread_started",
+          provider: this.provider,
+          sessionId: this.state.sessionId,
+        });
+        return true;
+      case "turn_start":
+        this.pendingSettlement = null;
+        this.maybeAdoptEnqueuedTurn();
+        this.activeTurnStarted = true;
+        this.clearNoTurnBuffers();
+        this.emit({
+          type: "turn_started",
+          provider: this.provider,
+          turnId: this.currentTurnIdForEvent(),
+        });
+        return true;
+      case "queue_update":
+        this.promptQueue = {
+          steering: readStringArray(event.steering),
+          followUp: readStringArray(event.followUp),
+        };
+        return true;
+      case "agent_end": {
+        const messages = event.messages ?? [];
+        // COMPAT(piAgentSettled): added in v0.2.3 — old Pi binaries omit
+        // willRetry and never emit agent_settled, so settle on agent_end. New
+        // Pi always sends an explicit willRetry boolean and follows the fully
+        // settled run with agent_settled; defer completion so automatic
+        // retries and queued continuations stay inside one turn. Remove the
+        // fallback after 2026-08-01 once the Pi floor emits agent_settled.
+        if (typeof event.willRetry !== "boolean") {
+          this.completeTurn(turnId, messages);
+          return true;
+        }
+        this.pendingSettlement = { turnId, messages };
+        return true;
+      }
+      case "agent_settled": {
+        const settlement = this.pendingSettlement;
+        this.pendingSettlement = null;
+        if (settlement || this.activeTurnId) {
+          this.completeTurn(settlement?.turnId ?? turnId, settlement?.messages ?? []);
+        }
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
+  // Race-safe adopted turn: a prompt queued near the end of a run can be
+  // delivered after the previous turn settled, starting a fresh agent run
+  // with no locally active turn. Adopt that run into a new turn so its events
+  // stay attributed instead of streaming turn-less.
+  private maybeAdoptEnqueuedTurn(): void {
+    if (this.activeTurnId || this.pendingEnqueuedPrompts.length === 0) {
+      return;
+    }
+    this.activeTurnId = randomUUID();
+    this.lastInterruptedTurnId = null;
+    this.activeClientMessageId = null;
+    this.activeAssistantMessageId = null;
+    this.activeTurnStarted = true;
+    this.clearNoTurnBuffers();
+  }
+
+  private takeEnqueuedPrompt(text: string): PiPendingEnqueuedPrompt | null {
+    const index = this.pendingEnqueuedPrompts.findIndex((pending) => pending.text === text);
+    if (index === -1) {
+      return null;
+    }
+    return this.pendingEnqueuedPrompts.splice(index, 1)[0] ?? null;
   }
 
   private handleToolExecutionEnd(

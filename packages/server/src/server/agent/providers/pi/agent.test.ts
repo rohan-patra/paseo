@@ -1837,3 +1837,235 @@ describe("transformPiModels", () => {
     ]);
   });
 });
+
+describe("PiRpcAgentSession thinking levels", () => {
+  test("derives model-specific thinking options from thinkingLevelMap", async () => {
+    const pi = new FakePi();
+    const client = createClient(pi);
+    const catalogPromise = client.fetchCatalog({ scope: "workspace", cwd: "/w", force: false });
+    pi.latestSession().models = [
+      {
+        provider: "openrouter",
+        id: "deepseek-v4-pro",
+        reasoning: true,
+        thinkingLevelMap: { minimal: null, xhigh: null, max: null },
+      },
+      {
+        provider: "openrouter",
+        id: "plain-reasoner",
+        reasoning: true,
+      },
+    ];
+
+    const catalog = await catalogPromise;
+    expect(catalog.models[0]?.thinkingOptions?.map((option) => option.id)).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+    ]);
+    expect(catalog.models[0]?.defaultThinkingOptionId).toBe("medium");
+    // Omitted map keys keep standard levels; extended levels stay unsupported.
+    expect(catalog.models[1]?.thinkingOptions?.map((option) => option.id)).toEqual([
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+    ]);
+  });
+
+  test("clamps setThinkingOption to runtime-supported levels and returns a notice", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+    fakeSession.availableThinkingLevels = ["off", "low", "medium", "high"];
+
+    const notice = await session.setThinkingOption("max");
+
+    expect(fakeSession.setThinkingLevelRequests).toEqual(["high"]);
+    expect(notice).toEqual({
+      type: "info",
+      message: "Thinking level 'max' is not supported by the current model; using 'high'.",
+    });
+    await expect(session.getRuntimeInfo()).resolves.toMatchObject({ thinkingOptionId: "high" });
+  });
+
+  test("returns no notice when the requested level is supported", async () => {
+    const { pi, session } = await createSession();
+    pi.latestSession().availableThinkingLevels = ["off", "medium", "high"];
+
+    await expect(session.setThinkingOption("high")).resolves.toBeUndefined();
+    expect(pi.latestSession().setThinkingLevelRequests).toEqual(["high"]);
+  });
+
+  test("prefers the effective get_state level when Pi clamps beyond the request", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+    fakeSession.effectiveThinkingLevel = "medium";
+
+    const notice = await session.setThinkingOption("xhigh");
+
+    expect(fakeSession.setThinkingLevelRequests).toEqual(["xhigh"]);
+    expect(notice).toEqual({
+      type: "info",
+      message: "Thinking level 'xhigh' is not supported by the current model; using 'medium'.",
+    });
+    await expect(session.getRuntimeInfo()).resolves.toMatchObject({ thinkingOptionId: "medium" });
+  });
+
+  test("falls back to the model thinkingLevelMap when the levels RPC is unavailable", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+    fakeSession.availableThinkingLevelsError = new Error("Unknown command");
+    fakeSession.setModelResult = {
+      provider: "openrouter",
+      id: "deepseek-v4-pro",
+      reasoning: true,
+      thinkingLevelMap: { xhigh: null, max: "max" },
+    };
+
+    await session.setModel("openrouter/deepseek-v4-pro");
+    await expect(session.getAvailableThinkingLevels()).resolves.toEqual([
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "max",
+    ]);
+    await session.setThinkingOption("xhigh");
+    expect(fakeSession.setThinkingLevelRequests).toEqual(["high"]);
+  });
+});
+
+describe("PiRpcAgentSession queueing and settlement", () => {
+  test("enqueues a steering prompt with Pi streamingBehavior and reports the queue", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+    await session.startTurn("start work");
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "turn_start" });
+
+    const result = await session.enqueuePrompt("focus on tests", {
+      behavior: "steer",
+      clientMessageId: "cm-steer",
+    });
+
+    expect(result).toEqual({
+      accepted: true,
+      behavior: "steer",
+      queue: { steering: ["focus on tests"], followUp: [] },
+    });
+    expect(fakeSession.prompts).toEqual([
+      { message: "start work", imageCount: 0 },
+      { message: "focus on tests", imageCount: 0, streamingBehavior: "steer" },
+    ]);
+  });
+
+  test("attaches the enqueued clientMessageId to the delivered queued user message", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    await session.startTurn("start work", { clientMessageId: "cm-foreground" });
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "turn_start" });
+
+    await session.enqueuePrompt("focus on tests", {
+      behavior: "steer",
+      clientMessageId: "cm-steer",
+    });
+    fakeSession.deliverQueuedPrompt("steer", "focus on tests");
+    fakeSession.finishSubmittedUserMessage({
+      id: "entry-9",
+      parentId: null,
+      text: "focus on tests",
+    });
+
+    expect(events.timelineItems()).toContainEqual({
+      type: "user_message",
+      text: "focus on tests",
+      messageId: "entry-9",
+      clientMessageId: "cm-steer",
+    });
+  });
+
+  test("reports a rejected enqueue without accepting it", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+    fakeSession.promptError = new Error("streamingBehavior is required");
+
+    const result = await session.enqueuePrompt("nope", { behavior: "followUp" });
+
+    expect(result).toEqual({
+      accepted: false,
+      behavior: "followUp",
+      queue: { steering: [], followUp: [] },
+    });
+  });
+
+  test("settles the turn on agent_settled instead of agent_end when willRetry is reported", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    const { turnId } = await session.startTurn("long task");
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "turn_start" });
+
+    fakeSession.finishRun(undefined, { willRetry: true });
+    await flushTurnScheduling();
+    expect(events.turnCompletedEvents()).toHaveLength(0);
+
+    fakeSession.finishRun(undefined, { willRetry: false });
+    await flushTurnScheduling();
+    expect(events.turnCompletedEvents()).toHaveLength(0);
+
+    fakeSession.settleAgent();
+    const completion = await events.nextTurnCompletion();
+    expect(completion.turnId).toBe(turnId);
+    expect(events.turnCompletedEvents()).toHaveLength(1);
+  });
+
+  test("adopts a turn when a queued prompt starts after the agent settled", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    const first = await session.startTurn("first");
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.finishRun(undefined, { willRetry: false });
+    fakeSession.settleAgent();
+    await events.nextTurnCompletion();
+
+    const result = await session.enqueuePrompt("follow up work", {
+      behavior: "followUp",
+      clientMessageId: "cm-follow",
+    });
+    expect(result.accepted).toBe(true);
+
+    const turnStartIds: Array<string | undefined> = [];
+    session.subscribe((event) => {
+      if (event.type === "turn_started") {
+        turnStartIds.push(event.turnId);
+      }
+    });
+    fakeSession.deliverQueuedPrompt("followUp", "follow up work");
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "turn_start" });
+    fakeSession.finishSubmittedUserMessage({
+      id: "entry-2",
+      parentId: null,
+      text: "follow up work",
+    });
+    fakeSession.finishRun(undefined, { willRetry: false });
+    fakeSession.settleAgent();
+
+    const completions = events.turnCompletedEvents();
+    expect(completions).toHaveLength(2);
+    const adoptedTurnId = completions[1]?.turnId;
+    expect(adoptedTurnId).toBeTypeOf("string");
+    expect(adoptedTurnId).not.toBe(first.turnId);
+    expect(turnStartIds).toEqual([adoptedTurnId]);
+    expect(events.timelineItems()).toContainEqual({
+      type: "user_message",
+      text: "follow up work",
+      messageId: "entry-2",
+      clientMessageId: "cm-follow",
+    });
+  });
+});

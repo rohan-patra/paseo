@@ -9,11 +9,13 @@ import {
 } from "../jsonl-rpc-process.js";
 import {
   buildPiLaunch,
+  type PiPromptOptions,
   type PiRuntime,
   type PiRuntimeLaunch,
   type PiRuntimeSession,
   type PiStartSessionInput,
 } from "./runtime.js";
+import { isPiThinkingLevel } from "./thinking-levels.js";
 import type {
   PiAgentMessage,
   PiModel,
@@ -23,6 +25,7 @@ import type {
   PiRuntimeEvent,
   PiSessionState,
   PiSessionStats,
+  PiThinkingLevel,
 } from "./rpc-types.js";
 
 const DEFAULT_PI_COMMAND: [string, ...string[]] = [
@@ -107,11 +110,13 @@ class PiCliRuntimeSession implements PiRuntimeSession {
   async prompt(
     message: string,
     images?: Array<{ type: "image"; data: string; mimeType: string }>,
+    options?: PiPromptOptions,
   ): Promise<PiPromptAck> {
     const { id: requestId, promise } = this.process.startRequest({
       type: "prompt",
       message,
       ...(images?.length ? { images } : {}),
+      ...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior } : {}),
     });
     const data = await promise;
     if (typeof data === "object" && data !== null && !Array.isArray(data)) {
@@ -166,6 +171,18 @@ class PiCliRuntimeSession implements PiRuntimeSession {
 
   async setThinkingLevel(level: string): Promise<void> {
     await this.request({ type: "set_thinking_level", level: level as never });
+  }
+
+  async getAvailableThinkingLevels(): Promise<PiThinkingLevel[]> {
+    const data = (await this.request({ type: "get_available_thinking_levels" })) as {
+      levels?: unknown;
+    };
+    if (!Array.isArray(data.levels)) {
+      return [];
+    }
+    return data.levels.filter(
+      (level): level is PiThinkingLevel => typeof level === "string" && isPiThinkingLevel(level),
+    );
   }
 
   async getSessionStats(): Promise<PiSessionStats> {

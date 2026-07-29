@@ -4,6 +4,7 @@ import type {
   PiRuntimeSession,
   PiStartSessionInput,
 } from "../runtime.js";
+import type { PiPromptOptions } from "../runtime.js";
 import type {
   PiAgentMessage,
   PiModel,
@@ -12,6 +13,8 @@ import type {
   PiRuntimeEvent,
   PiSessionState,
   PiSessionStats,
+  PiStreamingBehavior,
+  PiThinkingLevel,
 } from "../rpc-types.js";
 import { buildPiLaunch } from "../runtime.js";
 
@@ -93,7 +96,11 @@ export class FakePi implements PiRuntime {
 }
 
 export class FakePiSession implements PiRuntimeSession {
-  readonly prompts: Array<{ message: string; imageCount: number }> = [];
+  readonly prompts: Array<{
+    message: string;
+    imageCount: number;
+    streamingBehavior?: PiStreamingBehavior;
+  }> = [];
   readonly compactRequests: Array<{ customInstructions?: string }> = [];
   readonly setAutoCompactionRequests: boolean[] = [];
   readonly subagentSubscriptionRequests: FakePiSubagentSubscriptionLevel[] = [];
@@ -112,6 +119,13 @@ export class FakePiSession implements PiRuntimeSession {
     response: { value?: string; confirmed?: boolean; cancelled?: boolean };
   }> = [];
   setModelResult: PiModel | null = null;
+  promptError: Error | null = null;
+  availableThinkingLevels: PiThinkingLevel[] | null = null;
+  availableThinkingLevelsError: Error | null = null;
+  // When set, setThinkingLevel reports this level from get_state (simulates
+  // Pi clamping the requested level to the model's supported set).
+  effectiveThinkingLevel: PiThinkingLevel | null = null;
+  queue: { steering: string[]; followUp: string[] } = { steering: [], followUp: [] };
   models: PiModel[] = [];
   messages: PiAgentMessage[] = [];
   stats: PiSessionStats = {
@@ -160,8 +174,24 @@ export class FakePiSession implements PiRuntimeSession {
   async prompt(
     message: string,
     images?: Array<{ type: "image"; data: string; mimeType: string }>,
+    options?: PiPromptOptions,
   ): Promise<PiPromptAck> {
-    this.prompts.push({ message, imageCount: images?.length ?? 0 });
+    this.prompts.push({
+      message,
+      imageCount: images?.length ?? 0,
+      ...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior } : {}),
+    });
+    if (this.promptError) {
+      throw this.promptError;
+    }
+    if (options?.streamingBehavior) {
+      // Real Pi emits queue_update for the queued message before the prompt
+      // response is written.
+      const queued =
+        options.streamingBehavior === "steer" ? this.queue.steering : this.queue.followUp;
+      queued.push(message);
+      this.emitQueueUpdate();
+    }
     const heldPrompt = this.nextHeldPrompt;
     if (heldPrompt) {
       this.nextHeldPrompt = null;
@@ -247,6 +277,19 @@ export class FakePiSession implements PiRuntimeSession {
 
   async setThinkingLevel(level: string): Promise<void> {
     this.setThinkingLevelRequests.push(level);
+    this.state = {
+      ...this.state,
+      thinkingLevel: this.effectiveThinkingLevel ?? (level as PiThinkingLevel),
+    };
+  }
+
+  async getAvailableThinkingLevels(): Promise<PiThinkingLevel[]> {
+    if (this.availableThinkingLevelsError) {
+      throw this.availableThinkingLevelsError;
+    }
+    return (
+      this.availableThinkingLevels ?? ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+    );
   }
 
   async getSessionStats(): Promise<PiSessionStats> {
@@ -296,6 +339,8 @@ export class FakePiSession implements PiRuntimeSession {
 
   async request(command: { type: string; [key: string]: unknown }): Promise<unknown> {
     switch (command.type) {
+      case "get_available_thinking_levels":
+        return { levels: await this.getAvailableThinkingLevels() };
       case "set_subagent_subscription":
         await this.setSubagentSubscription(command.level as FakePiSubagentSubscriptionLevel);
         return {};
@@ -353,6 +398,41 @@ export class FakePiSession implements PiRuntimeSession {
   finishTurn(message: PiAgentMessage = { role: "assistant", content: [] }): void {
     this.messages = [...this.messages, message];
     this.emit({ type: "agent_end", messages: this.messages });
+  }
+
+  // New-Pi shape: agent_end carries an explicit willRetry and settlement is a
+  // separate agent_settled event.
+  finishRun(
+    message: PiAgentMessage = { role: "assistant", content: [] },
+    options: { willRetry?: boolean } = {},
+  ): void {
+    this.messages = [...this.messages, message];
+    this.emit({
+      type: "agent_end",
+      messages: this.messages,
+      willRetry: options.willRetry ?? false,
+    });
+  }
+
+  settleAgent(): void {
+    this.emit({ type: "agent_settled" });
+  }
+
+  emitQueueUpdate(): void {
+    this.emit({
+      type: "queue_update",
+      steering: [...this.queue.steering],
+      followUp: [...this.queue.followUp],
+    });
+  }
+
+  deliverQueuedPrompt(behavior: PiStreamingBehavior, message: string): void {
+    const queued = behavior === "steer" ? this.queue.steering : this.queue.followUp;
+    const index = queued.indexOf(message);
+    if (index !== -1) {
+      queued.splice(index, 1);
+    }
+    this.emitQueueUpdate();
   }
 
   finishSubmittedUserMessage(entry: FakePiUserEntry): void {

@@ -1,5 +1,16 @@
 export type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
+/**
+ * Model-specific thinking controls. Tristate per Pi level: a string maps the
+ * level to a provider value (supported), `null` marks it unsupported, and an
+ * omitted key keeps standard levels (off..high) on the provider default while
+ * extended levels (xhigh, max) stay unsupported.
+ */
+export type PiThinkingLevelMap = Partial<Record<PiThinkingLevel, string | null>>;
+
+/** Queueing behavior for prompts sent while the agent is streaming. */
+export type PiStreamingBehavior = "steer" | "followUp";
+
 export interface PiImageContent {
   type: "image";
   data: string;
@@ -81,6 +92,7 @@ export interface PiModel {
   input?: string[];
   cost?: Record<string, unknown>;
   compat?: unknown;
+  thinkingLevelMap?: PiThinkingLevelMap;
 }
 
 export interface PiSessionState {
@@ -127,7 +139,13 @@ export interface PiRpcSlashCommand {
 }
 
 export type PiRpcCommand =
-  | { id?: string; type: "prompt"; message: string; images?: PiImageContent[] }
+  | {
+      id?: string;
+      type: "prompt";
+      message: string;
+      images?: PiImageContent[];
+      streamingBehavior?: PiStreamingBehavior;
+    }
   | { id?: string; type: "compact"; customInstructions?: string }
   | { id?: string; type: "set_auto_compaction"; enabled: boolean }
   | { id?: string; type: "abort" }
@@ -136,6 +154,7 @@ export type PiRpcCommand =
   | { id?: string; type: "get_available_models" }
   | { id?: string; type: "set_model"; provider: string; modelId: string }
   | { id?: string; type: "set_thinking_level"; level: PiThinkingLevel }
+  | { id?: string; type: "get_available_thinking_levels" }
   | { id?: string; type: "get_session_stats" }
   | { id?: string; type: string };
 
@@ -184,8 +203,18 @@ export type PiAgentSessionEvent =
       isError?: boolean;
     }
   | { type: "compaction_start"; reason?: "manual" | "threshold" | "overflow" | string }
-  | { type: "compaction_end"; reason?: string; errorMessage?: string; aborted?: boolean }
-  | { type: "agent_end"; messages?: PiAgentMessage[] };
+  | {
+      type: "compaction_end";
+      reason?: string;
+      errorMessage?: string;
+      aborted?: boolean;
+      willRetry?: boolean;
+    }
+  // Old Pi omits willRetry entirely; new Pi always sends an explicit boolean
+  // and follows the settled run with agent_settled.
+  | { type: "agent_end"; messages?: PiAgentMessage[]; willRetry?: boolean }
+  | { type: "agent_settled" }
+  | { type: "queue_update"; steering?: string[]; followUp?: string[] };
 
 export type PiRuntimeEvent =
   | PiAgentSessionEvent
