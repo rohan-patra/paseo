@@ -32,6 +32,80 @@ Pi MCP support depends on the open-source `pi-mcp-adapter` extension being loade
 
 Pi import discovery reads Pi's persisted JSONL session files because Pi RPC does not expose a recent-session listing command. Resume and full history hydration still go through `pi --mode rpc` using the session file as `nativeHandle`.
 
+### Pi per-model thinking levels are not yet capability-aware
+
+Upstream Pi's `models.json` schema carries a per-model `thinkingLevelMap` (`off` through `max`) that
+remaps or disables abstract levels for that specific model — an unmapped `xhigh`/`max` means the
+level is unsupported (opt-in), while a level explicitly mapped to `null` means it's opt-out. Pi's
+own `agent-session.ts` (`getSupportedThinkingLevels` / `clampThinkingLevel`, backed by
+`@earendil-works/pi-ai`'s `getSupportedThinkingLevels`/`clampThinkingLevel`) uses this to filter the
+levels it will actually honor per model, and Pi RPC exposes `get_available_thinking_levels` so a
+client can ask before rendering a picker. **Paseo's Pi adapter (`providers/pi/agent.ts`) never calls
+that RPC.** `PI_THINKING_OPTIONS` is a fixed, hardcoded array of all seven levels, and
+`fetchCatalog` (`thinkingOptions: model.reasoning ? PI_THINKING_OPTIONS.map(...) : undefined`) offers
+every level whenever a model merely has `reasoning: true`, regardless of what that model's
+`thinkingLevelMap` actually supports. `PiModel` in `pi/rpc-types.ts` also has no field carrying the
+map, so the RPC's `get_available_models` response can't currently convey it even if the adapter
+wanted to read it locally instead of calling `get_available_thinking_levels`.
+
+Practical effect: selecting an option the model's `thinkingLevelMap` doesn't support isn't rejected —
+Pi's `setThinkingLevel`/`clampThinkingLevel` silently snaps to the nearest supported level (searching
+upward then downward through the abstract ladder). The Paseo UI will show the level the user picked
+as selected, while the underlying session may actually be running at a different level, with no
+provider notice surfaced (`setThinkingOption` doesn't return an `AgentProviderNotice` for this case).
+
+Paseo's sibling **OMP** provider (`providers/omp/map-omp-model.ts`, `resolveOmpThinkingConfig`)
+already solves this correctly: OMP's model catalog RPC reports `model.thinking.efforts` and
+`model.thinking.defaultLevel` per model (falling back to the full static list only for older OMP
+binaries that don't report it), and `mapOmpModel` filters `OMP_THINKING_OPTIONS` down to the
+reported set before it ever reaches the client. Any plan to fix per-model thinking levels for Pi
+should follow that OMP pattern — either read an equivalent field from Pi's model catalog once Pi's
+RPC reports one, or call `get_available_thinking_levels` per selected model — rather than reinventing
+filtering logic. Confirm first whether Pi's `get_available_models` response actually carries
+thinking-map data before assuming a new field needs to round-trip an extra RPC per model.
+
+### Pi has no native steer/follow-up wiring; OMP already does
+
+Upstream Pi's `AgentSession` supports mid-turn message queuing through two RPC verbs, `steer` and
+`follow_up` (plus `set_steering_mode`/`set_follow_up_mode` and a `queue_update` event stream), backed
+by `agent.steer()`/`agent.followUp()` in `pi-agent-core`. `steer()` messages are delivered after the
+current assistant turn finishes its tool calls but before the next LLM call; `follow_up()` messages
+are delivered only once the agent has no more tool calls or steering messages queued — i.e. genuinely
+after the agent would otherwise stop.
+
+**`PiRuntimeSession` (`providers/pi/runtime.ts`) has no `steer`/`followUp` methods at all**, and
+`providers/pi/agent.ts#startTurn` throws `"A Pi turn is already active"` if a prompt arrives while
+`this.activeTurnId` is set — there is no queuing path, native or Paseo-level, for messages submitted
+to a running Pi turn today.
+
+OMP's adapter (`providers/omp/runtime.ts` / `providers/omp/agent.ts`) already wires this: its
+`OmpRuntimeSession` has real `steer(message, images?)` / `followUp(message, images?)` methods, and
+`tryHandleOutOfBand` recognizes `/steer` and `/follow-up` slash-command input and calls them directly
+— but only as user-typed slash commands, not as a first-class composer affordance (no mode toggle, no
+surfaced `queue_update` state in the Paseo protocol). Any plan wiring native steer/follow-up into Pi
+should treat OMP's implementation as the reference shape, but note it is itself only a partial
+integration (slash-command triggered, no queue visibility) — don't assume OMP already proves out the
+full UX.
+
+### The abort RPC does not clear queued steer/follow-up messages
+
+Upstream `AgentSession.abort()` only calls `this.agent.abort()` (aborts the in-flight run's
+`AbortController`) and `waitForIdle()` — it does **not** call `clearSteeringQueue()`,
+`clearFollowUpQueue()`, or `clearAllQueues()`. Those are separate, explicit methods on the underlying
+agent loop, and Pi RPC exposes no command to invoke them or to inspect/clear the queues remotely
+(`get_available_thinking_levels`-style introspection doesn't exist for queues; only the interactive
+TUI's own `queue_update` event stream reflects current queue contents, and even that is push-only).
+On `continue()`, any still-queued steering messages are drained and run first, then follow-ups —
+so a queued message can survive an abort/interrupt and be delivered on the _next_ turn without the
+user having asked for that.
+
+This matters directly for any plan adding steer/follow-up to Paseo's Pi adapter: wiring `interrupt()`
+to Pi's `abort` RPC alone is not sufficient to give users a clean "stop and discard everything"
+action once steer/follow-up queuing exists. The plan needs an explicit decision (and, if Pi RPC lacks
+the verb, a documented limitation) for what happens to queued-but-undelivered steer/follow-up
+messages when a user hits Stop — silently replaying them on the next prompt is a likely surprise bug
+if this is left unaddressed.
+
 OMP is a first-class built-in provider, disabled by default. Its launch contract, typed runtime, agent/session behavior, history, permissions, imports, and test fake live under `providers/omp/`; only the provider-neutral JSONL child-process transport is shared with Pi. It launches `omp --mode rpc-ui`, uses OMP's `get_available_commands` RPC for slash-command discovery, bridges OMP `rpc-ui` approval dialogs into Paseo permissions, and imports terminal-started sessions from `~/.omp/agent/sessions` when enabled.
 
 OMP supports native Paseo host tools. The adapter registers the full caller-scoped Paseo tool catalog directly with OMP, matching providers such as Claude that expose the full catalog through MCP. Serialize every OMP host definition with `loadMode: "essential"` so `create_agent`, `send_agent_prompt`, `wait_for_agent`, and related tools remain direct calls; omitting the field makes OMP mount non-built-in names under `xd://` instead. OMP's provider-managed task subagents are surfaced as Paseo subagents through `child_session` imports; the parent keeps the subagents track while the child runtime stays owned by OMP. Custom OMP profiles should extend `omp`; other Pi-compatible forks can still extend `pi`, override `command`, and set `params.sessionDir` to their JSONL session directory.
