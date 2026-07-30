@@ -547,7 +547,7 @@ describe("PiRpcAgentSession", () => {
     ]);
   });
 
-  test("tracks each background subagent independently and starts a new row when it resumes", async () => {
+  test("tracks each background subagent independently without rows for internal turns", async () => {
     const { pi, events } = await createSession();
     const fakeSession = pi.latestSession();
     const emitWidget = (id: string, widgetLines: string[]) =>
@@ -615,6 +615,19 @@ describe("PiRpcAgentSession", () => {
     ]);
 
     expect(events.timelineItems()).toHaveLength(7);
+    expect(
+      new Set(
+        events
+          .timelineItems()
+          .filter(
+            (item) =>
+              item.type === "tool_call" &&
+              item.metadata?.backgroundWorkId === "Alpha" &&
+              item.callId.includes(":1:subagent:Alpha:"),
+          )
+          .map((item) => (item.type === "tool_call" ? item.callId : "")),
+      ),
+    ).toHaveLength(2);
     expect(events.timelineItems()).toMatchObject([
       {
         type: "tool_call",
@@ -660,9 +673,9 @@ describe("PiRpcAgentSession", () => {
       },
       {
         type: "tool_call",
-        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:subagent:Alpha:run:3$/),
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:subagent:Alpha:run:2$/),
         detail: { type: "plain_text", text: expect.stringContaining("3 turns") },
-        metadata: { runGeneration: 3, backgroundWorkStatus: "active" },
+        metadata: { runGeneration: 2, backgroundWorkStatus: "active" },
       },
       {
         callId: expect.stringMatching(/^pi-background-work:[^:]+:2:subagent:Alpha:run:1$/),

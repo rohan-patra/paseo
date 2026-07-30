@@ -1142,12 +1142,11 @@ function advanceBackgroundWorkRun(
   text: string,
 ): BackgroundWorkRun {
   const resumed = previous !== undefined && previous.status !== "active" && row.status === "active";
-  const startedNextTurn =
-    previous?.turnCount !== undefined &&
-    row.turnCount !== undefined &&
-    row.turnCount > previous.turnCount;
   return {
-    generation: previous ? previous.generation + (resumed || startedNextTurn ? 1 : 0) : 1,
+    // Internal model turns are ordinary progress within one visible run. Only
+    // create a later timeline row when the task visibly resumes from a
+    // non-active state; widget clears use a separate epoch boundary.
+    generation: previous ? previous.generation + (resumed ? 1 : 0) : 1,
     status: row.status,
     turnCount: row.turnCount ?? previous?.turnCount,
     text,
