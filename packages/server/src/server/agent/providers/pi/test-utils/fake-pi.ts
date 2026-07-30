@@ -120,6 +120,7 @@ export class FakePiSession implements PiRuntimeSession {
   }> = [];
   setModelResult: PiModel | null = null;
   promptError: Error | null = null;
+  readonly promptErrors: Error[] = [];
   availableThinkingLevels: PiThinkingLevel[] | null = null;
   availableThinkingLevelsError: Error | null = null;
   // When set, setThinkingLevel reports this level from get_state (simulates
@@ -181,8 +182,9 @@ export class FakePiSession implements PiRuntimeSession {
       imageCount: images?.length ?? 0,
       ...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior } : {}),
     });
-    if (this.promptError) {
-      throw this.promptError;
+    const promptError = this.promptErrors.shift() ?? this.promptError;
+    if (promptError) {
+      throw promptError;
     }
     if (options?.streamingBehavior && this.state.isStreaming) {
       // Real Pi queues only while streaming; the same option starts a normal
@@ -415,8 +417,12 @@ export class FakePiSession implements PiRuntimeSession {
     });
   }
 
-  settleAgent(): void {
+  becomeIdleWithoutSettlement(): void {
     this.state = { ...this.state, isStreaming: false };
+  }
+
+  settleAgent(): void {
+    this.becomeIdleWithoutSettlement();
     this.emit({ type: "agent_settled" });
   }
 

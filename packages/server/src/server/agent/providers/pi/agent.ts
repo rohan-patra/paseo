@@ -74,6 +74,7 @@ import type {
   PiAgentMessage,
   PiImageContent,
   PiModel,
+  PiPromptAck,
   PiRpcSlashCommand,
   PiRuntimeEvent,
   PiSessionStats,
@@ -808,6 +809,12 @@ function isPiRequestAbortError(error: unknown): boolean {
   return /\brequest was aborted\b|\babort(ed)?\b/i.test(toDiagnosticErrorMessage(error));
 }
 
+function isPiAlreadyProcessingError(error: unknown): boolean {
+  return /Agent is already processing\. Specify streamingBehavior [^\n]*(?:steer[^\n]*followUp|followUp[^\n]*steer)[^\n]*queue the message\./i.test(
+    toDiagnosticErrorMessage(error),
+  );
+}
+
 // Effective get_state precedence: the runtime's reported thinkingLevel is the
 // effective value (Pi may clamp a requested level to the model's supported
 // set); the locally cached option is only a fallback for Pi-compatible
@@ -1058,6 +1065,7 @@ interface BackgroundWorkRun {
   generation: number;
   status: BackgroundWorkStatus;
   turnCount?: number;
+  name: string;
   text: string;
 }
 
@@ -1080,6 +1088,38 @@ function backgroundWorkStatus(glyph: string): BackgroundWorkStatus {
     default:
       return "active";
   }
+}
+
+function backgroundWorkDisplayName(
+  id: string,
+  kind: "subagent" | "shell",
+  lines: string[],
+): string {
+  if (kind === "shell") return `shell ${id}`;
+  const taskName = id
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((part) => `${part[0]!.toUpperCase()}${part.slice(1)}`)
+    .join(" ");
+  const stats = lines
+    .slice(1)
+    .find((line) => line.includes("·"))
+    ?.trim()
+    .split("·");
+  const modelReference = stats?.[0]?.trim();
+  const effort = stats
+    ?.map((part) => part.trim().toLowerCase())
+    .find((part) => ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(part));
+  if (!modelReference?.includes("/") || !effort) return taskName || id;
+  const model = modelReference
+    .split("/")
+    .at(-1)!
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((part) => (/^gpt$/i.test(part) ? "GPT" : `${part[0]!.toUpperCase()}${part.slice(1)}`))
+    .join(" ");
+  const effortLabel = `${effort[0]!.toUpperCase()}${effort.slice(1)}`;
+  return `${taskName || id} • ${model} (${effortLabel})`;
 }
 
 function parseBackgroundWorkRows(
@@ -1125,7 +1165,7 @@ function parseBackgroundWorkRows(
     rows.push({
       key: `${kind}:${id}${occurrence > 1 ? `:${occurrence}` : ""}`,
       id,
-      name: kind === "shell" ? `shell ${id}` : id,
+      name: backgroundWorkDisplayName(id, kind, rowLines),
       kind,
       occurrence,
       status: backgroundWorkStatus(match[1]!),
@@ -1149,6 +1189,7 @@ function advanceBackgroundWorkRun(
     generation: previous ? previous.generation + (resumed ? 1 : 0) : 1,
     status: row.status,
     turnCount: row.turnCount ?? previous?.turnCount,
+    name: row.name.includes(" • ") ? row.name : (previous?.name ?? row.name),
     text,
   };
 }
@@ -1173,7 +1214,7 @@ function backgroundWorkTimelineItem(
   const common = {
     type: "tool_call" as const,
     callId: `pi-background-work:${incarnation}:${epoch}:${row.key}:run:${run.generation}`,
-    name: row.name,
+    name: run.name,
     detail: { type: "plain_text" as const, text: run.text, icon: "sparkles" as const },
     metadata: {
       source: "pi_extension_ui",
@@ -1540,8 +1581,11 @@ export class PiRpcAgentSession implements AgentSession {
   // While populated, prompt delivery is held locally: Pi may already consider
   // itself idle, in which case streamingBehavior would start an overlapping run
   // instead of atomically queueing onto this one.
-  private pendingSettlement: { turnId: string | undefined; messages: PiAgentMessage[] } | null =
-    null;
+  private pendingSettlement: {
+    turnId: string | undefined;
+    messages: PiAgentMessage[];
+    willRetry: boolean;
+  } | null = null;
   private promptDeliveryBlockedUntilSettlementOrRestart = false;
   private deferredPromptStartInFlight = false;
   private readonly currentModeId: string | null;
@@ -1612,7 +1656,18 @@ export class PiRpcAgentSession implements AgentSession {
 
     void (async () => {
       try {
-        const ack = await this.runtimeSession.prompt(payload.text, payload.images);
+        let ack: PiPromptAck;
+        try {
+          ack = await this.runtimeSession.prompt(payload.text, payload.images);
+        } catch (error) {
+          if (!isPiAlreadyProcessingError(error) || this.activeTurnId !== turnId) throw error;
+          // Pi may begin an extension/provider-owned run just before Paseo's
+          // start request arrives. Queue this exact foreground prompt onto that
+          // run instead of failing it with "Agent is already processing".
+          ack = await this.runtimeSession.prompt(payload.text, payload.images, {
+            streamingBehavior: "steer",
+          });
+        }
         this.activePromptRequestId = ack.requestId ?? null;
         const correlatedResult = ack.requestId
           ? this.pendingPromptResults.get(ack.requestId)
@@ -2639,8 +2694,9 @@ export class PiRpcAgentSession implements AgentSession {
 
     switch (event.type) {
       case "agent_start":
+        this.settleBeforeIndependentRestart();
         this.promptDeliveryBlockedUntilSettlementOrRestart = false;
-        this.maybeAdoptEnqueuedTurn();
+        this.ensureActiveTurnForPiRun();
         this.activeTurnStarted = true;
         this.clearNoTurnBuffers();
         this.emit({
@@ -2651,7 +2707,7 @@ export class PiRpcAgentSession implements AgentSession {
         void this.flushDeferredPromptsIntoActiveRun();
         return true;
       case "turn_start":
-        this.maybeAdoptEnqueuedTurn();
+        this.ensureActiveTurnForPiRun();
         this.activeTurnStarted = true;
         this.clearNoTurnBuffers();
         this.emit({
@@ -2679,7 +2735,7 @@ export class PiRpcAgentSession implements AgentSession {
           this.completeTurn(turnId, messages);
           return true;
         }
-        this.pendingSettlement = { turnId, messages };
+        this.pendingSettlement = { turnId, messages, willRetry: event.willRetry };
         this.promptDeliveryBlockedUntilSettlementOrRestart = true;
         return true;
       }
@@ -2697,6 +2753,14 @@ export class PiRpcAgentSession implements AgentSession {
       default:
         return false;
     }
+  }
+
+  private settleBeforeIndependentRestart(): void {
+    const settlement = this.pendingSettlement;
+    if (!settlement || settlement.willRetry) return;
+    this.pendingSettlement = null;
+    this.completeTurn(settlement.turnId, settlement.messages);
+    this.clearSettledNativePromptCorrelations();
   }
 
   private clearSettledNativePromptCorrelations(): void {
@@ -2768,6 +2832,22 @@ export class PiRpcAgentSession implements AgentSession {
       if (!pending) return;
       if (!(await this.queuePromptNatively(pending, false))) return;
     }
+  }
+
+  private ensureActiveTurnForPiRun(): void {
+    this.maybeAdoptEnqueuedTurn();
+    if (this.activeTurnId) return;
+
+    // Extensions can trigger a root Pi run without going through Paseo's
+    // startTurn/enqueuePrompt APIs. Bind it immediately so agent_end and
+    // agent_settled can terminate the manager's autonomous run.
+    this.activeTurnId = randomUUID();
+    this.lastInterruptedTurnId = null;
+    this.activeClientMessageId = null;
+    this.activeAssistantMessageId = null;
+    this.activeTurnStarted = false;
+    this.activeForegroundPromptText = null;
+    this.clearNoTurnBuffers();
   }
 
   // Race-safe adopted turn: a prompt queued near the end of a run can be

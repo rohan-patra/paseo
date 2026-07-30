@@ -563,7 +563,7 @@ describe("PiRpcAgentSession", () => {
     emitWidget("widget-1", [
       "Background work",
       "\u001b[36m↳\u001b[0m \u001b[1mAlpha\u001b[0m: inspect auth",
-      "  model/a · 1 turn · 00:02",
+      "  claude-code-proxy/gpt-5.6-terra · medium · 1 turn · 00:02",
       "  ↳ read: src/auth.ts · 1s",
       "↳ Beta: run tests",
       "  model/b · 1 turn · 00:02",
@@ -572,7 +572,7 @@ describe("PiRpcAgentSession", () => {
     emitWidget("widget-duplicate", [
       "Background work",
       "↳ Alpha: inspect auth",
-      "  model/a · 1 turn · 00:02",
+      "  claude-code-proxy/gpt-5.6-terra · medium · 1 turn · 00:02",
       "  ↳ read: src/auth.ts · 1s",
       "↳ Beta: run tests",
       "  model/b · 1 turn · 00:02",
@@ -632,7 +632,7 @@ describe("PiRpcAgentSession", () => {
       {
         type: "tool_call",
         callId: expect.stringMatching(/^pi-background-work:[^:]+:1:subagent:Alpha:run:1$/),
-        name: "Alpha",
+        name: "Alpha • GPT 5.6 Terra (Medium)",
         status: "running",
         metadata: {
           backgroundWorkKind: "subagent",
@@ -2405,6 +2405,49 @@ describe("PiRpcAgentSession queueing and settlement", () => {
     expect(result).toEqual({ accepted: false });
   });
 
+  test("binds and settles an unsolicited root Pi run", async () => {
+    const { pi, events } = await createSession();
+    const fakeSession = pi.latestSession();
+
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "turn_start" });
+    const started = events.eventsOfType("turn_started");
+    expect(started).toHaveLength(1);
+    expect(started[0]?.turnId).toBeTypeOf("string");
+
+    fakeSession.finishRun(undefined, { willRetry: false });
+    expect(events.turnCompletedEvents()).toHaveLength(0);
+    fakeSession.settleAgent();
+    fakeSession.settleAgent();
+
+    expect(events.turnCompletedEvents()).toEqual([
+      expect.objectContaining({ type: "turn_completed", turnId: started[0]?.turnId }),
+    ]);
+  });
+
+  test("retries a foreground prompt as steer when Pi started processing first", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    fakeSession.promptErrors.push(
+      new Error(
+        "Agent is already processing. Specify streamingBehavior (‘steer’ or ‘followUp’) to queue the message.",
+      ),
+    );
+    const { turnId } = await session.startTurn("race-safe prompt");
+    await flushTurnScheduling();
+
+    expect(fakeSession.prompts).toEqual([
+      { message: "race-safe prompt", imageCount: 0 },
+      { message: "race-safe prompt", imageCount: 0, streamingBehavior: "steer" },
+    ]);
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.finishRun(undefined, { willRetry: false });
+    fakeSession.settleAgent();
+    expect(events.turnCompletedEvents()).toEqual([
+      expect.objectContaining({ type: "turn_completed", turnId }),
+    ]);
+  });
+
   test("settles the turn on agent_settled instead of agent_end when willRetry is reported", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();
@@ -2597,6 +2640,33 @@ describe("PiRpcAgentSession queueing and settlement", () => {
 
     expect(events.turnCompletedEvents()).toHaveLength(0);
     expect(events.eventsOfType("turn_canceled")).toHaveLength(1);
+  });
+
+  test("settles a finished run before binding an independent restart", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    const first = await session.startTurn("first run");
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.finishRun(undefined, { willRetry: false });
+
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "turn_start" });
+    const starts = events.eventsOfType("turn_started");
+    const secondTurnId = starts.at(-1)?.turnId;
+    expect(events.turnCompletedEvents()).toEqual([
+      expect.objectContaining({ type: "turn_completed", turnId: first.turnId }),
+    ]);
+    expect(secondTurnId).toBeTypeOf("string");
+    expect(secondTurnId).not.toBe(first.turnId);
+
+    fakeSession.settleAgent();
+    expect(events.turnCompletedEvents()).toHaveLength(1);
+    fakeSession.finishRun(undefined, { willRetry: false });
+    fakeSession.settleAgent();
+    expect(events.turnCompletedEvents()).toEqual([
+      expect.objectContaining({ type: "turn_completed", turnId: first.turnId }),
+      expect.objectContaining({ type: "turn_completed", turnId: secondTurnId }),
+    ]);
   });
 
   test("does not erase pending settlement when Pi starts an internal retry", async () => {
