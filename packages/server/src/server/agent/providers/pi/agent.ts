@@ -1581,11 +1581,8 @@ export class PiRpcAgentSession implements AgentSession {
   // While populated, prompt delivery is held locally: Pi may already consider
   // itself idle, in which case streamingBehavior would start an overlapping run
   // instead of atomically queueing onto this one.
-  private pendingSettlement: {
-    turnId: string | undefined;
-    messages: PiAgentMessage[];
-    willRetry: boolean;
-  } | null = null;
+  private pendingSettlement: { turnId: string | undefined; messages: PiAgentMessage[] } | null =
+    null;
   private promptDeliveryBlockedUntilSettlementOrRestart = false;
   private deferredPromptStartInFlight = false;
   private readonly currentModeId: string | null;
@@ -2694,7 +2691,6 @@ export class PiRpcAgentSession implements AgentSession {
 
     switch (event.type) {
       case "agent_start":
-        this.settleBeforeIndependentRestart();
         this.promptDeliveryBlockedUntilSettlementOrRestart = false;
         this.ensureActiveTurnForPiRun();
         this.activeTurnStarted = true;
@@ -2735,7 +2731,7 @@ export class PiRpcAgentSession implements AgentSession {
           this.completeTurn(turnId, messages);
           return true;
         }
-        this.pendingSettlement = { turnId, messages, willRetry: event.willRetry };
+        this.pendingSettlement = { turnId, messages };
         this.promptDeliveryBlockedUntilSettlementOrRestart = true;
         return true;
       }
@@ -2753,14 +2749,6 @@ export class PiRpcAgentSession implements AgentSession {
       default:
         return false;
     }
-  }
-
-  private settleBeforeIndependentRestart(): void {
-    const settlement = this.pendingSettlement;
-    if (!settlement || settlement.willRetry) return;
-    this.pendingSettlement = null;
-    this.completeTurn(settlement.turnId, settlement.messages);
-    this.clearSettledNativePromptCorrelations();
   }
 
   private clearSettledNativePromptCorrelations(): void {
@@ -2995,7 +2983,11 @@ export class PiRpcAgentSession implements AgentSession {
           item: { type: "assistant_message", text },
         });
       }
-      if (this.pendingSettlement?.turnId !== turnId) {
+      // A custom message can either be the whole result of an extension command
+      // that never started Pi's agent loop, or a steer delivered inside a live
+      // run. Only the former is terminal; mid-run subagent/shell updates must
+      // remain in the current Paseo turn until agent_settled.
+      if (!this.activeTurnStarted && this.pendingSettlement?.turnId !== turnId) {
         this.completeTurn(turnId, []);
       }
       return;

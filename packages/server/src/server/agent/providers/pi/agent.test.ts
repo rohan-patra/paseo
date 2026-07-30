@@ -2539,7 +2539,48 @@ describe("PiRpcAgentSession queueing and settlement", () => {
     expect(fakeSession.prompts.at(-1)).toEqual({ message: "/local-command", imageCount: 0 });
   });
 
-  test("emits exactly one terminal event when custom completion precedes agent settlement", async () => {
+  test("does not complete a live turn when a custom steer is delivered mid-run", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    const { turnId } = await session.startTurn("run background waves");
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "turn_start" });
+
+    fakeSession.emit({
+      type: "message_end",
+      message: { role: "custom", content: "Subagent wave one completed" },
+    });
+    expect(events.turnCompletedEvents()).toHaveLength(0);
+    expect(events.timelineItems()).toContainEqual({
+      type: "assistant_message",
+      text: "Subagent wave one completed",
+    });
+
+    fakeSession.emit({ type: "turn_start" });
+    expect(events.eventsOfType("turn_started").at(-1)?.turnId).toBe(turnId);
+    fakeSession.finishRun(undefined, { willRetry: false });
+    fakeSession.settleAgent();
+    expect(events.turnCompletedEvents()).toEqual([
+      expect.objectContaining({ type: "turn_completed", turnId }),
+    ]);
+  });
+
+  test("completes custom extension output when no agent run starts", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    const { turnId } = await session.startTurn("/extension-command");
+
+    fakeSession.emit({
+      type: "message_end",
+      message: { role: "custom", content: "Extension command completed" },
+    });
+
+    expect(events.turnCompletedEvents()).toEqual([
+      expect.objectContaining({ type: "turn_completed", turnId }),
+    ]);
+  });
+
+  test("emits exactly one terminal event when custom output precedes agent settlement", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();
     const { turnId } = await session.startTurn("extension task");
@@ -2596,7 +2637,7 @@ describe("PiRpcAgentSession queueing and settlement", () => {
     ]);
   });
 
-  test("retains native prompt correlation until settlement after custom completion", async () => {
+  test("retains native prompt correlation until settlement after custom output", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();
     await session.startTurn("extension task");
@@ -2642,30 +2683,27 @@ describe("PiRpcAgentSession queueing and settlement", () => {
     expect(events.eventsOfType("turn_canceled")).toHaveLength(1);
   });
 
-  test("settles a finished run before binding an independent restart", async () => {
+  test("keeps an agent_end-handler continuation in the same turn until agent_settled", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();
-    const first = await session.startTurn("first run");
-    fakeSession.emit({ type: "agent_start" });
-    fakeSession.finishRun(undefined, { willRetry: false });
-
+    const { turnId } = await session.startTurn("run parallel waves");
     fakeSession.emit({ type: "agent_start" });
     fakeSession.emit({ type: "turn_start" });
-    const starts = events.eventsOfType("turn_started");
-    const secondTurnId = starts.at(-1)?.turnId;
-    expect(events.turnCompletedEvents()).toEqual([
-      expect.objectContaining({ type: "turn_completed", turnId: first.turnId }),
-    ]);
-    expect(secondTurnId).toBeTypeOf("string");
-    expect(secondTurnId).not.toBe(first.turnId);
-
-    fakeSession.settleAgent();
-    expect(events.turnCompletedEvents()).toHaveLength(1);
     fakeSession.finishRun(undefined, { willRetry: false });
+
+    // Pi awaits agent_end extension handlers before checking its steering queue.
+    // A background task finishing in one of those handlers can enqueue a custom
+    // message, so Pi starts agent.continue() without ever emitting agent_settled.
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "turn_start" });
+    expect(events.turnCompletedEvents()).toHaveLength(0);
+    expect(events.eventsOfType("turn_started").at(-1)?.turnId).toBe(turnId);
+
+    fakeSession.finishRun(undefined, { willRetry: false });
+    expect(events.turnCompletedEvents()).toHaveLength(0);
     fakeSession.settleAgent();
     expect(events.turnCompletedEvents()).toEqual([
-      expect.objectContaining({ type: "turn_completed", turnId: first.turnId }),
-      expect.objectContaining({ type: "turn_completed", turnId: secondTurnId }),
+      expect.objectContaining({ type: "turn_completed", turnId }),
     ]);
   });
 
