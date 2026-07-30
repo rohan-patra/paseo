@@ -222,6 +222,8 @@ interface AgentManagerRescueTimeouts {
   interruptSessionMs?: number;
 }
 
+const PI_TERMINAL_PRESENTATION_DELAY_MS = 75;
+
 interface ProviderEnabledFlag {
   enabled: boolean;
   derivedFromProviderId?: string | null;
@@ -255,6 +257,7 @@ export interface AgentManagerOptions {
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   appendSystemPrompt?: string;
   agentStreamCoalesceWindowMs?: number;
+  piTerminalPresentationDelayMs?: number;
   rescueTimeouts?: AgentManagerRescueTimeouts;
   logger: Logger;
 }
@@ -591,6 +594,17 @@ export class AgentManager {
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
+  private readonly piTerminalPresentationFences = new Map<
+    string,
+    {
+      deadline: number;
+      timer: ReturnType<typeof setTimeout> | null;
+      persist: boolean;
+      pending: boolean;
+      released: boolean;
+    }
+  >();
+  private readonly piTerminalPresentationDelayMs: number;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
   private paseoToolsEnabled = true;
@@ -611,6 +625,8 @@ export class AgentManager {
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
     this.mcpAuthToken = options?.mcpAuthToken ?? null;
+    this.piTerminalPresentationDelayMs =
+      options.piTerminalPresentationDelayMs ?? PI_TERMINAL_PRESENTATION_DELAY_MS;
     this.configurePaseoTools(options);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
@@ -680,6 +696,7 @@ export class AgentManager {
 
   prepareForShutdown(): void {
     this.acceptingAgentRegistrations = false;
+    this.flushPiTerminalPresentationFences();
   }
 
   setPaseoToolsEnabled(enabled: boolean): void {
@@ -2960,6 +2977,7 @@ export class AgentManager {
     cancelReason: string,
   ): ManagedAgentClosed {
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
+    this.clearPiTerminalPresentationFence(agent.id);
     this.agents.delete(agent.id);
     this.previousStatuses.delete(agent.id);
     if (agent.unsubscribeSession) {
@@ -3410,33 +3428,48 @@ export class AgentManager {
     }
 
     const flags: StreamEventFlags = { shouldDispatchEvent: true, shouldNotifyWaiters: true };
+    const isLiveTerminalEvent = !options?.fromHistory && isTurnTerminalEvent(event);
 
-    const dispatchPromise = this.dispatchStreamEventByType({
-      agent,
-      event,
-      options,
-      isForegroundEvent,
-      eventTurnId,
-      flags,
-    });
-    if (dispatchPromise) {
-      await dispatchPromise;
-    }
+    const piTerminalFenceArmed = isLiveTerminalEvent && agent.provider === "pi";
+    if (piTerminalFenceArmed) this.beginPiTerminalPresentationFence(agent.id);
 
-    if (!options?.fromHistory && isTurnTerminalEvent(event)) {
-      this.runs.settleTerminalRun(agent.id, eventTurnId);
-      if (isForegroundEvent) {
-        this.finalizeForegroundTurn(agent, eventTurnId);
+    try {
+      const dispatchPromise = this.dispatchStreamEventByType({
+        agent,
+        event,
+        options,
+        isForegroundEvent,
+        eventTurnId,
+        flags,
+      });
+      if (dispatchPromise) {
+        await dispatchPromise;
       }
+
+      if (isLiveTerminalEvent) {
+        // Terminal lifecycle snapshots are finalized below. Publish the stream
+        // edge first so even an unbuffered client cannot observe idle/error before
+        // the matching terminal event.
+        if (flags.shouldDispatchEvent) {
+          this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
+          flags.shouldDispatchEvent = false;
+        }
+
+        this.runs.settleTerminalRun(agent.id, eventTurnId);
+        if (isForegroundEvent) {
+          this.finalizeForegroundTurn(agent, eventTurnId);
+        }
+      }
+
+      if (!options?.fromHistory && flags.shouldDispatchEvent) {
+        this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
+      }
+
+      this.traceHandleStreamEventEnd(agent, event, eventTurnId, flags);
+      return flags.shouldNotifyWaiters;
+    } finally {
+      this.releasePiTerminalPresentationFenceIfArmed(agent.id, piTerminalFenceArmed);
     }
-
-    if (!options?.fromHistory && flags.shouldDispatchEvent) {
-      this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
-    }
-
-    this.traceHandleStreamEventEnd(agent, event, eventTurnId, flags);
-
-    return flags.shouldNotifyWaiters;
   }
 
   private traceHandleStreamEventStart(
@@ -3948,7 +3981,106 @@ export class AgentManager {
     return row;
   }
 
+  private beginPiTerminalPresentationFence(agentId: string): void {
+    this.clearPiTerminalPresentationFence(agentId);
+    if (this.piTerminalPresentationDelayMs <= 0 || !this.acceptingAgentRegistrations) return;
+    this.piTerminalPresentationFences.set(agentId, {
+      deadline: Date.now() + this.piTerminalPresentationDelayMs,
+      timer: null,
+      persist: false,
+      pending: false,
+      released: false,
+    });
+  }
+
+  private releasePiTerminalPresentationFenceIfArmed(agentId: string, armed: boolean): void {
+    if (armed) this.releasePiTerminalPresentationFence(agentId);
+  }
+
+  private releasePiTerminalPresentationFence(agentId: string): void {
+    const fence = this.piTerminalPresentationFences.get(agentId);
+    if (!fence) return;
+    fence.deadline = Date.now() + this.piTerminalPresentationDelayMs;
+    fence.released = true;
+    this.schedulePiTerminalPresentationFence(agentId, fence);
+  }
+
+  private schedulePiTerminalPresentationFence(
+    agentId: string,
+    fence: {
+      deadline: number;
+      timer: ReturnType<typeof setTimeout> | null;
+      persist: boolean;
+      pending: boolean;
+      released: boolean;
+    },
+  ): void {
+    if (fence.timer || !fence.released || !fence.pending) return;
+    const remainingMs = fence.deadline - Date.now();
+    if (remainingMs <= 0) {
+      this.flushPiTerminalPresentationFence(agentId, fence);
+      return;
+    }
+    fence.timer = setTimeout(
+      () => this.flushPiTerminalPresentationFence(agentId, fence),
+      remainingMs,
+    );
+    fence.timer.unref?.();
+  }
+
+  private flushPiTerminalPresentationFence(
+    agentId: string,
+    expectedFence?: {
+      deadline: number;
+      timer: ReturnType<typeof setTimeout> | null;
+      persist: boolean;
+      pending: boolean;
+      released: boolean;
+    },
+  ): void {
+    const fence = this.piTerminalPresentationFences.get(agentId);
+    if (!fence || (expectedFence && fence !== expectedFence)) return;
+    if (fence.timer) clearTimeout(fence.timer);
+    this.piTerminalPresentationFences.delete(agentId);
+    const agent = this.agents.get(agentId);
+    if (fence.pending && agent && (agent.lifecycle === "idle" || agent.lifecycle === "error")) {
+      this.emitState(agent, { persist: fence.persist });
+    }
+  }
+
+  private flushPiTerminalPresentationFences(): void {
+    for (const agentId of Array.from(this.piTerminalPresentationFences.keys())) {
+      this.flushPiTerminalPresentationFence(agentId);
+    }
+  }
+
+  private clearPiTerminalPresentationFence(agentId: string): void {
+    const fence = this.piTerminalPresentationFences.get(agentId);
+    if (fence?.timer) clearTimeout(fence.timer);
+    this.piTerminalPresentationFences.delete(agentId);
+  }
+
+  private deferPiTerminalState(agent: ManagedAgent, options?: { persist?: boolean }): boolean {
+    const fence = this.piTerminalPresentationFences.get(agent.id);
+    if (!fence) return false;
+    if (agent.lifecycle !== "idle" && agent.lifecycle !== "error") {
+      this.clearPiTerminalPresentationFence(agent.id);
+      return false;
+    }
+    fence.persist ||= options?.persist !== false;
+    fence.pending = true;
+    this.schedulePiTerminalPresentationFence(agent.id, fence);
+    return true;
+  }
+
   private emitState(agent: ManagedAgent, options?: { persist?: boolean }): void {
+    // The app batches agent_stream for 48 ms (session-stream-reducers.ts) but
+    // applies agent_update immediately; that transition also drains queued
+    // composer input. Pi can settle through extension-driven continuations, so
+    // hold its idle/error snapshot for one reducer window after the terminal
+    // stream edge. Any restart clears the pending snapshot and publishes running.
+    if (this.deferPiTerminalState(agent, options)) return;
+
     // Keep attention as an edge-triggered unread signal, not a level signal.
     this.checkAndSetAttention(agent);
     if (options?.persist !== false) {
@@ -4100,6 +4232,7 @@ export class AgentManager {
 
   private async flushTasks(options: { includeAgentRegistrations: boolean }): Promise<void> {
     this.agentStreamCoalescer.flushAll();
+    this.flushPiTerminalPresentationFences();
     // Drain tasks, including tasks spawned while awaiting.
     while (
       this.backgroundTasks.size > 0 ||

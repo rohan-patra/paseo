@@ -726,6 +726,144 @@ function fakeCodexEmitting(args: FakeCodexEmitterArgs): AgentClient {
 
 const logger = createTestLogger();
 
+test("publishes Pi turn completion before the idle agent state", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-pi-terminal-order-"));
+  const client = new (class extends TestAgentClient {
+    constructor() {
+      super("pi");
+    }
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new (class extends TestAgentSession {
+        override readonly provider = "pi" as const;
+      })(config);
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { pi: client },
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000099",
+    piTerminalPresentationDelayMs: 50,
+  });
+  const observed: Array<{ type: string; lifecycle?: string }> = [];
+  manager.subscribe(
+    (event) => {
+      observed.push({
+        type: event.type === "agent_stream" ? event.event.type : event.type,
+        ...(event.type === "agent_state" ? { lifecycle: event.agent.lifecycle } : {}),
+      });
+    },
+    { replayState: false },
+  );
+
+  try {
+    const agent = await manager.createAgent({ provider: "pi", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    observed.length = 0;
+    for await (const _event of await manager.streamAgent(agent.id, "finish visibly")) {
+      // Drain through the terminal event.
+    }
+
+    expect(observed).toContainEqual({ type: "turn_completed" });
+    expect(observed).not.toContainEqual({ type: "agent_state", lifecycle: "idle" });
+
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    expect(observed.findIndex((event) => event.type === "turn_completed")).toBeLessThan(
+      observed.findIndex((event) => event.type === "agent_state" && event.lifecycle === "idle"),
+    );
+  } finally {
+    manager.prepareForShutdown();
+    await manager.flushForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("publishes terminal stream events before lifecycle state for every provider", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-terminal-order-"));
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000098",
+    piTerminalPresentationDelayMs: 0,
+  });
+  const observed: Array<{ type: string; lifecycle?: string }> = [];
+  manager.subscribe(
+    (event) => {
+      observed.push({
+        type: event.type === "agent_stream" ? event.event.type : event.type,
+        ...(event.type === "agent_state" ? { lifecycle: event.agent.lifecycle } : {}),
+      });
+    },
+    { replayState: false },
+  );
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    observed.length = 0;
+    for await (const _event of await manager.streamAgent(agent.id, "finish in order")) {
+      // Drain through the terminal event.
+    }
+
+    expect(observed.findIndex((event) => event.type === "turn_completed")).toBeLessThan(
+      observed.findIndex((event) => event.type === "agent_state" && event.lifecycle === "idle"),
+    );
+  } finally {
+    manager.prepareForShutdown();
+    await manager.flushForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("flushes a pending Pi terminal lifecycle state during shutdown", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-pi-terminal-shutdown-"));
+  const client = new (class extends TestAgentClient {
+    constructor() {
+      super("pi");
+    }
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new (class extends TestAgentSession {
+        override readonly provider = "pi" as const;
+      })(config);
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { pi: client },
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000097",
+    piTerminalPresentationDelayMs: 10_000,
+  });
+  const lifecycles: string[] = [];
+  manager.subscribe(
+    (event) => {
+      if (event.type === "agent_state") lifecycles.push(event.agent.lifecycle);
+    },
+    { replayState: false },
+  );
+
+  try {
+    const agent = await manager.createAgent({ provider: "pi", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    lifecycles.length = 0;
+    for await (const _event of await manager.streamAgent(agent.id, "finish before shutdown")) {
+      // Drain through the terminal event.
+    }
+    expect(lifecycles).not.toContain("idle");
+
+    manager.prepareForShutdown();
+    await manager.flushForShutdown();
+    expect(lifecycles).toContain("idle");
+  } finally {
+    manager.prepareForShutdown();
+    await manager.flushForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("does not register a session that finishes starting after shutdown begins", async () => {
   const client = new HeldAgentCreationClient();
   const manager = new AgentManager({
