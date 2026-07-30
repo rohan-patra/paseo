@@ -685,6 +685,56 @@ describe("PiRpcAgentSession", () => {
     ]);
   });
 
+  test("preserves decimal model versions in background subagent labels", async () => {
+    const { pi, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    fakeSession.emit({
+      type: "extension_ui_request",
+      id: "widget-haiku",
+      method: "setWidget",
+      widgetKey: "background-work",
+      widgetLines: [
+        "Background work",
+        "↳ Release-Notes-Gather: collect release notes",
+        "  claude-code-proxy/claude-haiku-4-5 · off · 1 turn · 00:02",
+        "  ↳ Thinking · 1s",
+      ],
+      widgetPlacement: "aboveEditor",
+    });
+
+    expect(events.timelineItems()).toMatchObject([
+      {
+        name: "Release Notes Gather • Claude Haiku 4.5 (Off)",
+        status: "running",
+        metadata: { backgroundWorkId: "Release-Notes-Gather" },
+      },
+    ]);
+  });
+
+  test("does not mistake a multi-digit model revision for a decimal version", async () => {
+    const { pi, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    fakeSession.emit({
+      type: "extension_ui_request",
+      id: "widget-gpt-revision",
+      method: "setWidget",
+      widgetKey: "background-work",
+      widgetLines: [
+        "Background work",
+        "↳ Revision-Check: inspect release",
+        "  openai/gpt-4-1106-preview · off · 1 turn · 00:02",
+      ],
+      widgetPlacement: "aboveEditor",
+    });
+
+    expect(events.timelineItems()).toMatchObject([
+      {
+        name: "Revision Check • GPT 4 1106 Preview (Off)",
+        status: "running",
+      },
+    ]);
+  });
+
   test("tracks background shells separately and deduplicates mixed fallback content", async () => {
     const { pi, events } = await createSession();
     const fakeSession = pi.latestSession();

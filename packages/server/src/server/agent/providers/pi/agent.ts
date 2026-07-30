@@ -1111,9 +1111,12 @@ function backgroundWorkDisplayName(
     ?.map((part) => part.trim().toLowerCase())
     .find((part) => ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(part));
   if (!modelReference?.includes("/") || !effort) return taskName || id;
+  // Pi model IDs encode decimal versions with hyphens (for example,
+  // claude-haiku-4-5). Preserve the numeric separator before humanizing words.
   const model = modelReference
     .split("/")
     .at(-1)!
+    .replace(/(\d)-(\d)(?!\d)/g, "$1.$2")
     .split(/[-_]+/)
     .filter(Boolean)
     .map((part) => (/^gpt$/i.test(part) ? "GPT" : `${part[0]!.toUpperCase()}${part.slice(1)}`))
