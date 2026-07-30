@@ -184,9 +184,9 @@ export class FakePiSession implements PiRuntimeSession {
     if (this.promptError) {
       throw this.promptError;
     }
-    if (options?.streamingBehavior) {
-      // Real Pi emits queue_update for the queued message before the prompt
-      // response is written.
+    if (options?.streamingBehavior && this.state.isStreaming) {
+      // Real Pi queues only while streaming; the same option starts a normal
+      // run when idle. queue_update precedes the prompt response.
       const queued =
         options.streamingBehavior === "steer" ? this.queue.steering : this.queue.followUp;
       queued.push(message);
@@ -390,6 +390,7 @@ export class FakePiSession implements PiRuntimeSession {
   async close(): Promise<void> {}
 
   emit(event: PiRuntimeEvent): void {
+    if (event.type === "agent_start") this.state = { ...this.state, isStreaming: true };
     for (const subscriber of this.subscribers) {
       subscriber(event);
     }
@@ -415,6 +416,7 @@ export class FakePiSession implements PiRuntimeSession {
   }
 
   settleAgent(): void {
+    this.state = { ...this.state, isStreaming: false };
     this.emit({ type: "agent_settled" });
   }
 

@@ -186,6 +186,10 @@ class SessionEvents {
     });
   }
 
+  eventsOfType<T extends AgentStreamEvent["type"]>(type: T) {
+    return this.events.filter((event) => event.type === type);
+  }
+
   turnCompletedEvents() {
     return this.events.filter(
       (event): event is Extract<AgentStreamEvent, { type: "turn_completed" }> =>
@@ -2364,6 +2368,17 @@ describe("PiRpcAgentSession queueing and settlement", () => {
     ]);
   });
 
+  test("rejects enqueue while idle so orchestration starts a tracked normal turn", async () => {
+    const { pi, session } = await createSession();
+    const result = await session.enqueuePrompt("idle prompt", {
+      behavior: "steer",
+      clientMessageId: "cm-idle",
+    });
+
+    expect(result).toEqual({ accepted: false });
+    expect(pi.latestSession().prompts).toHaveLength(0);
+  });
+
   test("reports a rejected enqueue without accepting it", async () => {
     const { pi, session } = await createSession();
     const fakeSession = pi.latestSession();
@@ -2398,49 +2413,220 @@ describe("PiRpcAgentSession queueing and settlement", () => {
     expect(events.turnCompletedEvents()).toHaveLength(1);
   });
 
-  test("adopts a turn when a queued prompt starts after the agent settled", async () => {
+  test("holds a send during settlement and starts it only after the old turn completes", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();
     const first = await session.startTurn("first");
     fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "turn_start" });
     fakeSession.finishRun(undefined, { willRetry: false });
+
+    const result = await session.enqueuePrompt("arrived at the boundary", {
+      behavior: "steer",
+      clientMessageId: "cm-boundary",
+    });
+
+    expect(result).toMatchObject({ accepted: true, behavior: "steer" });
+    expect(fakeSession.prompts).toEqual([{ message: "first", imageCount: 0 }]);
+    expect(events.turnCompletedEvents()).toHaveLength(0);
+
     fakeSession.settleAgent();
-    await events.nextTurnCompletion();
+    await flushTurnScheduling();
 
-    const result = await session.enqueuePrompt("follow up work", {
-      behavior: "followUp",
-      clientMessageId: "cm-follow",
-    });
-    expect(result.accepted).toBe(true);
+    expect(events.turnCompletedEvents()).toEqual([
+      expect.objectContaining({ type: "turn_completed", turnId: first.turnId }),
+    ]);
+    expect(fakeSession.prompts).toEqual([
+      { message: "first", imageCount: 0 },
+      { message: "arrived at the boundary", imageCount: 0 },
+    ]);
 
-    const turnStartIds: Array<string | undefined> = [];
-    session.subscribe((event) => {
-      if (event.type === "turn_started") {
-        turnStartIds.push(event.turnId);
-      }
-    });
-    fakeSession.deliverQueuedPrompt("followUp", "follow up work");
     fakeSession.emit({ type: "agent_start" });
     fakeSession.emit({ type: "turn_start" });
     fakeSession.finishSubmittedUserMessage({
-      id: "entry-2",
+      id: "entry-boundary",
       parentId: null,
-      text: "follow up work",
+      text: "arrived at the boundary",
     });
     fakeSession.finishRun(undefined, { willRetry: false });
     fakeSession.settleAgent();
+    await flushTurnScheduling();
 
     const completions = events.turnCompletedEvents();
     expect(completions).toHaveLength(2);
-    const adoptedTurnId = completions[1]?.turnId;
-    expect(adoptedTurnId).toBeTypeOf("string");
-    expect(adoptedTurnId).not.toBe(first.turnId);
-    expect(turnStartIds).toEqual([adoptedTurnId]);
+    expect(completions[1]?.turnId).not.toBe(first.turnId);
     expect(events.timelineItems()).toContainEqual({
       type: "user_message",
-      text: "follow up work",
-      messageId: "entry-2",
-      clientMessageId: "cm-follow",
+      text: "arrived at the boundary",
+      messageId: "entry-boundary",
+      clientMessageId: "cm-boundary",
     });
+  });
+
+  test("completes a deferred prompt that Pi handles without starting an agent run", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    await session.startTurn("first");
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.finishRun(undefined, { willRetry: false });
+    await session.enqueuePrompt("/local-command", {
+      behavior: "steer",
+      clientMessageId: "cm-local",
+    });
+    fakeSession.promptAck = { agentInvoked: false };
+
+    fakeSession.settleAgent();
+    await flushTurnScheduling();
+    await flushTurnScheduling();
+
+    expect(events.turnCompletedEvents()).toHaveLength(2);
+    expect(fakeSession.prompts.at(-1)).toEqual({ message: "/local-command", imageCount: 0 });
+  });
+
+  test("emits exactly one terminal event when custom completion precedes agent settlement", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    const { turnId } = await session.startTurn("extension task");
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.finishRun(undefined, { willRetry: false });
+    fakeSession.emit({
+      type: "message_end",
+      message: { role: "custom", content: "extension completed" },
+    });
+    const boundarySend = await session.enqueuePrompt("after custom output", {
+      behavior: "steer",
+      clientMessageId: "cm-after-custom",
+    });
+    expect(boundarySend.accepted).toBe(true);
+    expect(fakeSession.prompts).toEqual([{ message: "extension task", imageCount: 0 }]);
+
+    fakeSession.settleAgent();
+    await flushTurnScheduling();
+
+    expect(fakeSession.prompts).toEqual([
+      { message: "extension task", imageCount: 0 },
+      { message: "after custom output", imageCount: 0 },
+    ]);
+    // A duplicate stale settlement from the old run must not consume the new
+    // run's starting correlation or trigger another deferred start.
+    fakeSession.settleAgent();
+    const afterStaleSettlement = await session.enqueuePrompt("after stale settlement", {
+      behavior: "steer",
+      clientMessageId: "cm-after-stale",
+    });
+    expect(afterStaleSettlement.accepted).toBe(true);
+    expect(fakeSession.prompts).toHaveLength(2);
+    await flushTurnScheduling();
+    fakeSession.emit({ type: "agent_start" });
+    await flushTurnScheduling();
+    expect(fakeSession.prompts.at(-1)).toEqual({
+      message: "after stale settlement",
+      imageCount: 0,
+      streamingBehavior: "steer",
+    });
+    fakeSession.finishSubmittedUserMessage({
+      id: "entry-after-custom",
+      parentId: null,
+      text: "after custom output",
+    });
+    expect(events.timelineItems()).toContainEqual({
+      type: "user_message",
+      text: "after custom output",
+      messageId: "entry-after-custom",
+      clientMessageId: "cm-after-custom",
+    });
+    expect(events.turnCompletedEvents()).toEqual([
+      expect.objectContaining({ type: "turn_completed", turnId }),
+    ]);
+  });
+
+  test("retains native prompt correlation until settlement after custom completion", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    await session.startTurn("extension task");
+    fakeSession.emit({ type: "agent_start" });
+    await session.enqueuePrompt("queued before custom completion", {
+      behavior: "steer",
+      clientMessageId: "cm-native-late-marker",
+    });
+    fakeSession.finishRun(undefined, { willRetry: false });
+    fakeSession.emit({
+      type: "message_end",
+      message: { role: "custom", content: "extension completed" },
+    });
+    fakeSession.finishSubmittedUserMessage({
+      id: "entry-native-late",
+      parentId: null,
+      text: "queued before custom completion",
+    });
+    fakeSession.settleAgent();
+    await flushTurnScheduling();
+
+    expect(events.timelineItems()).toContainEqual({
+      type: "user_message",
+      text: "queued before custom completion",
+      messageId: "entry-native-late",
+      clientMessageId: "cm-native-late-marker",
+    });
+  });
+
+  test("ignores late lifecycle events after the active turn was canceled", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    await session.startTurn("cancel me");
+    fakeSession.emit({ type: "agent_start" });
+    await session.interrupt();
+
+    fakeSession.finishRun(undefined, { willRetry: false });
+    fakeSession.settleAgent();
+    fakeSession.emit({ type: "message_end", message: { role: "custom", content: "late output" } });
+    await flushTurnScheduling();
+
+    expect(events.turnCompletedEvents()).toHaveLength(0);
+    expect(events.eventsOfType("turn_canceled")).toHaveLength(1);
+  });
+
+  test("does not erase pending settlement when Pi starts an internal retry", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    const { turnId } = await session.startTurn("retry task");
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "turn_start" });
+    fakeSession.finishRun(undefined, { willRetry: true });
+
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "turn_start" });
+    fakeSession.finishRun(undefined, { willRetry: false });
+    fakeSession.settleAgent();
+    await flushTurnScheduling();
+
+    expect(events.turnCompletedEvents()).toEqual([
+      expect.objectContaining({ type: "turn_completed", turnId }),
+    ]);
+  });
+
+  test("holds multiple settlement-boundary sends and preserves FIFO delivery", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+    await session.startTurn("first");
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.finishRun(undefined, { willRetry: false });
+    await session.enqueuePrompt("second", { behavior: "steer", clientMessageId: "cm-second" });
+    await session.enqueuePrompt("third", { behavior: "steer", clientMessageId: "cm-third" });
+
+    fakeSession.settleAgent();
+    await flushTurnScheduling();
+    expect(fakeSession.prompts).toEqual([
+      { message: "first", imageCount: 0 },
+      { message: "second", imageCount: 0 },
+    ]);
+
+    fakeSession.emit({ type: "agent_start" });
+    await flushTurnScheduling();
+    expect(fakeSession.prompts).toEqual([
+      { message: "first", imageCount: 0 },
+      { message: "second", imageCount: 0 },
+      { message: "third", imageCount: 0, streamingBehavior: "steer" },
+    ]);
   });
 });
