@@ -89,6 +89,11 @@ async function flushTurnScheduling(): Promise<void> {
   await waitForImmediate();
 }
 
+function eventsToolCallId(item: unknown): string {
+  if (!item || typeof item !== "object" || !("callId" in item)) return "";
+  return typeof item.callId === "string" ? item.callId : "";
+}
+
 async function createSession(pi = new FakePi()): Promise<{
   pi: FakePi;
   session: PiRpcAgentSession;
@@ -486,12 +491,12 @@ describe("PiRpcAgentSession", () => {
       {
         type: "tool_call",
         callId: "pi-extension-ui:event:notify-1",
-        name: "Pi extension UI",
+        name: "Notification",
         status: "completed",
         error: null,
         detail: {
           type: "plain_text",
-          label: "Notification · warning",
+          label: "warning",
           text: "Command blocked",
           icon: "sparkles",
         },
@@ -502,7 +507,7 @@ describe("PiRpcAgentSession", () => {
     expect(fakeSession.canceledExtensionUiRequests).toEqual([]);
   });
 
-  test("surfaces keyed Pi RPC status and widget updates with stable timeline identities", async () => {
+  test("keeps keyed Pi RPC status and ordinary widgets on stable timeline identities", async () => {
     const { pi, events } = await createSession();
     const fakeSession = pi.latestSession();
 
@@ -515,16 +520,10 @@ describe("PiRpcAgentSession", () => {
     });
     fakeSession.emit({
       type: "extension_ui_request",
-      id: "status-2",
-      method: "setStatus",
-      statusKey: "auto-mode",
-    });
-    fakeSession.emit({
-      type: "extension_ui_request",
       id: "widget-1",
       method: "setWidget",
-      widgetKey: "background-work",
-      widgetLines: ["Background work", "\u001b[32m✓ child done\u001b[0m"],
+      widgetKey: "review",
+      widgetLines: ["Review ready"],
       widgetPlacement: "aboveEditor",
     });
 
@@ -532,23 +531,251 @@ describe("PiRpcAgentSession", () => {
       {
         type: "tool_call",
         callId: "pi-extension-ui:keyed:setStatus:auto-mode",
-        detail: { type: "plain_text", label: "Status · auto-mode", text: "Enabled" },
+        name: "Auto mode",
+        detail: { type: "plain_text", text: "Enabled" },
       },
       {
         type: "tool_call",
-        callId: "pi-extension-ui:keyed:setStatus:auto-mode",
-        detail: { type: "plain_text", label: "Status · auto-mode", text: "Cleared" },
-      },
-      {
-        type: "tool_call",
-        callId: "pi-extension-ui:keyed:setWidget:background-work",
-        detail: {
-          type: "plain_text",
-          label: "Widget · background-work",
-          text: "Background work\n✓ child done",
-        },
+        callId: "pi-extension-ui:keyed:setWidget:review",
+        name: "Review",
+        detail: { type: "plain_text", text: "Review ready" },
       },
     ]);
+  });
+
+  test("tracks each background subagent independently and starts a new row when it resumes", async () => {
+    const { pi, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    const emitWidget = (id: string, widgetLines: string[]) =>
+      fakeSession.emit({
+        type: "extension_ui_request",
+        id,
+        method: "setWidget",
+        widgetKey: "background-work",
+        widgetLines,
+        widgetPlacement: "aboveEditor",
+      });
+
+    emitWidget("widget-1", [
+      "Background work",
+      "\u001b[36m↳\u001b[0m \u001b[1mAlpha\u001b[0m: inspect auth",
+      "  model/a · 1 turn · 00:02",
+      "  ↳ read: src/auth.ts · 1s",
+      "↳ Beta: run tests",
+      "  model/b · 1 turn · 00:02",
+      "  ↳ bash: npm test · 1s",
+    ]);
+    emitWidget("widget-duplicate", [
+      "Background work",
+      "↳ Alpha: inspect auth",
+      "  model/a · 1 turn · 00:02",
+      "  ↳ read: src/auth.ts · 1s",
+      "↳ Beta: run tests",
+      "  model/b · 1 turn · 00:02",
+      "  ↳ bash: npm test · 1s",
+    ]);
+    emitWidget("widget-2", [
+      "Background work",
+      "❔ Alpha: inspect auth",
+      "  model/a · 1 turn · 00:05",
+      "  ❔ Which token format?",
+      "✓ Beta: run tests",
+      "  model/b · 1 turn · 00:05",
+      "  ✓ Done",
+    ]);
+    emitWidget("widget-3", [
+      "Background work",
+      "↳ Alpha: inspect auth",
+      "  model/a · 2 turns · 00:08",
+      "  ↳ Thinking · 1s",
+      "✓ Beta: run tests",
+      "  model/b · 1 turn · 00:05",
+      "  ✓ Done",
+    ]);
+    emitWidget("widget-4", [
+      "Background work",
+      "↳ Alpha: inspect auth",
+      "  model/a · 3 turns · 00:12",
+      "  ↳ edit: src/auth.ts · 1s",
+      "✓ Beta: run tests",
+      "  model/b · 1 turn · 00:05",
+      "  ✓ Done",
+    ]);
+    emitWidget("widget-clear", []);
+    emitWidget("widget-clear-again", []);
+    emitWidget("widget-5", [
+      "Background work",
+      "↳ Alpha: inspect auth again",
+      "  model/a · 1 turn · 00:01",
+      "  ↳ Starting…",
+    ]);
+
+    expect(events.timelineItems()).toHaveLength(7);
+    expect(events.timelineItems()).toMatchObject([
+      {
+        type: "tool_call",
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:subagent:Alpha:run:1$/),
+        name: "Alpha",
+        status: "running",
+        metadata: {
+          backgroundWorkKind: "subagent",
+          backgroundWorkId: "Alpha",
+          runGeneration: 1,
+          backgroundWorkStatus: "active",
+        },
+      },
+      {
+        type: "tool_call",
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:subagent:Beta:run:1$/),
+        name: "Beta",
+        status: "running",
+        metadata: {
+          backgroundWorkKind: "subagent",
+          backgroundWorkId: "Beta",
+          runGeneration: 1,
+          backgroundWorkStatus: "active",
+        },
+      },
+      {
+        type: "tool_call",
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:subagent:Alpha:run:1$/),
+        status: "completed",
+        detail: { type: "plain_text", text: expect.stringContaining("Which token format?") },
+        metadata: { backgroundWorkStatus: "waiting" },
+      },
+      {
+        type: "tool_call",
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:subagent:Beta:run:1$/),
+        metadata: { backgroundWorkStatus: "completed" },
+      },
+      {
+        type: "tool_call",
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:subagent:Alpha:run:2$/),
+        detail: { type: "plain_text", text: expect.stringContaining("2 turns") },
+        metadata: { runGeneration: 2, backgroundWorkStatus: "active" },
+      },
+      {
+        type: "tool_call",
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:subagent:Alpha:run:3$/),
+        detail: { type: "plain_text", text: expect.stringContaining("3 turns") },
+        metadata: { runGeneration: 3, backgroundWorkStatus: "active" },
+      },
+      {
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:2:subagent:Alpha:run:1$/),
+        detail: { type: "plain_text", text: expect.stringContaining("inspect auth again") },
+        metadata: { runGeneration: 1, backgroundWorkStatus: "active" },
+      },
+    ]);
+  });
+
+  test("tracks background shells separately and deduplicates mixed fallback content", async () => {
+    const { pi, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    const emitWidget = (id: string, widgetLines: string[]) =>
+      fakeSession.emit({
+        type: "extension_ui_request",
+        id,
+        method: "setWidget",
+        widgetKey: "background-work",
+        widgetLines,
+        widgetPlacement: "aboveEditor",
+      });
+
+    const running = [
+      "Background work",
+      "↳ Alpha: inspect auth",
+      "  model/a · 1 turn · 00:02",
+      "  ↳ Thinking · 1s",
+      "  … 2 more — /subagents for the full list",
+      "↳ shell a1b2c3d4 · 00:02",
+      "  npm test",
+      "  ↳ 12 tests passed",
+      "↳ shell a1b2c3d4 · 00:01",
+      "  npm run lint",
+    ];
+    emitWidget("mixed-1", running);
+    emitWidget("mixed-duplicate", running);
+    emitWidget("mixed-2", [
+      "Background work",
+      "↳ Alpha: inspect auth",
+      "  model/a · 1 turn · 00:03",
+      "  ↳ Thinking · 2s",
+      "  … 1 more — /subagents for the full list",
+      "✓ shell a1b2c3d4 · 00:03",
+      "  npm test",
+      "  ↳ 12 tests passed",
+      "✗ shell a1b2c3d4 · 00:02",
+      "  npm run lint",
+      "  ↳ lint failed",
+    ]);
+
+    expect(events.timelineItems()).toHaveLength(8);
+    expect(events.timelineItems()).toMatchObject([
+      {
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:subagent:Alpha:run:1$/),
+        metadata: { backgroundWorkKind: "subagent", backgroundWorkId: "Alpha" },
+      },
+      {
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:shell:a1b2c3d4:run:1$/),
+        name: "shell a1b2c3d4",
+        status: "running",
+        metadata: {
+          backgroundWorkKind: "shell",
+          backgroundWorkId: "a1b2c3d4",
+          backgroundWorkStatus: "active",
+        },
+      },
+      {
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:shell:a1b2c3d4:2:run:1$/),
+        name: "shell a1b2c3d4",
+        detail: { type: "plain_text", text: expect.stringContaining("npm run lint") },
+        metadata: { backgroundWorkKind: "shell", backgroundWorkStatus: "active" },
+      },
+      {
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:other$/),
+        detail: { type: "plain_text", text: expect.stringContaining("2 more") },
+      },
+      {
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:subagent:Alpha:run:1$/),
+      },
+      {
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:shell:a1b2c3d4:run:1$/),
+        metadata: { backgroundWorkStatus: "completed" },
+      },
+      {
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:shell:a1b2c3d4:2:run:1$/),
+        status: "failed",
+        error: expect.stringContaining("lint failed"),
+        detail: { type: "plain_text", text: expect.stringContaining("lint failed") },
+        metadata: { backgroundWorkStatus: "failed" },
+      },
+      {
+        callId: expect.stringMatching(/^pi-background-work:[^:]+:1:other$/),
+        detail: { type: "plain_text", text: expect.stringContaining("1 more") },
+      },
+    ]);
+  });
+
+  test("uses a fresh call-ID namespace for each Pi session", async () => {
+    const first = await createSession();
+    const second = await createSession();
+    const widget = {
+      type: "extension_ui_request" as const,
+      id: "widget",
+      method: "setWidget",
+      widgetKey: "background-work",
+      widgetLines: ["Background work", "↳ Alpha: inspect", "  model/a · 1 turn · 00:01"],
+      widgetPlacement: "aboveEditor",
+    };
+
+    first.pi.latestSession().emit(widget);
+    second.pi.latestSession().emit(widget);
+    const firstCall = eventsToolCallId(first.events.timelineItems()[0]);
+    const secondCall = eventsToolCallId(second.events.timelineItems()[0]);
+
+    expect(firstCall).not.toBe(secondCall);
+    expect(firstCall).toMatch(/:subagent:Alpha:run:1$/);
+    expect(secondCall).toMatch(/:subagent:Alpha:run:1$/);
   });
 
   test("surfaces Pi RPC title and editor draft updates", async () => {
@@ -572,14 +799,15 @@ describe("PiRpcAgentSession", () => {
       {
         type: "tool_call",
         callId: "pi-extension-ui:event:title-1",
-        detail: { type: "plain_text", label: "Session title", text: "pi - project" },
+        name: "Session title",
+        detail: { type: "plain_text", text: "pi - project" },
       },
       {
         type: "tool_call",
         callId: "pi-extension-ui:event:editor-1",
+        name: "Editor draft",
         detail: {
           type: "plain_text",
-          label: "Editor draft",
           text: "Continue with the portable implementation",
         },
       },
@@ -1235,7 +1463,8 @@ describe("PiRpcAgentSession", () => {
         item: {
           type: "tool_call",
           callId: "pi-extension-ui:event:notify-plan",
-          detail: { type: "plain_text", label: "Notification", text: "Plan mode enabled" },
+          name: "Notification",
+          detail: { type: "plain_text", text: "Plan mode enabled" },
         },
       },
       { type: "turn_completed" },

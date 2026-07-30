@@ -1039,6 +1039,180 @@ function extensionUiLines(value: unknown): string[] {
     : [];
 }
 
+type BackgroundWorkStatus = "active" | "waiting" | "completed" | "failed" | "orphaned" | "canceled";
+
+interface BackgroundWorkRow {
+  key: string;
+  id: string;
+  name: string;
+  kind: "subagent" | "shell";
+  occurrence: number;
+  status: BackgroundWorkStatus;
+  turnCount?: number;
+  lines: string[];
+}
+
+interface BackgroundWorkRun {
+  generation: number;
+  status: BackgroundWorkStatus;
+  turnCount?: number;
+  text: string;
+}
+
+const BACKGROUND_WORK_AGENT_ROW =
+  /^(↳|❔|✓|✗|∙|⊘)\s+([A-Za-z0-9][A-Za-z0-9_-]{0,63})(?::(?:\s|$).*)?$/;
+const BACKGROUND_WORK_SHELL_ROW = /^(↳|✓|✗|⊘)\s+shell\s+([A-Za-z0-9_-]+)\s+·(?:\s|$).*$/;
+
+function backgroundWorkStatus(glyph: string): BackgroundWorkStatus {
+  switch (glyph) {
+    case "❔":
+      return "waiting";
+    case "✓":
+      return "completed";
+    case "✗":
+      return "failed";
+    case "∙":
+      return "orphaned";
+    case "⊘":
+      return "canceled";
+    default:
+      return "active";
+  }
+}
+
+function parseBackgroundWorkRows(
+  value: unknown,
+): { rows: BackgroundWorkRow[]; otherLines: string[] } | null {
+  if (!Array.isArray(value)) return null;
+  const lines = value.flatMap((line) => {
+    if (typeof line !== "string") return [];
+    const text = stripAnsi(line).trimEnd();
+    return text.trim() ? [text] : [];
+  });
+  if (lines[0]?.trim() !== "Background work") return null;
+
+  const rows: BackgroundWorkRow[] = [];
+  const otherLines: string[] = [];
+  const shellOccurrences = new Map<string, number>();
+  for (let index = 1; index < lines.length; ) {
+    const line = lines[index]!;
+    const agentMatch = line.match(BACKGROUND_WORK_AGENT_ROW);
+    const shellMatch = line.match(BACKGROUND_WORK_SHELL_ROW);
+    const match = agentMatch ?? shellMatch;
+    const block = [line];
+    index += 1;
+    while (index < lines.length && /^\s/.test(lines[index]!)) {
+      block.push(lines[index]!);
+      index += 1;
+    }
+    if (!match) {
+      otherLines.push(...block);
+      continue;
+    }
+    const hiddenLines = block.filter((entry) => /^\s*…\s+\d+\s+more\s+—/.test(entry));
+    const rowLines = block.filter((entry) => !hiddenLines.includes(entry));
+    otherLines.push(...hiddenLines);
+    const turnMatch = rowLines
+      .slice(1)
+      .join(" ")
+      .match(/\b(\d+)\s+turns?\b/);
+    const id = match[2]!;
+    const kind = shellMatch ? "shell" : "subagent";
+    const occurrence = kind === "shell" ? (shellOccurrences.get(id) ?? 0) + 1 : 1;
+    if (kind === "shell") shellOccurrences.set(id, occurrence);
+    rows.push({
+      key: `${kind}:${id}${occurrence > 1 ? `:${occurrence}` : ""}`,
+      id,
+      name: kind === "shell" ? `shell ${id}` : id,
+      kind,
+      occurrence,
+      status: backgroundWorkStatus(match[1]!),
+      ...(turnMatch ? { turnCount: Number(turnMatch[1]) } : {}),
+      lines: rowLines,
+    });
+  }
+  return { rows, otherLines };
+}
+
+function advanceBackgroundWorkRun(
+  previous: BackgroundWorkRun | undefined,
+  row: BackgroundWorkRow,
+  text: string,
+): BackgroundWorkRun {
+  const resumed = previous !== undefined && previous.status !== "active" && row.status === "active";
+  const startedNextTurn =
+    previous?.turnCount !== undefined &&
+    row.turnCount !== undefined &&
+    row.turnCount > previous.turnCount;
+  return {
+    generation: previous ? previous.generation + (resumed || startedNextTurn ? 1 : 0) : 1,
+    status: row.status,
+    turnCount: row.turnCount ?? previous?.turnCount,
+    text,
+  };
+}
+
+function backgroundWorkRunChanged(
+  previous: BackgroundWorkRun | undefined,
+  run: BackgroundWorkRun,
+): boolean {
+  return (
+    previous?.generation !== run.generation ||
+    previous.status !== run.status ||
+    previous.text !== run.text
+  );
+}
+
+function backgroundWorkTimelineItem(
+  row: BackgroundWorkRow,
+  run: BackgroundWorkRun,
+  incarnation: string,
+  epoch: number,
+): Extract<AgentTimelineItem, { type: "tool_call" }> {
+  const common = {
+    type: "tool_call" as const,
+    callId: `pi-background-work:${incarnation}:${epoch}:${row.key}:run:${run.generation}`,
+    name: row.name,
+    detail: { type: "plain_text" as const, text: run.text, icon: "sparkles" as const },
+    metadata: {
+      source: "pi_extension_ui",
+      method: "setWidget",
+      widgetKey: "background-work",
+      backgroundWorkKind: row.kind,
+      backgroundWorkId: row.id,
+      backgroundWorkOccurrence: row.occurrence,
+      runGeneration: run.generation,
+      backgroundWorkStatus: row.status,
+    },
+  };
+  if (row.status === "active") return { ...common, status: "running", error: null };
+  if (row.status === "failed") {
+    return { ...common, status: "failed", error: run.text };
+  }
+  if (row.status === "canceled" || row.status === "orphaned") {
+    return { ...common, status: "canceled", error: null };
+  }
+  // Waiting is a settled run segment: answering the question starts a fresh
+  // call ID. Completed work naturally settles the same way.
+  return { ...common, status: "completed", error: null };
+}
+
+function backgroundWorkOtherItem(
+  lines: string[],
+  incarnation: string,
+  epoch: number,
+): Extract<AgentTimelineItem, { type: "tool_call" }> {
+  return {
+    type: "tool_call",
+    callId: `pi-background-work:${incarnation}:${epoch}:other`,
+    name: "Background work",
+    status: "completed",
+    error: null,
+    detail: { type: "plain_text", text: lines.join("\n"), icon: "sparkles" },
+    metadata: { source: "pi_extension_ui", method: "setWidget" },
+  };
+}
+
 function extensionUiCallId(method: string, event: Record<string, unknown>): string {
   let keyedId: string | undefined;
   if (method === "setStatus") keyedId = extensionUiText(event.statusKey);
@@ -1048,10 +1222,16 @@ function extensionUiCallId(method: string, event: Record<string, unknown>): stri
     : `pi-extension-ui:event:${event.id}`;
 }
 
+function extensionUiName(value: string): string {
+  const normalized = value.replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim();
+  return normalized ? normalized[0]!.toUpperCase() + normalized.slice(1) : "Update";
+}
+
 function mapExtensionUiSideEffect(
   event: Extract<PiRuntimeEvent, { type: "extension_ui_request" }>,
 ): Extract<AgentTimelineItem, { type: "tool_call" }> | null {
-  let label: string;
+  let name: string;
+  let label: string | undefined;
   let text: string | undefined;
 
   switch (event.method) {
@@ -1059,29 +1239,30 @@ function mapExtensionUiSideEffect(
       const message = extensionUiText(event.message);
       if (!message) return null;
       const level = extensionUiText(event.notifyType);
-      label = level && level !== "info" ? `Notification · ${level}` : "Notification";
+      name = "Notification";
+      label = level && level !== "info" ? level : undefined;
       text = message;
       break;
     }
     case "setStatus": {
-      const key = extensionUiText(event.statusKey) ?? "extension";
-      label = `Status · ${key}`;
+      const key = extensionUiText(event.statusKey) ?? "status";
+      name = extensionUiName(key);
       text = extensionUiText(event.statusText) ?? "Cleared";
       break;
     }
     case "setWidget": {
-      const key = extensionUiText(event.widgetKey) ?? "extension";
+      const key = extensionUiText(event.widgetKey) ?? "update";
       const lines = extensionUiLines(event.widgetLines);
-      label = `Widget · ${key}`;
+      name = extensionUiName(key);
       text = lines.length > 0 ? lines.join("\n") : "Cleared";
       break;
     }
     case "setTitle":
-      label = "Session title";
+      name = "Session title";
       text = extensionUiText(event.title) ?? "Cleared";
       break;
     case "set_editor_text":
-      label = "Editor draft";
+      name = "Editor draft";
       text = extensionUiText(event.text) ?? "Cleared";
       break;
     default:
@@ -1091,10 +1272,10 @@ function mapExtensionUiSideEffect(
   return {
     type: "tool_call",
     callId: extensionUiCallId(event.method, event),
-    name: "Pi extension UI",
+    name,
     status: "completed",
     error: null,
-    detail: { type: "plain_text", label, text, icon: "sparkles" },
+    detail: { type: "plain_text", ...(label ? { label } : {}), text, icon: "sparkles" },
     metadata: { source: "pi_extension_ui", method: event.method },
   };
 }
@@ -1322,6 +1503,11 @@ export class PiRpcAgentSession implements AgentSession {
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private readonly activeToolCalls = new Map<string, PiTrackedToolCall>();
   private readonly pendingExtensionUiRequests = new Map<string, AgentPermissionRequest>();
+  private readonly backgroundWorkIncarnation = randomUUID();
+  private backgroundWorkEpoch = 1;
+  private backgroundWorkVisible = false;
+  private readonly backgroundWorkRuns = new Map<string, BackgroundWorkRun>();
+  private backgroundWorkOtherText: string | null = null;
   private activeAskUserDialog: ActiveAskUserDialog | null = null;
   private pendingCombinedAskUserResponse: PendingCombinedAskUserResponse | null = null;
   private activeTurnId: string | null = null;
@@ -2127,6 +2313,69 @@ export class PiRpcAgentSession implements AgentSession {
     return true;
   }
 
+  private mapBackgroundWorkWidget(
+    event: Extract<PiRuntimeEvent, { type: "extension_ui_request" }>,
+  ): Array<Extract<AgentTimelineItem, { type: "tool_call" }>> | null {
+    if (event.method !== "setWidget" || extensionUiText(event.widgetKey) !== "background-work") {
+      return null;
+    }
+    if (!Array.isArray(event.widgetLines) || event.widgetLines.length === 0) {
+      if (this.backgroundWorkVisible) {
+        this.backgroundWorkRuns.clear();
+        this.backgroundWorkOtherText = null;
+        this.backgroundWorkEpoch += 1;
+        this.backgroundWorkVisible = false;
+      }
+      return [];
+    }
+    const parsed = parseBackgroundWorkRows(event.widgetLines);
+    if (!parsed) return null;
+    this.backgroundWorkVisible = true;
+
+    const items: Array<Extract<AgentTimelineItem, { type: "tool_call" }>> = [];
+    for (const row of parsed.rows) {
+      const previous = this.backgroundWorkRuns.get(row.key);
+      const run = advanceBackgroundWorkRun(previous, row, row.lines.join("\n"));
+      this.backgroundWorkRuns.set(row.key, run);
+      if (backgroundWorkRunChanged(previous, run)) {
+        items.push(
+          backgroundWorkTimelineItem(
+            row,
+            run,
+            this.backgroundWorkIncarnation,
+            this.backgroundWorkEpoch,
+          ),
+        );
+      }
+    }
+
+    const otherText = parsed.otherLines.join("\n");
+    if (otherText && otherText !== this.backgroundWorkOtherText) {
+      items.push(
+        backgroundWorkOtherItem(
+          parsed.otherLines,
+          this.backgroundWorkIncarnation,
+          this.backgroundWorkEpoch,
+        ),
+      );
+    }
+    this.backgroundWorkOtherText = otherText || null;
+    return items;
+  }
+
+  private emitExtensionUiItem(item: AgentTimelineItem): void {
+    if (this.activeTurnId && !this.activeTurnStarted) {
+      this.pendingNoTurnUiItems.push({ turnId: this.activeTurnId, item });
+      return;
+    }
+    this.emit({
+      type: "timeline",
+      provider: this.provider,
+      turnId: this.currentTurnIdForEvent(),
+      item,
+    });
+  }
+
   private handleExtensionUiRequest(
     event: Extract<PiRuntimeEvent, { type: "extension_ui_request" }>,
   ): void {
@@ -2141,18 +2390,15 @@ export class PiRpcAgentSession implements AgentSession {
       return;
     }
 
+    const backgroundWorkItems = this.mapBackgroundWorkWidget(event);
+    if (backgroundWorkItems) {
+      for (const item of backgroundWorkItems) this.emitExtensionUiItem(item);
+      return;
+    }
+
     const sideEffect = mapExtensionUiSideEffect(event);
     if (sideEffect) {
-      if (this.activeTurnId && !this.activeTurnStarted) {
-        this.pendingNoTurnUiItems.push({ turnId: this.activeTurnId, item: sideEffect });
-      } else {
-        this.emit({
-          type: "timeline",
-          provider: this.provider,
-          turnId: this.currentTurnIdForEvent(),
-          item: sideEffect,
-        });
-      }
+      this.emitExtensionUiItem(sideEffect);
       return;
     }
 
