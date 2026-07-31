@@ -511,7 +511,7 @@ describe("PiRpcAgentSession", () => {
     expect(fakeSession.canceledExtensionUiRequests).toEqual([]);
   });
 
-  test("keeps keyed Pi RPC status and ordinary widgets on stable timeline identities", async () => {
+  test("ignores transient Pi RPC statuses while preserving keyed widgets", async () => {
     const { pi, events } = await createSession();
     const fakeSession = pi.latestSession();
 
@@ -519,8 +519,15 @@ describe("PiRpcAgentSession", () => {
       type: "extension_ui_request",
       id: "status-1",
       method: "setStatus",
-      statusKey: "auto-mode",
-      statusText: "Enabled",
+      statusKey: "activity",
+      statusText: "Spinner frame 1",
+    });
+    fakeSession.emit({
+      type: "extension_ui_request",
+      id: "status-2",
+      method: "setStatus",
+      statusKey: "activity",
+      statusText: "Spinner frame 2",
     });
     fakeSession.emit({
       type: "extension_ui_request",
@@ -534,17 +541,13 @@ describe("PiRpcAgentSession", () => {
     expect(events.timelineItems()).toMatchObject([
       {
         type: "tool_call",
-        callId: "pi-extension-ui:keyed:setStatus:auto-mode",
-        name: "Auto mode",
-        detail: { type: "plain_text", text: "Enabled" },
-      },
-      {
-        type: "tool_call",
         callId: "pi-extension-ui:keyed:setWidget:review",
         name: "Review",
         detail: { type: "plain_text", text: "Review ready" },
       },
     ]);
+    expect(fakeSession.extensionUiResponses).toEqual([]);
+    expect(fakeSession.canceledExtensionUiRequests).toEqual([]);
   });
 
   test("tracks each background subagent independently without rows for internal turns", async () => {
@@ -973,6 +976,39 @@ describe("PiRpcAgentSession", () => {
       text: "lo",
       messageId: firstMessageId,
     });
+  });
+
+  test("does not interrupt reasoning with transient Pi RPC statuses", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+
+    await session.startTurn("hello");
+    fakeSession.emit({
+      type: "message_start",
+      message: { role: "assistant", content: [], responseId: "response-1" },
+    });
+    fakeSession.emit({
+      type: "message_update",
+      message: { role: "assistant", content: [] },
+      assistantMessageEvent: { type: "thinking_delta", delta: "first" },
+    });
+    fakeSession.emit({
+      type: "extension_ui_request",
+      id: "status-1",
+      method: "setStatus",
+      statusKey: "activity",
+      statusText: "Spinner frame",
+    });
+    fakeSession.emit({
+      type: "message_update",
+      message: { role: "assistant", content: [] },
+      assistantMessageEvent: { type: "thinking_delta", delta: " second" },
+    });
+
+    expect(events.timelineItems()).toEqual([
+      { type: "reasoning", text: "first", reasoningId: "response-1:reasoning:0" },
+      { type: "reasoning", text: " second", reasoningId: "response-1:reasoning:0" },
+    ]);
   });
 
   test("assigns distinct reasoning ids when assistant response ids are absent", async () => {

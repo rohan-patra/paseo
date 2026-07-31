@@ -1259,9 +1259,7 @@ function backgroundWorkOtherItem(
 }
 
 function extensionUiCallId(method: string, event: Record<string, unknown>): string {
-  let keyedId: string | undefined;
-  if (method === "setStatus") keyedId = extensionUiText(event.statusKey);
-  if (method === "setWidget") keyedId = extensionUiText(event.widgetKey);
+  const keyedId = method === "setWidget" ? extensionUiText(event.widgetKey) : undefined;
   return keyedId
     ? `pi-extension-ui:keyed:${method}:${keyedId}`
     : `pi-extension-ui:event:${event.id}`;
@@ -1287,12 +1285,6 @@ function mapExtensionUiSideEffect(
       name = "Notification";
       label = level && level !== "info" ? level : undefined;
       text = message;
-      break;
-    }
-    case "setStatus": {
-      const key = extensionUiText(event.statusKey) ?? "status";
-      name = extensionUiName(key);
-      text = extensionUiText(event.statusText) ?? "Cleared";
       break;
     }
     case "setWidget": {
@@ -2473,6 +2465,11 @@ export class PiRpcAgentSession implements AgentSession {
   private handleExtensionUiRequest(
     event: Extract<PiRuntimeEvent, { type: "extension_ui_request" }>,
   ): void {
+    // Status updates are transient TUI chrome, not causal agent activity. Emitting
+    // them as tool calls would interrupt reasoning whenever an extension animates.
+    // Pi sends them fire-and-forget, so no extension_ui_response is owed.
+    if (event.method === "setStatus") return;
+
     const message = optionalString(event.message);
     if (
       event.method === "notify" &&
