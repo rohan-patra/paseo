@@ -2259,6 +2259,120 @@ describe("HostRuntimeStore", () => {
     useSessionStore.getState().clearSession(host.serverId);
   });
 
+  it("flushes terminal stream state before draining queued composer input", async () => {
+    const host = makeHost({ serverId: "srv_stream_before_queue_drain" });
+    const ordering: string[] = [];
+    const fakeClient = new (class extends FakeDaemonClient {
+      override async sendAgentMessage(
+        ...args: Parameters<DaemonClient["sendAgentMessage"]>
+      ): Promise<void> {
+        ordering.push("send");
+        await super.sendAgentMessage(...args);
+      }
+    })();
+    const store = new HostRuntimeStore({
+      deps: {
+        createClient: () => fakeClient as unknown as DaemonClient,
+        connectToDaemon: async () => ({
+          client: fakeClient as unknown as DaemonClient,
+          serverId: host.serverId,
+          hostname: null,
+        }),
+        getClientId: async () => "cid_stream_before_queue_drain",
+      },
+    });
+    const sessionStore = useSessionStore.getState();
+    sessionStore.initializeSession(host.serverId, fakeClient as unknown as DaemonClient, 1);
+    sessionStore.setQueuedMessages(
+      host.serverId,
+      new Map([["agent", [{ id: "queued", text: "next turn", attachments: [] }]]]),
+    );
+    const unregister = store.registerAgentStreamFlusher(host.serverId, (agentId) => {
+      ordering.push(`flush:${agentId}`);
+    });
+
+    store.drainQueuedAgentMessage(host.serverId, "agent");
+    await fakeClient.waitForSentMessages(1);
+
+    expect(ordering).toEqual(["flush:agent", "send"]);
+    unregister();
+    sessionStore.clearSession(host.serverId);
+  });
+
+  it("unregisters a stream flusher after its server id is reconciled", async () => {
+    const oldServerId = "srv_flusher_before_rekey";
+    const newServerId = "srv_flusher_after_rekey";
+    const host = makeHost({ serverId: oldServerId });
+    const fakeClient = new FakeDaemonClient();
+    const store = new HostRuntimeStore({
+      deps: {
+        createClient: () => fakeClient as unknown as DaemonClient,
+        connectToDaemon: async () => ({
+          client: fakeClient as unknown as DaemonClient,
+          serverId: oldServerId,
+          hostname: null,
+        }),
+        getClientId: async () => "cid_flusher_rekey",
+      },
+    });
+    store.syncHosts([host]);
+    const staleFlusher = vi.fn();
+    const unregister = store.registerAgentStreamFlusher(oldServerId, staleFlusher);
+
+    store.reconcileServerId(oldServerId, newServerId);
+    unregister();
+
+    const sessionStore = useSessionStore.getState();
+    sessionStore.initializeSession(newServerId, fakeClient as unknown as DaemonClient, 1);
+    sessionStore.setQueuedMessages(
+      newServerId,
+      new Map([["agent", [{ id: "queued", text: "after rekey", attachments: [] }]]]),
+    );
+    store.drainQueuedAgentMessage(newServerId, "agent");
+    await fakeClient.waitForSentMessages(1);
+
+    expect(staleFlusher).not.toHaveBeenCalled();
+    store.syncHosts([]);
+    sessionStore.clearSession(oldServerId);
+    sessionStore.clearSession(newServerId);
+  });
+
+  it("does not duplicate a queued send when a stream flusher re-enters drain", async () => {
+    const host = makeHost({ serverId: "srv_reentrant_queue_drain" });
+    const fakeClient = new FakeDaemonClient();
+    const store = new HostRuntimeStore({
+      deps: {
+        createClient: () => fakeClient as unknown as DaemonClient,
+        connectToDaemon: async () => ({
+          client: fakeClient as unknown as DaemonClient,
+          serverId: host.serverId,
+          hostname: null,
+        }),
+        getClientId: async () => "cid_reentrant_queue_drain",
+      },
+    });
+    const sessionStore = useSessionStore.getState();
+    sessionStore.initializeSession(host.serverId, fakeClient as unknown as DaemonClient, 1);
+    sessionStore.setQueuedMessages(
+      host.serverId,
+      new Map([["agent", [{ id: "queued", text: "send once", attachments: [] }]]]),
+    );
+    let flushCount = 0;
+    const unregister = store.registerAgentStreamFlusher(host.serverId, () => {
+      flushCount += 1;
+      if (flushCount === 1) store.drainQueuedAgentMessage(host.serverId, "agent");
+    });
+
+    store.drainQueuedAgentMessage(host.serverId, "agent");
+    await fakeClient.waitForSentMessages(1);
+    await Promise.resolve();
+
+    expect(flushCount).toBe(2);
+    expect(fakeClient.sentAgentMessages).toHaveLength(1);
+    unregister();
+    sessionStore.clearSession(host.serverId);
+  });
+
   it("restores an automatically drained message when sending fails", async () => {
     const host = makeHost({ serverId: "srv_failed_queue_drain" });
     const fakeClient = new FakeDaemonClient();

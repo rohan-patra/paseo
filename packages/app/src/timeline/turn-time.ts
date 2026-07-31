@@ -65,6 +65,7 @@ export function deriveStreamTurnTiming(params: {
   }
 
   const isRunning = params.agentStatus === "running";
+  const isAwaitingOptimisticResponse = currentUserIsOptimistic && currentLastItemAt === null;
   const runningStartedAt = isRunning ? currentAuthoritativeUserAt : null;
   if (params.agentStatus !== "running") {
     flushCompletedTurn();
@@ -73,6 +74,6 @@ export function deriveStreamTurnTiming(params: {
   return {
     byAssistantId,
     runningStartedAt,
-    isActive: isRunning || currentUserIsOptimistic,
+    isActive: isRunning || isAwaitingOptimisticResponse,
   };
 }

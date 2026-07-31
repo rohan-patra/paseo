@@ -17,10 +17,6 @@ export interface PiImageContent {
   mimeType: string;
 }
 export interface PiPromptAck {
-  agentInvoked?: boolean;
-}
-
-export interface PiPromptAck {
   requestId?: string;
   agentInvoked?: boolean;
 }
@@ -169,12 +165,14 @@ export interface PiRpcResponse {
 
 export type PiAssistantMessageEvent =
   | { type: "text_delta"; delta?: string }
-  | { type: "thinking_delta"; delta?: string }
+  | { type: "thinking_delta"; delta?: string; contentIndex?: number }
   | { type: "start" | "text_start" | "text_end" | "thinking_start" | "thinking_end" | "done" };
 
 export type PiAgentSessionEvent =
-  | { type: "agent_start" }
-  | { type: "turn_start" }
+  // `runId` is optional for compatibility with current Pi RPC. New Pi runtimes
+  // must attach one stable id to every lifecycle event for one agent run.
+  | { type: "agent_start"; runId?: string }
+  | { type: "turn_start"; runId?: string }
   | { type: "message_start"; message: PiAgentMessage }
   | { type: "message_end"; message: PiAgentMessage }
   | {
@@ -212,8 +210,8 @@ export type PiAgentSessionEvent =
     }
   // Old Pi omits willRetry entirely; new Pi always sends an explicit boolean
   // and follows the settled run with agent_settled.
-  | { type: "agent_end"; messages?: PiAgentMessage[]; willRetry?: boolean }
-  | { type: "agent_settled" }
+  | { type: "agent_end"; messages?: PiAgentMessage[]; willRetry?: boolean; runId?: string }
+  | { type: "agent_settled"; runId?: string }
   | { type: "queue_update"; steering?: string[]; followUp?: string[] };
 
 export type PiRuntimeEvent =

@@ -811,6 +811,10 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       setAgents,
       recoverTimelineGap,
     });
+    const unregisterAgentStreamFlusher = getHostRuntimeStore().registerAgentStreamFlusher(
+      serverId,
+      agentStreamReducerQueue.flushAgent,
+    );
 
     const unsubAgentStream = client.on("agent_stream", (message) => {
       if (message.type !== "agent_stream") return;
@@ -1158,6 +1162,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       unsubTranscription();
       unsubVoiceInputState();
       unsubTerminalAttention();
+      unregisterAgentStreamFlusher();
       agentStreamReducerQueue.dispose({ flush: true });
     };
   }, [

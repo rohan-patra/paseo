@@ -80,7 +80,10 @@ function isSameTextStream(previous: PendingTextEntry, next: PendingTextEntry): b
   if (previous.item.type === "assistant_message" && next.item.type === "assistant_message") {
     return previous.item.messageId === next.item.messageId;
   }
-  return true;
+  if (previous.item.type !== "reasoning" || next.item.type !== "reasoning") {
+    return true;
+  }
+  return previous.item.reasoningId === next.item.reasoningId;
 }
 
 export class AgentStreamCoalescer {

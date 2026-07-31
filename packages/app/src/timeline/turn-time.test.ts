@@ -37,6 +37,21 @@ describe("deriveStreamTurnTiming", () => {
     assert.equal(timing.isActive, true);
   });
 
+  it("stops the optimistic spinner once a response item arrives", () => {
+    const optimisticPrompt = {
+      ...user("optimistic", new Date("2026-05-15T00:00:00.000Z")),
+      optimistic: true as const,
+    };
+
+    const timing = deriveStreamTurnTiming({
+      agentStatus: "idle",
+      tail: [],
+      head: [optimisticPrompt, assistant("response", new Date("2026-05-15T00:00:01.000Z"))],
+    });
+
+    assert.equal(timing.isActive, false);
+  });
+
   it("does not start elapsed time from an optimistic prompt", () => {
     const optimisticPrompt = {
       ...user("optimistic", new Date("2026-05-15T00:00:00.000Z")),

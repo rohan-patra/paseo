@@ -1353,6 +1353,7 @@ export class HostRuntimeStore {
   private lastConnectionStatusByServer = new Map<string, HostRuntimeConnectionStatus>();
   private directoryBootstrapInFlight = new Map<string, Promise<void>>();
   private queuedAgentDrainInFlight = new Set<string>();
+  private agentStreamFlushersByServer = new Map<string, Set<(agentId: string) => void>>();
   private directorySyncByServer = new Map<string, DirectorySync>();
   private configuredOverrideBootstrapInFlight: Promise<void> | null = null;
   private bootStarted = false;
@@ -1586,6 +1587,7 @@ export class HostRuntimeStore {
     rekeyMap(this.controllers, oldServerId, newServerId);
     rekeyMap(this.lastConnectionStatusByServer, oldServerId, newServerId);
     rekeyMap(this.directoryBootstrapInFlight, oldServerId, newServerId);
+    rekeyMap(this.agentStreamFlushersByServer, oldServerId, newServerId);
     this.replicaCache.reconcileServerId(oldServerId, newServerId);
     this.directorySyncByServer.get(oldServerId)?.dispose();
     this.directorySyncByServer.delete(oldServerId);
@@ -1899,6 +1901,7 @@ export class HostRuntimeStore {
       this.controllers.delete(serverId);
       this.lastConnectionStatusByServer.delete(serverId);
       this.directoryBootstrapInFlight.delete(serverId);
+      this.agentStreamFlushersByServer.delete(serverId);
       this.directorySyncByServer.get(serverId)?.dispose();
       this.directorySyncByServer.delete(serverId);
       this.clearHostReplica(serverId);
@@ -2048,16 +2051,43 @@ export class HostRuntimeStore {
     this.directoryBootstrapInFlight.set(serverId, bootstrap);
   }
 
+  registerAgentStreamFlusher(serverId: string, flushAgent: (agentId: string) => void): () => void {
+    const flushers = this.agentStreamFlushersByServer.get(serverId) ?? new Set();
+    flushers.add(flushAgent);
+    this.agentStreamFlushersByServer.set(serverId, flushers);
+    return () => {
+      for (const [registeredServerId, registeredFlushers] of this.agentStreamFlushersByServer) {
+        if (registeredFlushers !== flushers) continue;
+        registeredFlushers.delete(flushAgent);
+        if (registeredFlushers.size === 0) {
+          this.agentStreamFlushersByServer.delete(registeredServerId);
+        }
+        return;
+      }
+    };
+  }
+
   drainQueuedAgentMessage(serverId: string, agentId: string): void {
     const drainKey = `${serverId}:${agentId}`;
     if (this.queuedAgentDrainInFlight.has(drainKey)) return;
-    const store = useSessionStore.getState();
-    const session = store.sessions[serverId];
-    const queue = session?.queuedMessages.get(agentId);
-    const client = session?.client;
-    if (!client || !queue?.length || session.initializingAgents.get(agentId) === true) {
+    const initialSession = useSessionStore.getState().sessions[serverId];
+    if (
+      !initialSession?.client ||
+      !initialSession.queuedMessages.get(agentId)?.length ||
+      initialSession.initializingAgents.get(agentId) === true
+    ) {
       return;
     }
+    for (const flushAgent of this.agentStreamFlushersByServer.get(serverId) ?? []) {
+      flushAgent(agentId);
+    }
+    // Flushers run synchronously and may re-enter this drain. Inner drain owns
+    // submission once it marks this key in flight.
+    if (this.queuedAgentDrainInFlight.has(drainKey)) return;
+    const session = useSessionStore.getState().sessions[serverId];
+    const queue = session?.queuedMessages.get(agentId);
+    const client = session?.client;
+    if (!client || !queue?.length) return;
     this.queuedAgentDrainInFlight.add(drainKey);
     const next = queue[0];
     void sendQueuedComposerMessageNow({

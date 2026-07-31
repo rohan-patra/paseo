@@ -8,6 +8,36 @@ import {
 } from "./timeline-projection.js";
 
 describe("projectTimelineRows", () => {
+  test("keeps same reasoning session separate across interposed rows", () => {
+    const rows: AgentTimelineRow[] = [
+      {
+        seq: 1,
+        timestamp: "2026-02-13T00:00:00.000Z",
+        item: { type: "reasoning", text: "A", reasoningId: "r1" },
+      },
+      { seq: 2, timestamp: "2026-02-13T00:00:00.100Z", item: { type: "todo", items: [] } },
+      {
+        seq: 3,
+        timestamp: "2026-02-13T00:00:00.200Z",
+        item: { type: "reasoning", text: "B", reasoningId: "r1" },
+      },
+      {
+        seq: 4,
+        timestamp: "2026-02-13T00:00:00.300Z",
+        item: { type: "reasoning", text: "C", reasoningId: "r2" },
+      },
+    ];
+    const projected = projectTimelineRows({ rows, mode: "projected" });
+    expect(projected.filter((entry) => entry.item.type === "reasoning")).toHaveLength(3);
+    expect(
+      projected.find((entry) => entry.item.type === "reasoning" && entry.item.reasoningId === "r1")
+        ?.item,
+    ).toEqual({
+      type: "reasoning",
+      text: "A",
+      reasoningId: "r1",
+    });
+  });
   test("merges adjacent assistant chunks in projected mode", () => {
     const rows: AgentTimelineRow[] = [
       {
@@ -509,6 +539,41 @@ describe("selectProjectedTimelinePage", () => {
     expect(page.startSeq).toBe(1);
     expect(page.endSeq).toBe(121);
     expect(page.hasNewer).toBe(false);
+  });
+
+  test("after page preserves identified reasoning chunks in causal order", () => {
+    const rows: AgentTimelineRow[] = [
+      {
+        seq: 10,
+        timestamp: new Date(10).toISOString(),
+        item: { type: "reasoning", text: "before", reasoningId: "r1" },
+      },
+      {
+        seq: 11,
+        timestamp: new Date(11).toISOString(),
+        item: { type: "user_message", text: "tool" },
+      },
+      {
+        seq: 250,
+        timestamp: new Date(250).toISOString(),
+        item: { type: "reasoning", text: "after", reasoningId: "r1" },
+      },
+    ];
+    const page = selectProjectedTimelinePage({
+      rows,
+      direction: "after",
+      cursorSeq: 249,
+      limit: 100,
+    });
+    expect(page.entries).toHaveLength(1);
+    expect(page.entries[0]?.item).toEqual({
+      type: "reasoning",
+      text: "after",
+      reasoningId: "r1",
+    });
+    expect(page.entries[0]?.sourceSeqRanges).toEqual([{ startSeq: 250, endSeq: 250 }]);
+    expect(page.startSeq).toBe(250);
+    expect(page.endSeq).toBe(250);
   });
 
   test("after page includes a full projected tool item when only its update is new", () => {

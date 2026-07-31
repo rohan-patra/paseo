@@ -125,6 +125,7 @@ export type ThoughtStatus = "loading" | "ready";
 export interface ThoughtItem {
   kind: "thought";
   id: string;
+  reasoningId?: string;
   text: string;
   timestamp: Date;
   status: ThoughtStatus;
@@ -461,14 +462,19 @@ function appendAssistantMessage(
   return [...state, item];
 }
 
-function appendThought(state: StreamItem[], text: string, timestamp: Date): StreamItem[] {
+function appendThought(
+  state: StreamItem[],
+  text: string,
+  timestamp: Date,
+  reasoningId?: string,
+): StreamItem[] {
   const { chunk, hasContent } = normalizeChunk(text);
   if (!chunk) {
     return state;
   }
 
   const last = state[state.length - 1];
-  if (last && last.kind === "thought") {
+  if (last && last.kind === "thought" && last.reasoningId === reasoningId) {
     const updated: ThoughtItem = {
       ...last,
       text: `${last.text}${chunk}`,
@@ -489,6 +495,7 @@ function appendThought(state: StreamItem[], text: string, timestamp: Date): Stre
     text: chunk,
     timestamp,
     status: "loading",
+    ...(reasoningId ? { reasoningId } : {}),
   };
   return [...state, item];
 }
@@ -868,7 +875,7 @@ function reduceTimelineEvent(
         ),
       );
     case "reasoning":
-      return appendThought(state, item.text, timestamp);
+      return appendThought(state, item.text, timestamp, item.reasoningId);
     case "tool_call":
       return finalizeActiveThoughts(reduceTimelineToolCall(state, event, item, timestamp));
     case "todo": {

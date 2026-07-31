@@ -160,39 +160,44 @@ function collapseToolLifecycle(entries: readonly WorkingEntry[]): WorkingEntry[]
   return output;
 }
 
+// Reasoning rows merge only while causally adjacent. Identity prevents
+// unrelated adjacent sessions from collapsing; adjacency preserves cursor order
+// and avoids duplicating/reordering rows across pagination windows.
 function mergeReasoningChunks(entries: readonly WorkingEntry[]): WorkingEntry[] {
   const output: WorkingEntry[] = [];
 
   for (const entry of entries) {
-    const previous = output[output.length - 1];
-    const shouldMerge =
-      previous &&
-      previous.item.type === "reasoning" &&
-      entry.item.type === "reasoning" &&
-      previous.seqEnd + 1 === entry.seqStart;
-
-    if (!shouldMerge || !previous) {
+    const previous = output.at(-1);
+    const previousReasoning = previous?.item.type === "reasoning" ? previous.item : undefined;
+    const entryReasoning = entry.item.type === "reasoning" ? entry.item : undefined;
+    if (
+      !previous ||
+      !previousReasoning ||
+      !entryReasoning ||
+      previousReasoning.reasoningId !== entryReasoning.reasoningId ||
+      previous.seqEnd + 1 !== entry.seqStart
+    ) {
       output.push(entry);
       continue;
     }
-    const previousReasoning = previous.item as Extract<AgentTimelineItem, { type: "reasoning" }>;
-    const entryReasoning = entry.item as Extract<AgentTimelineItem, { type: "reasoning" }>;
 
+    const previousEntry = previous;
+    const mergedReasoning: Extract<AgentTimelineItem, { type: "reasoning" }> = {
+      type: "reasoning",
+      text: `${previousReasoning.text}${entryReasoning.text}`,
+      ...(previousReasoning.reasoningId ? { reasoningId: previousReasoning.reasoningId } : {}),
+    };
     const collapsedKinds = new Set<TimelineProjectionKind>([
-      ...previous.collapsed,
+      ...previousEntry.collapsed,
       ...entry.collapsed,
       "reasoning_merge",
     ]);
-
     output[output.length - 1] = {
-      ...previous,
-      item: {
-        type: "reasoning",
-        text: `${previousReasoning.text}${entryReasoning.text}`,
-      },
+      ...previousEntry,
+      item: mergedReasoning,
       timestamp: entry.timestamp,
       seqEnd: entry.seqEnd,
-      sourceSeqRanges: mergeSeqRanges(previous.sourceSeqRanges, entry.sourceSeqRanges),
+      sourceSeqRanges: mergeSeqRanges(previousEntry.sourceSeqRanges, entry.sourceSeqRanges),
       collapsed: Array.from(collapsedKinds),
     };
   }

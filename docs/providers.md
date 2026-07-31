@@ -24,6 +24,12 @@ Paseo tools are not implemented as MCP tools internally. They live in a shared t
 
 Pi is a process-backed provider. Paseo requires the user to have the `pi` binary installed and talks to it through `pi --mode rpc`; the server package does not embed Pi's SDK/runtime packages.
 
+### Pi turn identity requirement
+
+Paseo treats Pi `agent_end` followed by `agent_settled` as terminal lifecycle authority. **Current Pi RPC does not support `runId`; Paseo does not depend on it or claim stale-run proof today.** Events remain causally ordered under existing protocol.
+
+**Future-compatible upstream extension:** optional `runId: string` on `agent_start`, `turn_start`, `agent_end`, and `agent_settled`, stable for one Pi agent run and changed before next run. Paseo only compares terminal IDs when both `agent_end` and `agent_settled` provide one; mixed-version streams retain legacy handling. No timer fence is lifecycle truth.
+
 Paseo's per-agent and daemon-wide system prompts are appended by its generated Pi integration extension. Paseo deliberately does not pass `--append-system-prompt`, because that flag replaces Pi's automatic `APPEND_SYSTEM.md` discovery instead of composing with it.
 
 Pi model records expose input capabilities through `model.input`. Only send raw RPC `images` when the current model explicitly includes `"image"` in that list. Text-only Pi/OMP models reject image content and persist the rejected image in JSONL history, so image prompts for those models must be materialized to a local file and passed as a text path hint instead.

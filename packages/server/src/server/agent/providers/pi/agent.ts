@@ -1558,6 +1558,8 @@ export class PiRpcAgentSession implements AgentSession {
   private activeTurnId: string | null = null;
   private activeClientMessageId: string | null = null;
   private activeAssistantMessageId: string | null = null;
+  private activeReasoningId: string | null = null;
+  private reasoningSequence = 0;
   private activeTurnStarted = false;
   private activeForegroundPromptText: string | null = null;
   private activeNoTurnPromptText: string | null = null;
@@ -1580,12 +1582,14 @@ export class PiRpcAgentSession implements AgentSession {
   // Prompts accepted via enqueuePrompt whose user-message delivery (and
   // possibly their own agent run) is still outstanding.
   private readonly pendingEnqueuedPrompts: PiPendingEnqueuedPrompt[] = [];
-  // agent_end payload held back until agent_settled confirms the run is done.
-  // While populated, prompt delivery is held locally: Pi may already consider
-  // itself idle, in which case streamingBehavior would start an overlapping run
-  // instead of atomically queueing onto this one.
-  private pendingSettlement: { turnId: string | undefined; messages: PiAgentMessage[] } | null =
-    null;
+  // `runId` is forward-compatible protocol metadata only. Current Pi RPC omits
+  // it, so lifecycle authority remains causally ordered agent_end → agent_settled.
+  // When a future Pi sends IDs on both events, reject a mismatched settlement.
+  private pendingSettlement: {
+    turnId: string | undefined;
+    messages: PiAgentMessage[];
+    piRunId?: string;
+  } | null = null;
   private promptDeliveryBlockedUntilSettlementOrRestart = false;
   private deferredPromptStartInFlight = false;
   private readonly currentModeId: string | null;
@@ -1688,6 +1692,7 @@ export class PiRpcAgentSession implements AgentSession {
           return;
         }
         this.activeTurnId = null;
+        this.pendingSettlement = null;
         this.activeClientMessageId = null;
         this.activeTurnStarted = false;
         this.activeAssistantMessageId = null;
@@ -2734,24 +2739,44 @@ export class PiRpcAgentSession implements AgentSession {
           this.completeTurn(turnId, messages);
           return true;
         }
-        this.pendingSettlement = { turnId, messages };
+        const priorSettlement = this.pendingSettlement;
+        // Once an identified agent_end is pending, a different identified end is
+        // stale. Current Pi lacks IDs, so untagged legacy events retain ordering.
+        if (priorSettlement?.piRunId && event.runId && priorSettlement.piRunId !== event.runId) {
+          return true;
+        }
+        this.pendingSettlement = {
+          turnId,
+          messages,
+          ...(event.runId ? { piRunId: event.runId } : {}),
+        };
         this.promptDeliveryBlockedUntilSettlementOrRestart = true;
         return true;
       }
       case "agent_settled": {
         const settlement = this.pendingSettlement;
-        this.pendingSettlement = null;
-        if (settlement) {
-          this.promptDeliveryBlockedUntilSettlementOrRestart = false;
-          this.completeTurn(settlement.turnId, settlement.messages);
-          this.clearSettledNativePromptCorrelations();
-          void this.startDeferredPromptAfterSettlement();
+        if (!settlement || !this.isSettlementForPendingRun(settlement, event.runId)) {
+          return true;
         }
+        this.pendingSettlement = null;
+        this.promptDeliveryBlockedUntilSettlementOrRestart = false;
+        this.completeTurn(settlement.turnId, settlement.messages);
+        this.clearSettledNativePromptCorrelations();
+        void this.startDeferredPromptAfterSettlement();
         return true;
       }
       default:
         return false;
     }
+  }
+
+  private isSettlementForPendingRun(
+    settlement: { piRunId?: string },
+    eventRunId: string | undefined,
+  ): boolean {
+    // Partial rollout stays legacy: compare only when both terminal events carry
+    // a run id. Do not let a new agent_start/turn_start gate current Pi traffic.
+    return !settlement.piRunId || !eventRunId || settlement.piRunId === eventRunId;
   }
 
   private clearSettledNativePromptCorrelations(): void {
@@ -2947,6 +2972,10 @@ export class PiRpcAgentSession implements AgentSession {
       return;
     }
     if (event.assistantMessageEvent.type === "thinking_delta") {
+      const contentIndex = event.assistantMessageEvent.contentIndex;
+      this.activeAssistantMessageId ??= `response-${++this.reasoningSequence}`;
+      const reasoningId = `${this.activeAssistantMessageId}:reasoning:${contentIndex ?? 0}`;
+      this.activeReasoningId = reasoningId ?? this.activeReasoningId;
       this.emit({
         type: "timeline",
         provider: this.provider,
@@ -2954,6 +2983,9 @@ export class PiRpcAgentSession implements AgentSession {
         item: {
           type: "reasoning",
           text: event.assistantMessageEvent.delta ?? "",
+          ...((reasoningId ?? this.activeReasoningId)
+            ? { reasoningId: reasoningId ?? this.activeReasoningId ?? undefined }
+            : {}),
         },
       });
     }
@@ -2961,6 +2993,7 @@ export class PiRpcAgentSession implements AgentSession {
 
   private handleMessageStart(event: Extract<PiAgentSessionEvent, { type: "message_start" }>): void {
     if (event.message.role === "assistant") {
+      this.activeReasoningId = null;
       this.activeAssistantMessageId = event.message.responseId || null;
     }
   }
@@ -3054,6 +3087,7 @@ export class PiRpcAgentSession implements AgentSession {
       return;
     }
     this.activeTurnId = null;
+    this.pendingSettlement = null;
     this.activeClientMessageId = null;
     this.activeAssistantMessageId = null;
     this.activeTurnStarted = false;

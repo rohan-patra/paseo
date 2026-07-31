@@ -925,7 +925,7 @@ describe("PiRpcAgentSession", () => {
     expect(events.timelineItems()).toEqual([
       { type: "assistant_message", text: "hel", messageId: "response-1" },
       { type: "assistant_message", text: "lo", messageId: "response-1" },
-      { type: "reasoning", text: "thinking" },
+      { type: "reasoning", text: "thinking", reasoningId: "response-1:reasoning:0" },
       {
         type: "tool_call",
         callId: "tool-1",
@@ -973,6 +973,58 @@ describe("PiRpcAgentSession", () => {
       text: "lo",
       messageId: firstMessageId,
     });
+  });
+
+  test("assigns distinct reasoning ids when assistant response ids are absent", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+
+    await session.startTurn("hello");
+    fakeSession.emit({
+      type: "message_update",
+      message: { role: "assistant", content: [] },
+      assistantMessageEvent: { type: "thinking_delta", delta: "first" },
+    });
+    fakeSession.emit({ type: "message_end", message: { role: "assistant", content: [] } });
+    fakeSession.emit({ type: "message_start", message: { role: "assistant", content: [] } });
+    fakeSession.emit({
+      type: "message_update",
+      message: { role: "assistant", content: [] },
+      assistantMessageEvent: { type: "thinking_delta", delta: "second" },
+    });
+
+    const reasoning = events.timelineItems().filter((item) => item.type === "reasoning");
+    expect(reasoning).toHaveLength(2);
+    expect(reasoning[0]).toMatchObject({ text: "first", reasoningId: expect.any(String) });
+    expect(reasoning[1]).toMatchObject({ text: "second", reasoningId: expect.any(String) });
+    expect((reasoning[0] as { reasoningId: string }).reasoningId).not.toBe(
+      (reasoning[1] as { reasoningId: string }).reasoningId,
+    );
+  });
+
+  test("uses content index to distinguish reasoning sessions", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    await session.startTurn("hello");
+    fakeSession.emit({
+      type: "message_start",
+      message: { role: "assistant", content: [], responseId: "resp" },
+    });
+    fakeSession.emit({
+      type: "message_update",
+      message: { role: "assistant", content: [] },
+      assistantMessageEvent: { type: "thinking_delta", delta: "a", contentIndex: 0 },
+    });
+    fakeSession.emit({
+      type: "message_update",
+      message: { role: "assistant", content: [] },
+      assistantMessageEvent: { type: "thinking_delta", delta: "b", contentIndex: 1 },
+    });
+    const reasoning = events.timelineItems().filter((item) => item.type === "reasoning");
+    expect(reasoning.map((item) => (item as { reasoningId: string }).reasoningId)).toEqual([
+      "resp:reasoning:0",
+      "resp:reasoning:1",
+    ]);
   });
 
   test("uses a response id that first appears on the assistant update", async () => {
@@ -2717,6 +2769,24 @@ describe("PiRpcAgentSession queueing and settlement", () => {
     });
   });
 
+  test("clears identified settlement when interrupting a turn", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    await session.startTurn("cancel identified turn");
+    fakeSession.emit({ type: "agent_start", runId: "run-canceled" });
+    fakeSession.emit({ type: "agent_end", runId: "run-canceled", willRetry: false });
+    await session.interrupt();
+
+    const next = await session.startTurn("replacement");
+    fakeSession.emit({ type: "agent_start", runId: "run-replacement" });
+    fakeSession.emit({ type: "agent_end", runId: "run-replacement", willRetry: false });
+    fakeSession.emit({ type: "agent_settled", runId: "run-replacement" });
+
+    expect(events.turnCompletedEvents()).toContainEqual(
+      expect.objectContaining({ turnId: next.turnId }),
+    );
+  });
+
   test("ignores late lifecycle events after the active turn was canceled", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();
@@ -2755,6 +2825,85 @@ describe("PiRpcAgentSession queueing and settlement", () => {
     expect(events.turnCompletedEvents()).toEqual([
       expect.objectContaining({ type: "turn_completed", turnId }),
     ]);
+  });
+
+  test("ignores a stale settled event when Pi supplies run identity", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    const { turnId } = await session.startTurn("identity-bound task");
+    fakeSession.emit({ type: "agent_start", runId: "run-current" });
+    fakeSession.emit({ type: "turn_start", runId: "run-current" });
+    fakeSession.emit({ type: "agent_end", runId: "run-current", willRetry: false });
+
+    fakeSession.emit({ type: "agent_settled", runId: "run-stale" });
+    expect(events.turnCompletedEvents()).toHaveLength(0);
+
+    fakeSession.emit({ type: "agent_settled", runId: "run-current" });
+    expect(events.turnCompletedEvents()).toEqual([
+      expect.objectContaining({ type: "turn_completed", turnId }),
+    ]);
+  });
+
+  test("does not replace an identified pending end with a stale end", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    const { turnId } = await session.startTurn("stale end task");
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "agent_end", runId: "run-current", willRetry: false });
+    fakeSession.emit({ type: "agent_end", runId: "run-stale", willRetry: false });
+    fakeSession.emit({ type: "agent_settled", runId: "run-current" });
+
+    expect(events.turnCompletedEvents()).toEqual([
+      expect.objectContaining({ type: "turn_completed", turnId }),
+    ]);
+  });
+
+  test("settles partial run identity rollout when only one terminal event has runId", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    const { turnId } = await session.startTurn("mixed identity task");
+    fakeSession.emit({ type: "agent_start", runId: "run-current" });
+    fakeSession.emit({ type: "agent_end", runId: "run-current", willRetry: false });
+    fakeSession.emit({ type: "agent_settled" });
+
+    expect(events.turnCompletedEvents()).toEqual([
+      expect.objectContaining({ type: "turn_completed", turnId }),
+    ]);
+  });
+
+  test("does not let stale identified starts block current Pi lifecycle", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    const { turnId } = await session.startTurn("current task");
+    fakeSession.emit({ type: "agent_start", runId: "run-stale" });
+    fakeSession.emit({ type: "turn_start", runId: "run-current" });
+    fakeSession.emit({ type: "agent_end", runId: "run-current", willRetry: false });
+    fakeSession.emit({ type: "agent_settled", runId: "run-current" });
+
+    expect(events.turnCompletedEvents()).toEqual([
+      expect.objectContaining({ type: "turn_completed", turnId }),
+    ]);
+  });
+
+  test("clears identified settlement after prompt start failure", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    fakeSession.promptError = new Error("prompt failed");
+    const failed = await session.startTurn("will fail");
+    await flushTurnScheduling();
+    expect(events.eventsOfType("turn_failed")).toContainEqual(
+      expect.objectContaining({ turnId: failed.turnId }),
+    );
+
+    fakeSession.promptError = null;
+    const next = await session.startTurn("next turn");
+    fakeSession.emit({ type: "agent_start", runId: "run-next" });
+    fakeSession.emit({ type: "agent_end", runId: "run-next", willRetry: false });
+    fakeSession.emit({ type: "agent_settled", runId: "run-next" });
+
+    expect(events.turnCompletedEvents()).toContainEqual(
+      expect.objectContaining({ turnId: next.turnId }),
+    );
   });
 
   test("does not erase pending settlement when Pi starts an internal retry", async () => {

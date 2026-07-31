@@ -410,7 +410,7 @@ export interface CompactionTimelineItem {
 export type AgentTimelineItem =
   | { type: "user_message"; text: string; messageId?: string; clientMessageId?: string }
   | { type: "assistant_message"; text: string; messageId?: string }
-  | { type: "reasoning"; text: string }
+  | { type: "reasoning"; text: string; reasoningId?: string }
   | ToolCallTimelineItem
   | { type: "todo"; items: { text: string; completed: boolean }[] }
   | { type: "error"; message: string }
