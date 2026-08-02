@@ -322,7 +322,7 @@ describe("PiRpcAgentSession", () => {
       {
         type: "upsert",
         id: "auth-research",
-        title: "auth-research",
+        title: "auth-research · kimi-k3",
         status: "running",
         description: "Trace token refresh.",
         subtitle: "kimi-k3 (modal) · 1 turn",

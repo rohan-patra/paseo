@@ -34,7 +34,7 @@ describe("Pi provider subagent mapper", () => {
       {
         type: "upsert",
         id: "auth-research",
-        title: "auth-research",
+        title: "auth-research · kimi-k3 · High",
         status: "running",
         subtitle: "kimi-k3 (modal) · High · 2 turns · 3 tools · 12k tokens",
         cwd: "/repo",
@@ -52,11 +52,24 @@ describe("Pi provider subagent mapper", () => {
     expect(index.apply({ ...running, metrics: { ...running.metrics, turns: 3 } })).toHaveLength(1);
   });
 
+  test("keeps model and effort in the title after sparse updates", () => {
+    const index = new PiSubagentIndex();
+    expect(upserts(index.apply(running))[0]?.title).toBe("auth-research · kimi-k3 · High");
+    expect(upserts(index.apply({ id: "auth-research", status: "completed" }))[0]?.title).toBe(
+      "auth-research · kimi-k3 · High",
+    );
+  });
+
   test("writes only the fields that moved", () => {
     const index = new PiSubagentIndex();
     index.apply(running);
     expect(upserts(index.apply({ ...running, status: "completed" }))).toEqual([
-      { type: "upsert", id: "auth-research", title: "auth-research", status: "completed" },
+      {
+        type: "upsert",
+        id: "auth-research",
+        title: "auth-research · kimi-k3 · High",
+        status: "completed",
+      },
     ]);
   });
 

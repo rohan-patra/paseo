@@ -86,6 +86,8 @@ export interface PiSubagentLaunch {
 interface PiSubagentState {
   seen: boolean;
   title: string;
+  model: string | null;
+  effort: string | null;
   description: string | null;
   subtitle: string | null;
   status: ProviderSubagentStatus;
@@ -181,6 +183,8 @@ export class PiSubagentIndex {
     const state: PiSubagentState = {
       seen: false,
       title: "",
+      model: null,
+      effort: null,
       description: null,
       subtitle: null,
       status: "running",
@@ -211,7 +215,7 @@ export class PiSubagentIndex {
   ): ProviderSubagentInputEvent | null {
     const launch = this.launches.get(id);
     const next = {
-      title: id,
+      ...resolvePiSubagentIdentity(id, state, update),
       description: launch?.task ?? state.description,
       // A publish that carries no metrics yet must not blank a subtitle already
       // shown, so an empty build preserves the previous value.
@@ -265,6 +269,16 @@ export class PiSubagentIndex {
     state.eventSequence += 1;
     return piSubagentTimelineItem(update.id.trim(), state, event, state.eventSequence, messageId);
   }
+}
+
+function resolvePiSubagentIdentity(
+  id: string,
+  state: PiSubagentState,
+  update: PiSubagentUpdate,
+): Pick<PiSubagentState, "title" | "model" | "effort"> {
+  const model = update.model?.id?.trim() || state.model;
+  const effort = formatEffort(update.effort) ?? state.effort;
+  return { title: [id, model, effort].filter(Boolean).join(" · "), model, effort };
 }
 
 function mapPiSubagentStatus(
