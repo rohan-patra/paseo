@@ -83,6 +83,11 @@ import type {
   PiThinkingLevel,
 } from "./rpc-types.js";
 import {
+  parsePiSubagentLaunchCommand,
+  PiSubagentIndex,
+  type PiSubagentUpdate,
+} from "./subagent-index.js";
+import {
   clampPiThinkingLevel,
   normalizePiThinkingOption,
   supportedPiThinkingLevels,
@@ -105,6 +110,7 @@ const PASEO_PI_CAPTURE_EXTENSION_COMMAND = "paseo_capture_entries";
 const PASEO_PI_ENTRY_CAPTURE_MARKER = "PASEO_ENTRY_CAPTURE";
 const PASEO_PI_SUBMITTED_USER_ENTRY_MARKER = "PASEO_SUBMITTED_USER_ENTRY";
 const PASEO_PI_COMMAND_RESULT_MARKER = "PASEO_COMMAND_RESULT";
+const PASEO_PI_SUBAGENT_MARKER = "PASEO_SUBAGENT";
 const DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS = 30_000;
 const QUESTION_RESPONSE_HEADER = "Response";
 const QUESTION_COMMENT_HEADER = "Comment";
@@ -685,6 +691,41 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 	  );
 	}
 
+	// Subagents are an extension feature, not a Pi core one, so no RPC command can
+	// observe them: pi answers get_subagents with "Unknown command". The shared
+	// extension bus is the supported seam. The subagents extension publishes one
+	// subagents:event per task change, and ui.notify is the only channel an
+	// extension has to an RPC client. The task's own event log is dropped and
+	// replaced by the single event that caused this publish, so the payload stays
+	// a bounded delta instead of resending the whole history on every tick.
+	function emitSubagentUpdate(ctx, payload) {
+	  const task = payload && payload.task;
+	  if (!ctx || !task || typeof task.taskId !== "string") return;
+	  ctx.ui.notify(
+	    "${PASEO_PI_SUBAGENT_MARKER} " +
+	      JSON.stringify({
+	        id: task.taskId,
+	        kind: task.kind,
+	        status: task.status,
+	        cwd: task.cwd,
+	        model: task.model,
+	        effort: task.effort,
+	        depth: task.depth,
+	        parentTaskId: task.parentTaskId,
+	        childSessionId: task.childSessionId,
+	        childSessionFile: task.childSessionFile,
+	        createdAt: task.createdAt,
+	        updatedAt: task.updatedAt,
+	        finishedAt: task.finishedAt,
+	        metrics: task.metrics,
+	        final: task.final,
+	        pendingRequest: task.pendingRequest,
+	        event: payload.event,
+	      }),
+	    "info",
+	  );
+	}
+
 	export default function paseoIntegration(pi) {
 	  const submittedUserMessages = [];
 
@@ -718,7 +759,32 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
         : ""
     }
 
+	  let uiContext;
+	  const pendingSubagentUpdates = [];
+
+	  // The bus handler has no ctx of its own, so the live one is latched at
+	  // session_start. Extension load order decides whether that has happened yet:
+	  // a session restoring earlier work republishes it immediately, and that can
+	  // land before this extension's own session_start. Buffer until there is a ctx.
+	  pi.events.on("subagents:event", (payload) => {
+	    try {
+	      if (!uiContext) {
+	        if (pendingSubagentUpdates.length < 100) pendingSubagentUpdates.push(payload);
+	        return;
+	      }
+	      emitSubagentUpdate(uiContext, payload);
+	    } catch {
+	      // A relay failure must never take down the session that is doing the work.
+	    }
+	  });
+
 	  pi.on("session_start", async (_event, ctx) => {
+	    uiContext = ctx;
+	    for (const payload of pendingSubagentUpdates.splice(0)) {
+	      try {
+	        emitSubagentUpdate(ctx, payload);
+	      } catch {}
+	    }
 	    emitEntryCapture(ctx, "session_start");
 	  });
 
@@ -1539,6 +1605,7 @@ export class PiRpcAgentSession implements AgentSession {
 
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private readonly activeToolCalls = new Map<string, PiTrackedToolCall>();
+  private readonly subagentIndex = new PiSubagentIndex();
   private readonly pendingExtensionUiRequests = new Map<string, AgentPermissionRequest>();
   private readonly backgroundWorkIncarnation = randomUUID();
   private backgroundWorkEpoch = 1;
@@ -1890,6 +1957,7 @@ export class PiRpcAgentSession implements AgentSession {
     }
     this.closed = true;
     try {
+      for (const event of this.subagentIndex.terminalizeRunning()) this.emit(event);
       await this.runtimeSession.close();
     } finally {
       this.rejectAllExtensionResults(new Error("Pi session closed"));
@@ -2399,6 +2467,16 @@ export class PiRpcAgentSession implements AgentSession {
     return true;
   }
 
+  /**
+   * Scrape the `background-work` widget into parent timeline cards.
+   *
+   * This predates the structured relay and remains the only view of background
+   * *shells*. Once the relay has reported a subagent, the subagent rows here are
+   * dropped: the same child would otherwise appear twice, once as a scraped card
+   * in the parent transcript and once as its own pane. An older subagents
+   * extension that never publishes on the bus keeps the scraped rows, so the
+   * fallback degrades instead of disappearing.
+   */
   private mapBackgroundWorkWidget(
     event: Extract<PiRuntimeEvent, { type: "extension_ui_request" }>,
   ): Array<Extract<AgentTimelineItem, { type: "tool_call" }>> | null {
@@ -2420,6 +2498,7 @@ export class PiRpcAgentSession implements AgentSession {
 
     const items: Array<Extract<AgentTimelineItem, { type: "tool_call" }>> = [];
     for (const row of parsed.rows) {
+      if (row.kind === "subagent" && this.subagentIndex.active) continue;
       const previous = this.backgroundWorkRuns.get(row.key);
       const run = advanceBackgroundWorkRun(previous, row, row.lines.join("\n"));
       this.backgroundWorkRuns.set(row.key, run);
@@ -2476,7 +2555,8 @@ export class PiRpcAgentSession implements AgentSession {
       message &&
       (this.handleSubmittedUserEntryMarker(message) ||
         this.handleEntryCaptureMarker(message) ||
-        this.handleCommandResultMarker(message))
+        this.handleCommandResultMarker(message) ||
+        this.handleSubagentMarker(message))
     ) {
       return;
     }
@@ -2567,6 +2647,49 @@ export class PiRpcAgentSession implements AgentSession {
     });
   }
 
+  /**
+   * Decode one `PASEO_SUBAGENT` relay marker into provider subagent events.
+   *
+   * The marker is the only channel that exists: subagents are an extension
+   * feature and Pi's RPC surface has no command that can see them (pi 0.83.0
+   * answers `get_subagents` with `Unknown command`). `paseo-integration.mjs`
+   * subscribes to the extension bus and republishes each task update here.
+   */
+  private handleSubagentMarker(message: string): boolean {
+    const payload = parseExtensionMarkerPayload(message, PASEO_PI_SUBAGENT_MARKER);
+    if (!payload) {
+      return false;
+    }
+    if (typeof payload.id !== "string") {
+      return true;
+    }
+    for (const event of this.subagentIndex.apply(payload as unknown as PiSubagentUpdate)) {
+      this.emit(event);
+    }
+    return true;
+  }
+
+  /**
+   * Link a child to the parent Bash call that launched it.
+   *
+   * `extensions/subagents` launches children through Bash, and the extension bus
+   * payload carries neither the parent tool call id nor the task text (the task
+   * prompt is stripped before publishing). The launcher command line carries
+   * both, so it is the only place the child can be attached to the parent turn
+   * that asked for it.
+   */
+  private noteSubagentLaunch(toolCallId: string, toolCall: PiTrackedToolCall): void {
+    if (toolCall.kind !== "bash") return;
+    const command = toolCall.args?.command;
+    if (typeof command !== "string") return;
+    const launch = parsePiSubagentLaunchCommand(command);
+    if (!launch) return;
+    this.subagentIndex.noteLaunch(launch.name, {
+      toolCallId,
+      ...(launch.task ? { task: launch.task } : {}),
+    });
+  }
+
   private handleRuntimeEvent(event: PiRuntimeEvent): void {
     if (isExtensionUiRequestEvent(event)) {
       this.handleExtensionUiRequest(event);
@@ -2606,6 +2729,11 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   private handleProcessExit(error: string): void {
+    // Children are separate OS processes the parent extension kills on shutdown,
+    // so a row left running against a dead parent would never resolve. State is
+    // kept, not cleared: a restarted runtime republishes from the same ids and
+    // must land on the existing descriptors rather than duplicate them.
+    for (const event of this.subagentIndex.terminalizeRunning()) this.emit(event);
     this.rejectAllExtensionResults(new Error(error));
     this.pendingSettlement = null;
     this.pendingEnqueuedPrompts.splice(0, this.pendingEnqueuedPrompts.length);
@@ -2647,6 +2775,7 @@ export class PiRpcAgentSession implements AgentSession {
       case "tool_execution_start": {
         const toolCall = parseToolArgs(event.toolName, event.args);
         this.activeToolCalls.set(event.toolCallId, toolCall);
+        this.noteSubagentLaunch(event.toolCallId, toolCall);
         this.activeAskUserDialog = readActiveAskUserDialog(event.toolName, event.args);
         this.emitToolCallEvent(event.toolCallId, toolCall, "running", null, null);
         return;

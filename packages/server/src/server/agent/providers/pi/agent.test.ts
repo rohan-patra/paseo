@@ -59,21 +59,31 @@ function readUtf8File(pathname: string): string {
 
 type PaseoExtensionListener = (event: unknown, context?: unknown) => unknown;
 
-async function loadPaseoExtensionListeners(
-  extensionPath: string,
-): Promise<Map<string, PaseoExtensionListener>> {
+async function loadPaseoExtension(extensionPath: string): Promise<{
+  listeners: Map<string, PaseoExtensionListener>;
+  busListeners: Map<string, (payload: unknown) => void>;
+}> {
   const listeners = new Map<string, PaseoExtensionListener>();
+  const busListeners = new Map<string, (payload: unknown) => void>();
   const extension = (await import(pathToFileURL(extensionPath).href)) as {
     default: (piApi: {
       on: (event: string, listener: PaseoExtensionListener) => void;
+      events: { on: (event: string, listener: (payload: unknown) => void) => void };
       registerCommand: () => void;
     }) => void;
   };
   extension.default({
     on: (event, listener) => listeners.set(event, listener),
+    events: { on: (event, listener) => busListeners.set(event, listener) },
     registerCommand: () => undefined,
   });
-  return listeners;
+  return { listeners, busListeners };
+}
+
+async function loadPaseoExtensionListeners(
+  extensionPath: string,
+): Promise<Map<string, PaseoExtensionListener>> {
+  return (await loadPaseoExtension(extensionPath)).listeners;
 }
 
 async function applyPaseoExtensionSystemPrompt(
@@ -92,6 +102,30 @@ async function flushTurnScheduling(): Promise<void> {
 function eventsToolCallId(item: unknown): string {
   if (!item || typeof item !== "object" || !("callId" in item)) return "";
   return typeof item.callId === "string" ? item.callId : "";
+}
+
+function providerSubagentEvents(events: AgentStreamEvent[]) {
+  return events.flatMap((event) => (event.type === "provider_subagent" ? [event.event] : []));
+}
+
+function widgetToolCallNames(events: AgentStreamEvent[]): string[] {
+  return events.flatMap((event) =>
+    event.type === "timeline" &&
+    event.item.type === "tool_call" &&
+    typeof event.item.metadata?.widgetKey === "string"
+      ? [event.item.name]
+      : [],
+  );
+}
+
+function emitSubagentMarker(fake: ReturnType<FakePi["latestSession"]>, update: unknown): void {
+  fake.emit({
+    type: "extension_ui_request",
+    id: `subagent-${JSON.stringify(update).length}-${Math.random()}`,
+    method: "notify",
+    message: `PASEO_SUBAGENT ${JSON.stringify(update)}`,
+    notifyType: "info",
+  });
 }
 
 async function createSession(pi = new FakePi()): Promise<{
@@ -260,6 +294,160 @@ class SessionEvents {
 }
 
 describe("PiRpcAgentSession", () => {
+  test("relays subagent updates from the injected extension into provider subagent events", async () => {
+    const { pi, session, events } = await createSession();
+    const fake = pi.latestSession();
+
+    // The parent launches children through Bash, which is the only place the
+    // parent tool call and the task text exist together.
+    fake.emit({
+      type: "tool_execution_start",
+      toolCallId: "call_7",
+      toolName: "bash",
+      args: {
+        command:
+          'pi --mode rpc --no-session --subagent --background --parent-session s1 --subagent-name auth-research --task "Trace token refresh."',
+      },
+    });
+    emitSubagentMarker(fake, {
+      id: "auth-research",
+      status: "running",
+      cwd: "/repo",
+      model: { provider: "modal", id: "kimi-k3" },
+      metrics: { turns: 1 },
+      event: { at: 10, kind: "text", summary: "Reading the refresh path." },
+    });
+
+    expect(providerSubagentEvents(events.events)).toEqual([
+      {
+        type: "upsert",
+        id: "auth-research",
+        title: "auth-research",
+        status: "running",
+        description: "Trace token refresh.",
+        subtitle: "kimi-k3 (modal) · 1 turn",
+        toolCallId: "call_7",
+        cwd: "/repo",
+      },
+      {
+        type: "timeline",
+        id: "auth-research",
+        item: {
+          type: "assistant_message",
+          text: "Reading the refresh path.",
+          messageId: "pi-subagent:auth-research:1",
+        },
+      },
+    ]);
+    // The marker is protocol, not a notification: it must never reach the
+    // parent timeline as an extension UI side effect.
+    expect(
+      events.events.filter((event) => event.type === "timeline" && event.item.type === "tool_call"),
+    ).toHaveLength(1);
+    await session.close();
+  });
+
+  test("stops scraping subagent widget rows once the relay is live, and keeps shell rows", async () => {
+    const { pi, session, events } = await createSession();
+    const fake = pi.latestSession();
+    const widget = {
+      type: "extension_ui_request" as const,
+      id: "widget-1",
+      method: "setWidget",
+      widgetKey: "background-work",
+      widgetLines: [
+        "Background work",
+        "↳ auth-research: Trace token refresh.",
+        "  kimi-k3 · 1 turn",
+        "↳ shell 1a2b3c4d · 00:05",
+        "  npm test",
+      ],
+    };
+
+    fake.emit(widget);
+    const scrapedBefore = widgetToolCallNames(events.events);
+    emitSubagentMarker(fake, { id: "auth-research", status: "running" });
+    fake.emit({
+      ...widget,
+      id: "widget-2",
+      // Both rows moved on: only the shell row may produce a scraped card now.
+      widgetLines: [
+        "Background work",
+        "↳ auth-research: Trace token refresh.",
+        "  kimi-k3 · 2 turns",
+        "↳ shell 1a2b3c4d · 00:06",
+        "  npm test",
+      ],
+    });
+    const scrapedAfter = widgetToolCallNames(events.events).slice(scrapedBefore.length);
+
+    expect(scrapedBefore.some((name) => name.startsWith("Auth Research"))).toBe(true);
+    expect(scrapedAfter.some((name) => name.startsWith("Auth Research"))).toBe(false);
+    expect(scrapedAfter.some((name) => name.startsWith("shell"))).toBe(true);
+    await session.close();
+  });
+
+  test("cancels children still running when the Pi process dies", async () => {
+    const { pi, session, events } = await createSession();
+    const fake = pi.latestSession();
+    emitSubagentMarker(fake, { id: "still-running", status: "running" });
+    emitSubagentMarker(fake, { id: "already-done", status: "completed" });
+
+    fake.emit({ type: "process_exit", error: "pi exited" });
+
+    expect(providerSubagentEvents(events.events).at(-1)).toEqual({
+      type: "upsert",
+      id: "still-running",
+      status: "canceled",
+    });
+    await session.close();
+  });
+
+  test("the injected extension republishes subagent bus events as relay markers", async () => {
+    const pi = new FakePi();
+    const session = await createClient(pi).createSession(createConfig());
+    const extensionPath = pi.recordedLaunches[0]?.extensionPaths[0];
+    expect(extensionPath).toBeDefined();
+    const extension = await loadPaseoExtension(extensionPath!);
+    const notifications: string[] = [];
+    await extension.listeners.get("session_start")?.(
+      {},
+      { sessionManager: { getEntries: () => [] }, ui: { notify: () => undefined } },
+    );
+    await extension.listeners.get("session_start")?.(
+      {},
+      {
+        sessionManager: { getEntries: () => [] },
+        ui: { notify: (message: string) => notifications.push(message) },
+      },
+    );
+
+    extension.busListeners.get("subagents:event")?.({
+      task: {
+        taskId: "auth-research",
+        status: "running",
+        cwd: "/repo",
+        model: { provider: "modal", id: "kimi-k3" },
+        // The extension strips the task text before publishing; the relay must
+        // not invent one.
+        task: undefined,
+        events: [{ at: 1, kind: "state", summary: "Task created" }],
+      },
+      event: { at: 10, kind: "text", summary: "Reading." },
+    });
+
+    const marker = notifications.find((message) => message.startsWith("PASEO_SUBAGENT "));
+    expect(marker).toBeDefined();
+    expect(JSON.parse(marker!.slice("PASEO_SUBAGENT ".length))).toEqual({
+      id: "auth-research",
+      status: "running",
+      cwd: "/repo",
+      model: { provider: "modal", id: "kimi-k3" },
+      event: { at: 10, kind: "text", summary: "Reading." },
+    });
+    await session.close();
+  });
+
   test("bridges Pi RPC select extension UI requests through question permissions", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();
