@@ -110,6 +110,7 @@ export const en = {
     },
     attachments: {
       addImage: "Add image",
+      pasteImage: "Paste image",
       addFile: "Upload file",
       addIssueOrPr: "Add issue or PR",
       addIssueOrPr_mr: "Add issue or MR",
@@ -135,6 +136,8 @@ export const en = {
       initialPromptRequired: "Initial prompt is required",
       alreadyLoading: "Already loading",
       uploadFailed: "Failed to upload file",
+      noClipboardImage: "No image in clipboard",
+      pasteImageFailed: "Failed to paste image",
       fileTooLarge: "{{fileName}} is too large (max {{size}})",
     },
     clientCommands: {
@@ -185,6 +188,7 @@ export const en = {
   agentStream: {
     empty: "Start chatting with this agent...",
     scrollToBottom: "Scroll to bottom",
+    historyLoadFailed: "Couldn't load agent history",
     permission: {
       plan: "Plan",
       required: "Permission Required",
@@ -261,7 +265,7 @@ export const en = {
       copyCode: "Copy code",
       copyTurn: "Copy turn",
       copyMessage: "Copy message",
-      forkMenu: "Fork chat",
+      forkMenu: "Fork chat from here",
       forkInNewTab: "Fork in a new tab",
       forkInNewWorkspace: "Fork in a new workspace",
       forkUnavailable: "Update the host to use this.",
@@ -1433,9 +1437,21 @@ export const en = {
       loadingOffer: "Loading pairing offer...",
       failedToLoadOffer: "Failed to load pairing offer.",
       relayDisabled: "Relay is not enabled. Enable relay to pair a device.",
+      enableTitle: "Enable relay?",
+      enableDescription:
+        "Relay lets this device connect from anywhere. Pairing traffic is end-to-end encrypted.",
+      relayDocs: "How relay works",
+      relayDocsAccessibility: "Read how Paseo relay works",
+      enableRelay: "Enable relay",
+      enablingRelay: "Enabling...",
+      notNow: "Not now",
+      directConnectionHint:
+        "Without relay, connect directly over TCP, Tailscale, or another VPN. No QR code is created.",
+      updateRequired: "Update the host to enable relay from Paseo Desktop.",
       unavailable: "Pairing offer unavailable.",
       hint: "Scan this QR code with Paseo on your phone, or copy the link below.",
       qrUnavailable: "QR code unavailable.",
+      qrAccessibility: "Pairing QR code",
       retry: "Retry",
       copy: "Copy",
       copied: "Copied",
@@ -1632,6 +1648,7 @@ export const en = {
       vimHint: "Applies to source files on web and desktop.",
     },
     hostSections: {
+      projects: "Projects",
       connections: "Connections",
       agents: "Agents",
       workspaces: "Workspaces",
@@ -1774,6 +1791,10 @@ export const en = {
       },
       detailLevel: {
         title: "Detail level",
+      },
+      chatOutline: {
+        title: "Chat outline",
+        description: "Show an outline for jumping between prompts",
       },
       fonts: {
         title: "Fonts",
@@ -1928,6 +1949,41 @@ export const en = {
       },
     },
     host: {
+      appearance: {
+        title: "Appearance",
+        name: {
+          label: "Name",
+        },
+        color: {
+          label: "Color",
+          accessibilityLabel: "Color, {{value}}",
+          options: {
+            none: "Default",
+            violet: "Violet",
+            sky: "Sky",
+            emerald: "Emerald",
+            orange: "Orange",
+            pink: "Pink",
+            indigo: "Indigo",
+            teal: "Teal",
+            red: "Red",
+            amber: "Amber",
+            blue: "Blue",
+          },
+        },
+        badge: {
+          label: "Sidebar badge",
+          accessibilityLabel: "Sidebar badge, {{value}}",
+          options: {
+            name: "Name",
+            icon: "Icon only",
+            hidden: "Hidden",
+          },
+        },
+        preview: {
+          workspaceName: "my-workspace",
+        },
+      },
       notFound: "Host not found",
       badges: {
         relay: "Relay",
@@ -2133,24 +2189,23 @@ export const en = {
       },
     },
     project: {
-      noEditableTarget: "We don't have an editable copy of this project on any connected host.",
+      noEditableTarget: "This project isn't editable on this host.",
       backToProjects: "Back to projects",
-      switchHost: "Switch host",
-      rename: {
-        renamedToast: "Project renamed",
-        errorFallback: "Couldn't rename project",
-        renameLabel: "Rename project",
-        resetLabel: "Reset project name to default",
-        projectNameLabel: "Project name",
-        saveLabel: "Save project name",
-        cancelLabel: "Cancel renaming",
-        reset: "Reset",
+      edit: {
+        title: "Edit project",
+        name: "Name",
+        nameLabel: "Project name",
+        icon: "Icon",
+        chooseImage: "Choose image",
+        useAutomatic: "Use automatic",
+        imageUrl: "Image or website URL",
+        save: "Save changes",
+        savedToast: "Project updated",
       },
       readFailures: {
         invalidTitle: "paseo.json couldn't be parsed",
         invalidDescription: "Fix the file on disk, then reload.",
         missingTitle: "This host doesn't have this project",
-        missingWithHosts: "Switch to another host above, or reload.",
         missingSingleHost: "The selected host has no record of this project.",
         transportTitle: "Couldn't load paseo.json",
         transportFallback: "The host didn't respond.",

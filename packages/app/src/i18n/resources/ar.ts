@@ -112,6 +112,7 @@ export const ar: TranslationResources = {
     },
     attachments: {
       addImage: "أضف صورة",
+      pasteImage: "لصق صورة",
       addFile: "Upload file",
       addIssueOrPr: "أضف مشكلة أو PR",
       addIssueOrPr_mr: "أضف مشكلة أو MR",
@@ -137,6 +138,8 @@ export const ar: TranslationResources = {
       initialPromptRequired: "مطلوب موجه الأولي",
       alreadyLoading: "جارٍ التحميل بالفعل",
       uploadFailed: "Failed to upload file",
+      noClipboardImage: "لا توجد صورة في الحافظة",
+      pasteImageFailed: "تعذر لصق الصورة",
       fileTooLarge: "{{fileName}} is too large (max {{size}})",
     },
     clientCommands: {
@@ -187,6 +190,7 @@ export const ar: TranslationResources = {
   agentStream: {
     empty: "ابدأ الدردشة مع هذا الوكيل...",
     scrollToBottom: "قم بالتمرير إلى الأسفل",
+    historyLoadFailed: "تعذر تحميل سجل الوكيل",
     permission: {
       plan: "يخطط",
       required: "الإذن مطلوب",
@@ -1422,9 +1426,21 @@ export const ar: TranslationResources = {
       loadingOffer: "جارٍ تحميل عرض الإقران...",
       failedToLoadOffer: "فشل تحميل عرض الاقتران.",
       relayDisabled: "لم يتم تمكين التتابع. تمكين التتابع لإقران جهاز.",
+      enableTitle: "تمكين التتابع؟",
+      enableDescription:
+        "يتيح التتابع لهذا الجهاز الاتصال من أي مكان. حركة مرور الإقران مشفرة من طرف إلى طرف.",
+      relayDocs: "كيفية عمل التتابع",
+      relayDocsAccessibility: "اقرأ كيفية عمل تتابع Paseo",
+      enableRelay: "تمكين التتابع",
+      enablingRelay: "جارٍ التمكين...",
+      notNow: "ليس الآن",
+      directConnectionHint:
+        "بدون التتابع، اتصل مباشرة عبر TCP أو Tailscale أو شبكة VPN أخرى. لن يتم إنشاء رمز QR.",
+      updateRequired: "حدّث المضيف لتمكين التتابع من Paseo Desktop.",
       unavailable: "عرض الاقتران غير متاح.",
       hint: "قم بمسح رمز QR هذا باستخدام Paseo على هاتفك، أو انسخ الرابط أدناه.",
       qrUnavailable: "رمز QR غير متاح.",
+      qrAccessibility: "رمز QR للإقران",
       retry: "أعد المحاولة",
       copy: "ينسخ",
       copied: "منقول",
@@ -1621,6 +1637,7 @@ export const ar: TranslationResources = {
       vimHint: "تنطبق على ملفات المصدر في الويب وسطح المكتب.",
     },
     hostSections: {
+      projects: "المشاريع",
       connections: "اتصالات",
       agents: "Agents",
       workspaces: "Workspaces",
@@ -1764,6 +1781,10 @@ export const ar: TranslationResources = {
       },
       detailLevel: {
         title: "مستوى التفاصيل",
+      },
+      chatOutline: {
+        title: "مخطط المحادثة",
+        description: "عرض مخطط للتنقل بين المطالبات",
       },
       fonts: {
         title: "الخطوط",
@@ -1917,6 +1938,41 @@ export const ar: TranslationResources = {
       },
     },
     host: {
+      appearance: {
+        title: "المظهر",
+        name: {
+          label: "الاسم",
+        },
+        color: {
+          label: "اللون",
+          accessibilityLabel: "اللون، {{value}}",
+          options: {
+            none: "افتراضي",
+            violet: "بنفسجي",
+            sky: "سماوي",
+            emerald: "زمردي",
+            orange: "برتقالي",
+            pink: "وردي",
+            indigo: "نيلي",
+            teal: "أزرق مخضر",
+            red: "أحمر",
+            amber: "كهرماني",
+            blue: "أزرق",
+          },
+        },
+        badge: {
+          label: "شارة الشريط الجانبي",
+          accessibilityLabel: "شارة الشريط الجانبي، {{value}}",
+          options: {
+            name: "الاسم",
+            icon: "أيقونة فقط",
+            hidden: "مخفي",
+          },
+        },
+        preview: {
+          workspaceName: "my-workspace",
+        },
+      },
       notFound: "لم يتم العثور على Host",
       badges: {
         relay: "تتابع",
@@ -2121,24 +2177,23 @@ export const ar: TranslationResources = {
       },
     },
     project: {
-      noEditableTarget: "ليس لدينا نسخة قابلة للتحرير من هذا المشروع على أي مضيف متصل.",
+      noEditableTarget: "هذا المشروع غير متاح للتحرير على هذا المضيف.",
       backToProjects: "العودة إلى المشاريع",
-      switchHost: "تبديل المضيف",
-      rename: {
-        renamedToast: "تمت إعادة تسمية المشروع",
-        errorFallback: "تعذرت إعادة تسمية المشروع",
-        renameLabel: "إعادة تسمية المشروع",
-        resetLabel: "إعادة تعيين اسم المشروع إلى الافتراضي",
-        projectNameLabel: "اسم المشروع",
-        saveLabel: "احفظ اسم المشروع",
-        cancelLabel: "إلغاء إعادة التسمية",
-        reset: "إعادة ضبط",
+      edit: {
+        title: "تعديل المشروع",
+        name: "الاسم",
+        nameLabel: "اسم المشروع",
+        icon: "الأيقونة",
+        chooseImage: "اختيار صورة",
+        useAutomatic: "استخدام التلقائي",
+        imageUrl: "رابط صورة أو موقع",
+        save: "حفظ التغييرات",
+        savedToast: "تم تحديث المشروع",
       },
       readFailures: {
         invalidTitle: "تعذر تحليل paseo.json",
         invalidDescription: "قم بإصلاح الملف على القرص، ثم أعد تحميله.",
         missingTitle: "هذا المضيف ليس لديه هذا المشروع",
-        missingWithHosts: "قم بالتبديل إلى مضيف آخر أعلاه، أو أعد التحميل.",
         missingSingleHost: "المضيف المحدد ليس لديه سجل لهذا المشروع.",
         transportTitle: "تعذر تحميل paseo.json",
         transportFallback: "المضيف لم يستجب.",

@@ -112,6 +112,7 @@ export const zhCN: TranslationResources = {
     },
     attachments: {
       addImage: "添加图片",
+      pasteImage: "粘贴图片",
       addFile: "Upload file",
       addIssueOrPr: "添加 issue 或 PR",
       addIssueOrPr_mr: "添加 issue 或 MR",
@@ -137,6 +138,8 @@ export const zhCN: TranslationResources = {
       initialPromptRequired: "初始 prompt 必填",
       alreadyLoading: "正在加载",
       uploadFailed: "Failed to upload file",
+      noClipboardImage: "剪贴板中没有图片",
+      pasteImageFailed: "无法粘贴图片",
       fileTooLarge: "{{fileName}} is too large (max {{size}})",
     },
     clientCommands: {
@@ -187,6 +190,7 @@ export const zhCN: TranslationResources = {
   agentStream: {
     empty: "开始和这个 Agent 对话...",
     scrollToBottom: "滚动到底部",
+    historyLoadFailed: "无法加载智能体历史记录",
     permission: {
       plan: "Plan",
       required: "需要权限",
@@ -1403,9 +1407,20 @@ export const zhCN: TranslationResources = {
       loadingOffer: "正在加载配对 offer...",
       failedToLoadOffer: "加载配对 offer 失败。",
       relayDisabled: "Relay 未启用。启用 relay 后才能配对设备。",
+      enableTitle: "启用中继？",
+      enableDescription: "中继让此设备可以从任何地方连接。配对流量采用端到端加密。",
+      relayDocs: "中继如何工作",
+      relayDocsAccessibility: "阅读 Paseo 中继的工作原理",
+      enableRelay: "启用中继",
+      enablingRelay: "正在启用...",
+      notNow: "暂不",
+      directConnectionHint:
+        "不使用中继时，请通过 TCP、Tailscale 或其他 VPN 直接连接。不会生成二维码。",
+      updateRequired: "请更新主机，以便从 Paseo Desktop 启用中继。",
       unavailable: "配对 offer 不可用。",
       hint: "用手机上的 Paseo 扫描此二维码，或复制下方链接。",
       qrUnavailable: "二维码不可用。",
+      qrAccessibility: "配对二维码",
       retry: "重试",
       copy: "复制",
       copied: "已复制",
@@ -1602,6 +1617,7 @@ export const zhCN: TranslationResources = {
       vimHint: "适用于网页和桌面端的源文件。",
     },
     hostSections: {
+      projects: "项目",
       connections: "连接",
       agents: "Agents",
       workspaces: "Workspaces",
@@ -1744,6 +1760,10 @@ export const zhCN: TranslationResources = {
       },
       detailLevel: {
         title: "详细程度",
+      },
+      chatOutline: {
+        title: "聊天大纲",
+        description: "显示用于在提示词之间跳转的大纲",
       },
       fonts: {
         title: "字体",
@@ -1896,6 +1916,41 @@ export const zhCN: TranslationResources = {
       },
     },
     host: {
+      appearance: {
+        title: "外观",
+        name: {
+          label: "名称",
+        },
+        color: {
+          label: "颜色",
+          accessibilityLabel: "颜色，{{value}}",
+          options: {
+            none: "默认",
+            violet: "紫罗兰",
+            sky: "天蓝",
+            emerald: "翠绿",
+            orange: "橙色",
+            pink: "粉色",
+            indigo: "靛蓝",
+            teal: "青色",
+            red: "红色",
+            amber: "琥珀",
+            blue: "蓝色",
+          },
+        },
+        badge: {
+          label: "侧边栏徽章",
+          accessibilityLabel: "侧边栏徽章，{{value}}",
+          options: {
+            name: "名称",
+            icon: "仅图标",
+            hidden: "隐藏",
+          },
+        },
+        preview: {
+          workspaceName: "my-workspace",
+        },
+      },
       notFound: "Host 未找到",
       badges: {
         relay: "Relay",
@@ -2095,24 +2150,23 @@ export const zhCN: TranslationResources = {
       },
     },
     project: {
-      noEditableTarget: "任何已连接 Host 上都没有这个 Project 的可编辑副本。",
+      noEditableTarget: "此项目无法在这个 Host 上编辑。",
       backToProjects: "返回 Projects",
-      switchHost: "切换 Host",
-      rename: {
-        renamedToast: "Project 已重命名",
-        errorFallback: "无法重命名 Project",
-        renameLabel: "重命名 Project",
-        resetLabel: "将 Project 名称重置为默认值",
-        projectNameLabel: "Project 名称",
-        saveLabel: "保存 Project 名称",
-        cancelLabel: "取消重命名",
-        reset: "重置",
+      edit: {
+        title: "编辑 Project",
+        name: "名称",
+        nameLabel: "Project 名称",
+        icon: "图标",
+        chooseImage: "选择图片",
+        useAutomatic: "使用自动",
+        imageUrl: "图片或网站 URL",
+        save: "保存更改",
+        savedToast: "Project 已更新",
       },
       readFailures: {
         invalidTitle: "无法解析 paseo.json",
         invalidDescription: "修复磁盘上的文件，然后重新加载。",
         missingTitle: "这个 Host 没有这个 Project",
-        missingWithHosts: "切换到上方其他 Host，或重新加载。",
         missingSingleHost: "所选 Host 没有这个 Project 的记录。",
         transportTitle: "无法加载 paseo.json",
         transportFallback: "Host 没有响应。",
