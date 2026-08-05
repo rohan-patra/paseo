@@ -644,6 +644,9 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
   writeFileSync(
     filePath,
     `
+	import { existsSync, readFileSync, statSync } from "node:fs";
+	import { resolve } from "node:path";
+
 	function decodePayload(encoded) {
 	  return JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
 	}
@@ -659,6 +662,26 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 	    .filter((part) => part && part.type === "text" && typeof part.text === "string")
 	    .map((part) => part.text)
 	    .join("\\n\\n");
+	}
+
+	const MAX_WRITE_DIFF_CHARS = 12_000;
+
+	function writeSnapshot(ctx, input) {
+	  try {
+	    if (!input || typeof input !== "object" || Array.isArray(input)) return;
+	    if (typeof input.path !== "string" || typeof input.content !== "string") return;
+	    if (/^[~@]/.test(input.path) || input.path.includes("://") || input.content.length > MAX_WRITE_DIFF_CHARS) return;
+	    const absolutePath = resolve(ctx.cwd, input.path);
+	    if (!existsSync(absolutePath)) return { oldContent: "", absolutePath };
+	    const stats = statSync(absolutePath);
+	    if (!stats.isFile() || stats.size > MAX_WRITE_DIFF_CHARS * 4) return;
+	    const oldContent = readFileSync(absolutePath, "utf8");
+	    return oldContent.length <= MAX_WRITE_DIFF_CHARS && !oldContent.includes("\\0")
+	      ? { oldContent, absolutePath }
+	      : undefined;
+	  } catch {
+	    // Observing a write must never prevent it from running.
+	  }
 	}
 
 	function getCapturedUserEntries(ctx) {
@@ -728,6 +751,7 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 
 	export default function paseoIntegration(pi) {
 	  const submittedUserMessages = [];
+	  const writeSnapshots = new Map();
 
 	  function emitSubmittedUserEntries(ctx) {
 	    const entries = ctx.sessionManager.getEntries();
@@ -786,6 +810,25 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 	      } catch {}
 	    }
 	    emitEntryCapture(ctx, "session_start");
+	  });
+
+	  pi.on("tool_call", async (event, ctx) => {
+	    // Pi serializes writes to one file, but sibling calls capture their own pre-batch state.
+	    if (event.toolName !== "write") return;
+	    const snapshot = writeSnapshot(ctx, event.input);
+	    if (snapshot) writeSnapshots.set(event.toolCallId, snapshot);
+	  });
+
+	  pi.on("tool_result", async (event) => {
+	    const snapshot = writeSnapshots.get(event.toolCallId);
+	    writeSnapshots.delete(event.toolCallId);
+	    if (!snapshot || !existsSync(snapshot.absolutePath)) return;
+	    const details = event.details && typeof event.details === "object" ? event.details : {};
+	    return { details: { ...details, oldContent: snapshot.oldContent } };
+	  });
+
+	  pi.on("turn_end", async () => {
+	    writeSnapshots.clear();
 	  });
 
 	  pi.on("message_end", async (event) => {

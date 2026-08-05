@@ -20,28 +20,50 @@ describe("Pi tool call mapper", () => {
     });
   });
 
-  test("maps legacy edit args to edit detail with diff", () => {
+  test("prefers the native edit patch over Pi's display diff", () => {
     const toolCall = parseToolArgs("edit", {
       path: "app.ts",
       old_string: "before",
       new_string: "after",
     });
-    const result = parseToolResult({ details: { diff: "-before\n+after" } });
+    const result = parseToolResult({
+      details: { diff: " 1|before\n-2|before\n+2|after", patch: "@@ -1 +1 @@\n-before\n+after" },
+    });
 
     expect(mapToolDetail(toolCall, result)).toEqual({
       type: "edit",
       filePath: "app.ts",
       oldString: "before",
       newString: "after",
-      unifiedDiff: "-before\n+after",
+      unifiedDiff: "@@ -1 +1 @@\n-before\n+after",
+    });
+  });
+
+  test("turns writes with a captured original file into diff details", () => {
+    const toolCall = parseToolArgs("write", { path: "notes.txt", content: "after\n" });
+
+    expect(mapToolDetail(toolCall, parseToolResult({ details: { oldContent: "before\n" } }))).toEqual({
+      type: "edit",
+      filePath: "notes.txt",
+      oldString: "before\n",
+      newString: "after\n",
+      unifiedDiff: undefined,
+    });
+  });
+
+  test("renders a new write as a diff when its captured original is empty", () => {
+    const toolCall = parseToolArgs("write", { path: "notes.txt", content: "created\n" });
+
+    expect(mapToolDetail(toolCall, parseToolResult({ details: { oldContent: "" } }))).toMatchObject({
+      type: "edit",
+      filePath: "notes.txt",
+      oldString: "",
+      newString: "created\n",
     });
   });
 
   test("preserves ordinary writes as write details", () => {
-    const toolCall = parseToolArgs("write", {
-      path: "notes.txt",
-      content: "unchanged\n",
-    });
+    const toolCall = parseToolArgs("write", { path: "notes.txt", content: "unchanged\n" });
 
     expect(mapToolDetail(toolCall, parseToolResult({ text: "Wrote notes.txt" }))).toEqual({
       type: "write",
@@ -64,6 +86,7 @@ describe("Pi tool call mapper", () => {
           args: { action: "open", url: "https://example.com" },
           inner: { title: "Example Domain" },
         },
+        oldContent: "must not become a file diff",
       },
     });
 
@@ -123,6 +146,17 @@ describe("Pi tool call mapper", () => {
       output: result,
     });
     expect(resolveToolCallName(toolCall, result)).toBe("write");
+  });
+
+  test("surfaces any path-based tool with a supplied patch as an edit", () => {
+    const toolCall = parseToolArgs("ast_grep_replace", { path: "src/app.ts", pattern: "old" });
+    const result = parseToolResult({ details: { patch: "@@ -1 +1 @@\n-old\n+new" } });
+
+    expect(mapToolDetail(toolCall, result)).toEqual({
+      type: "edit",
+      filePath: "src/app.ts",
+      unifiedDiff: "@@ -1 +1 @@\n-old\n+new",
+    });
   });
 
   test("preserves unknown tool input and parsed output", () => {

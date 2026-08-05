@@ -60,10 +60,10 @@ function readUtf8File(pathname: string): string {
 type PaseoExtensionListener = (event: unknown, context?: unknown) => unknown;
 
 async function loadPaseoExtension(extensionPath: string): Promise<{
-  listeners: Map<string, PaseoExtensionListener>;
+  listeners: Map<string, PaseoExtensionListener[]>;
   busListeners: Map<string, (payload: unknown) => void>;
 }> {
-  const listeners = new Map<string, PaseoExtensionListener>();
+  const listeners = new Map<string, PaseoExtensionListener[]>();
   const busListeners = new Map<string, (payload: unknown) => void>();
   const extension = (await import(pathToFileURL(extensionPath).href)) as {
     default: (piApi: {
@@ -73,7 +73,7 @@ async function loadPaseoExtension(extensionPath: string): Promise<{
     }) => void;
   };
   extension.default({
-    on: (event, listener) => listeners.set(event, listener),
+    on: (event, listener) => listeners.set(event, [...(listeners.get(event) ?? []), listener]),
     events: { on: (event, listener) => busListeners.set(event, listener) },
     registerCommand: () => undefined,
   });
@@ -82,7 +82,7 @@ async function loadPaseoExtension(extensionPath: string): Promise<{
 
 async function loadPaseoExtensionListeners(
   extensionPath: string,
-): Promise<Map<string, PaseoExtensionListener>> {
+): Promise<Map<string, PaseoExtensionListener[]>> {
   return (await loadPaseoExtension(extensionPath)).listeners;
 }
 
@@ -91,7 +91,7 @@ async function applyPaseoExtensionSystemPrompt(
   systemPrompt: string,
 ): Promise<string | undefined> {
   const listeners = await loadPaseoExtensionListeners(extensionPath);
-  const result = await listeners.get("before_agent_start")?.({ systemPrompt });
+  const result = await listeners.get("before_agent_start")?.at(-1)?.({ systemPrompt });
   return (result as { systemPrompt?: string } | undefined)?.systemPrompt;
 }
 
@@ -410,11 +410,11 @@ describe("PiRpcAgentSession", () => {
     expect(extensionPath).toBeDefined();
     const extension = await loadPaseoExtension(extensionPath!);
     const notifications: string[] = [];
-    await extension.listeners.get("session_start")?.(
+    await extension.listeners.get("session_start")?.at(-1)?.(
       {},
       { sessionManager: { getEntries: () => [] }, ui: { notify: () => undefined } },
     );
-    await extension.listeners.get("session_start")?.(
+    await extension.listeners.get("session_start")?.at(-1)?.(
       {},
       {
         sessionManager: { getEntries: () => [] },
@@ -1536,14 +1536,14 @@ describe("PiRpcAgentSession", () => {
       ui: { notify: (message: string) => notifications.push(message) },
     };
 
-    await listeners.get("message_end")?.({ message: submittedMessage }, context);
+    await listeners.get("message_end")?.at(-1)?.({ message: submittedMessage }, context);
     entries.push({
       type: "message",
       id: "entry-new",
       parentId: "entry-old-assistant",
       message: submittedMessage,
     });
-    await listeners.get("message_start")?.(
+    await listeners.get("message_start")?.at(-1)?.(
       { message: { role: "assistant", content: [] } },
       context,
     );

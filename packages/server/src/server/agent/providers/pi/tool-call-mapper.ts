@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import type { ToolCallDetail } from "../../agent-sdk-types.js";
+import { truncateDiffText } from "../tool-call-mapper-utils.js";
 
 interface BashToolInput {
   command: string;
@@ -59,6 +60,8 @@ interface PiToolResultObject {
 
 interface PiToolResultDetails {
   diff?: string;
+  patch?: string;
+  oldContent?: string;
   mode?: string;
   server?: string;
   tool?: string;
@@ -160,6 +163,8 @@ const PiToolResultContentSchema = z.union([
 const PiToolResultDetailsSchema = z
   .object({
     diff: z.string().optional(),
+    patch: z.string().optional(),
+    oldContent: z.string().optional(),
   })
   .passthrough();
 
@@ -360,15 +365,13 @@ export function mapToolDetail(toolCall: PiTrackedToolCall, result?: PiToolResult
       };
     case "edit": {
       const firstEdit = toolCall.args.edits[0];
-      const unifiedDiff =
-        parsedResult && typeof parsedResult !== "string" ? parsedResult.details?.diff : undefined;
 
       return {
         type: "edit",
         filePath: toolCall.args.path,
         oldString: firstEdit?.oldText,
         newString: firstEdit?.newText,
-        unifiedDiff,
+        unifiedDiff: resultPatch(parsedResult),
       };
     }
     case "write":
@@ -380,11 +383,7 @@ export function mapToolDetail(toolCall: PiTrackedToolCall, result?: PiToolResult
     case "ls":
       return mapLsToolDetail(toolCall.args, parsedResult);
     default:
-      return {
-        type: "unknown",
-        input: toolCall.args,
-        output: parsedResult,
-      };
+      return mapUnknownToolDetail(toolCall, parsedResult);
   }
 }
 
@@ -409,11 +408,37 @@ function mapWriteToolDetail(args: WriteToolInput, result: PiToolResult): ToolCal
     };
   }
 
+  const oldContent = result && typeof result !== "string" ? result.details?.oldContent : undefined;
+  const unifiedDiff = resultPatch(result);
+  if (oldContent !== undefined || unifiedDiff) {
+    return {
+      type: "edit",
+      filePath: args.path,
+      oldString: oldContent,
+      newString: args.content,
+      unifiedDiff,
+    };
+  }
+
   return {
     type: "write",
     filePath: args.path,
     content: args.content,
   };
+}
+
+function resultPatch(result: PiToolResult): string | undefined {
+  if (!result || typeof result === "string") return undefined;
+  return truncateDiffText(result.details?.patch ?? result.details?.diff);
+}
+
+function mapUnknownToolDetail(toolCall: PiUnknownToolCall, result: PiToolResult): ToolCallDetail {
+  const unifiedDiff = resultPatch(result);
+  const filePath = isRecord(toolCall.args) ? readNonEmptyString(toolCall.args.path) : undefined;
+  if (filePath && unifiedDiff) {
+    return { type: "edit", filePath, unifiedDiff };
+  }
+  return { type: "unknown", input: toolCall.args, output: result };
 }
 
 function resolveToolCallOutput(result: PiToolResult): ToolCallOutputSummary {
