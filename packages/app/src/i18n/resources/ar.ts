@@ -384,7 +384,7 @@ export const ar: TranslationResources = {
       openFile: "افتح الملف",
       copyPath: "نسخ المسار",
       download: "تحميل",
-      addToChat: "إضافة إلى الدردشة…",
+      addToChat: "إضافة إلى الدردشة",
       moreActions: "المزيد من الإجراءات",
     },
     fileExplorer: {
@@ -481,6 +481,7 @@ export const ar: TranslationResources = {
     },
     terminal: {
       hostDisconnected: "Host غير متصل",
+      updateHost: "حدّث المضيف لاستخدام عارض الطرفية الأصلي.",
       unableToSubscribe: "غير قادر على الاشتراك في المحطة",
     },
     tabs: {
@@ -834,6 +835,14 @@ export const ar: TranslationResources = {
           viewPullRequest: "عرض",
           openOn: "فتح على {{brand}}",
         },
+        checksSummary: {
+          passedLabel: "نجح",
+          failedLabel: "فشل",
+          runningLabel: "قيد التشغيل",
+          passedAccessible: "نجحت الفحوصات",
+          failedAccessible: "فشلت الفحوصات",
+          runningAccessible: "الفحوصات قيد التشغيل",
+        },
         sections: {
           checks: "الشيكات",
           pipeline: "خط المعالجة",
@@ -881,6 +890,38 @@ export const ar: TranslationResources = {
     },
   },
   sidebar: {
+    display: {
+      trigger: "تفضيلات العرض",
+      heading: "العرض",
+      grouping: {
+        label: "التجميع",
+        project: "المشروع",
+        status: "الحالة",
+      },
+      titleSource: {
+        label: "العنوان",
+        title: "العنوان",
+        branch: "اسم الفرع",
+      },
+      show: {
+        label: "إظهار",
+        host: "المضيف",
+        changeRequest: "طلب السحب",
+        checks: "الفحوصات",
+        services: "الخدمات",
+        diff: "إحصائيات الفروق",
+        timestamp: "آخر نشاط",
+      },
+      checks: {
+        iconAndText: "أيقونة ونص",
+        icon: "أيقونة فقط",
+        none: "مخفي",
+      },
+      hostFilter: {
+        label: "المضيف",
+        all: "كل المضيفين",
+      },
+    },
     pinned: {
       title: "المثبتة",
     },
@@ -948,7 +989,8 @@ export const ar: TranslationResources = {
     },
     workspace: {
       status: {
-        scriptsAvailable: "البرامج النصية المتاحة",
+        serviceRunning: "الخدمة {{name}} قيد التشغيل",
+        serviceUnhealthy: "الخدمة {{name}} غير سليمة",
         creating: "جارٍ الإنشاء...",
       },
       actions: {
@@ -1708,6 +1750,7 @@ export const ar: TranslationResources = {
           es: "Español",
           fr: "Français",
           ja: "日本語",
+          ko: "한국어",
           ptBR: "Português brasileiro",
           ru: "Русский",
           zhCN: "中文",
@@ -1716,6 +1759,11 @@ export const ar: TranslationResources = {
     },
     diagnostics: {
       title: "التشخيص",
+      legacyTerminalRenderer: {
+        label: "استخدام عارض الطرفية السابق",
+        description: "استخدام طرفية WebView السابقة بعد إعادة فتح الطرفية",
+        accessibilityLabel: "استخدام عارض الطرفية السابق",
+      },
       testAudio: "اختبار الصوت",
       playTest: "لعب الاختبار",
       playing: "جارٍ اللعب...",

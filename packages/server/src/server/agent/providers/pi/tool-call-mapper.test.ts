@@ -42,7 +42,9 @@ describe("Pi tool call mapper", () => {
   test("turns writes with a captured original file into diff details", () => {
     const toolCall = parseToolArgs("write", { path: "notes.txt", content: "after\n" });
 
-    expect(mapToolDetail(toolCall, parseToolResult({ details: { oldContent: "before\n" } }))).toEqual({
+    expect(
+      mapToolDetail(toolCall, parseToolResult({ details: { oldContent: "before\n" } })),
+    ).toEqual({
       type: "edit",
       filePath: "notes.txt",
       oldString: "before\n",
@@ -54,12 +56,14 @@ describe("Pi tool call mapper", () => {
   test("renders a new write as a diff when its captured original is empty", () => {
     const toolCall = parseToolArgs("write", { path: "notes.txt", content: "created\n" });
 
-    expect(mapToolDetail(toolCall, parseToolResult({ details: { oldContent: "" } }))).toMatchObject({
-      type: "edit",
-      filePath: "notes.txt",
-      oldString: "",
-      newString: "created\n",
-    });
+    expect(mapToolDetail(toolCall, parseToolResult({ details: { oldContent: "" } }))).toMatchObject(
+      {
+        type: "edit",
+        filePath: "notes.txt",
+        oldString: "",
+        newString: "created\n",
+      },
+    );
   });
 
   test("preserves ordinary writes as write details", () => {
@@ -167,6 +171,37 @@ describe("Pi tool call mapper", () => {
       type: "unknown",
       input: { value: 42 },
       output: { text: "custom result" },
+    });
+  });
+
+  test("maps task calls to sub-agent detail while running", () => {
+    const toolCall = parseToolArgs("task", {
+      agent: "explore",
+      task: "Trace the Pi provider tool mapper",
+    });
+
+    expect(mapToolDetail(toolCall, null)).toEqual({
+      type: "sub_agent",
+      subAgentType: "explore",
+      description: "Trace the Pi provider tool mapper",
+      log: "",
+    });
+  });
+
+  test("maps completed subagent calls with task input to sub-agent detail", () => {
+    const toolCall = parseToolArgs("subagent", {
+      agent: "reviewer",
+      task: "Review the Pi mapper change",
+    });
+    const result = parseToolResult({
+      content: [{ type: "text", text: "The mapper change preserves provider status." }],
+    });
+
+    expect(mapToolDetail(toolCall, result)).toEqual({
+      type: "sub_agent",
+      subAgentType: "reviewer",
+      description: "Review the Pi mapper change",
+      log: "The mapper change preserves provider status.",
     });
   });
 

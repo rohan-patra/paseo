@@ -387,7 +387,7 @@ export const ru: TranslationResources = {
       openFile: "Открыть файл",
       copyPath: "Копировать путь",
       download: "Скачать",
-      addToChat: "Добавить в чат…",
+      addToChat: "Добавить в чат",
       moreActions: "Дополнительные действия",
     },
     fileExplorer: {
@@ -485,6 +485,7 @@ export const ru: TranslationResources = {
     },
     terminal: {
       hostDisconnected: "Host не подключен",
+      updateHost: "Обновите хост, чтобы использовать нативный терминал.",
       unableToSubscribe: "Невозможно подписаться на терминал",
     },
     tabs: {
@@ -856,6 +857,14 @@ export const ru: TranslationResources = {
           viewPullRequest: "Открыть",
           openOn: "Открыть на {{brand}}",
         },
+        checksSummary: {
+          passedLabel: "успешно",
+          failedLabel: "ошибка",
+          runningLabel: "выполняется",
+          passedAccessible: "Проверки пройдены",
+          failedAccessible: "Проверки не пройдены",
+          runningAccessible: "Проверки выполняются",
+        },
         sections: {
           checks: "Чеки",
           pipeline: "Пайплайн",
@@ -903,6 +912,38 @@ export const ru: TranslationResources = {
     },
   },
   sidebar: {
+    display: {
+      trigger: "Настройки отображения",
+      heading: "Отображение",
+      grouping: {
+        label: "Группировка",
+        project: "Проект",
+        status: "Статус",
+      },
+      titleSource: {
+        label: "Заголовок",
+        title: "Заголовок",
+        branch: "Имя ветки",
+      },
+      show: {
+        label: "Показывать",
+        host: "Хост",
+        changeRequest: "Pull request",
+        checks: "Проверки",
+        services: "Сервисы",
+        diff: "Статистика изменений",
+        timestamp: "Последняя активность",
+      },
+      checks: {
+        iconAndText: "Значок и текст",
+        icon: "Только значок",
+        none: "Скрыто",
+      },
+      hostFilter: {
+        label: "Хост",
+        all: "Все хосты",
+      },
+    },
     pinned: {
       title: "Закреплённые",
     },
@@ -970,7 +1011,8 @@ export const ru: TranslationResources = {
     },
     workspace: {
       status: {
-        scriptsAvailable: "Доступны скрипты",
+        serviceRunning: "Сервис {{name}} запущен",
+        serviceUnhealthy: "Сервис {{name}} неисправен",
         creating: "Создание...",
       },
       actions: {
@@ -1743,6 +1785,7 @@ export const ru: TranslationResources = {
           es: "Español",
           fr: "Français",
           ja: "日本語",
+          ko: "한국어",
           ptBR: "Português brasileiro",
           ru: "Русский",
           zhCN: "中文",
@@ -1751,6 +1794,11 @@ export const ru: TranslationResources = {
     },
     diagnostics: {
       title: "Диагностика",
+      legacyTerminalRenderer: {
+        label: "Использовать прежний рендерер терминала",
+        description: "Использовать прежний WebView-терминал после повторного открытия",
+        accessibilityLabel: "Использовать прежний рендерер терминала",
+      },
       testAudio: "Тестирование звука",
       playTest: "Игровой тест",
       playing: "Игра...",
