@@ -14,7 +14,7 @@ import path from "node:path";
 import pino from "pino";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
-import { describe, expect, onTestFinished, test } from "vitest";
+import { describe, expect, onTestFinished, test, vi } from "vitest";
 
 import type { AgentSession, AgentSessionConfig, AgentStreamEvent } from "../../agent-sdk-types.js";
 import { PiRpcAgentClient, PiRpcAgentSession, transformPiModels } from "./agent.js";
@@ -62,22 +62,32 @@ type PaseoExtensionListener = (event: unknown, context?: unknown) => unknown;
 async function loadPaseoExtension(extensionPath: string): Promise<{
   listeners: Map<string, PaseoExtensionListener[]>;
   busListeners: Map<string, (payload: unknown) => void>;
+  commands: Map<string, (args: string, context: unknown) => unknown>;
 }> {
   const listeners = new Map<string, PaseoExtensionListener[]>();
   const busListeners = new Map<string, (payload: unknown) => void>();
+  const commands = new Map<string, (args: string, context: unknown) => unknown>();
   const extension = (await import(pathToFileURL(extensionPath).href)) as {
     default: (piApi: {
       on: (event: string, listener: PaseoExtensionListener) => void;
       events: { on: (event: string, listener: (payload: unknown) => void) => void };
-      registerCommand: () => void;
+      registerCommand: (
+        name: string,
+        command: { handler: (args: string, context: unknown) => unknown },
+      ) => void;
     }) => void;
   };
   extension.default({
     on: (event, listener) => listeners.set(event, [...(listeners.get(event) ?? []), listener]),
-    events: { on: (event, listener) => busListeners.set(event, listener) },
-    registerCommand: () => undefined,
+    events: {
+      on: (event, listener) => {
+        busListeners.set(event, listener);
+        return () => busListeners.delete(event);
+      },
+    },
+    registerCommand: (name, command) => commands.set(name, command.handler),
   });
-  return { listeners, busListeners };
+  return { listeners, busListeners, commands };
 }
 
 async function loadPaseoExtensionListeners(
@@ -400,6 +410,23 @@ describe("PiRpcAgentSession", () => {
       id: "still-running",
       status: "canceled",
     });
+    await session.close();
+  });
+
+  test("the injected reload bridge invokes Pi's reload action", async () => {
+    const pi = new FakePi();
+    const session = await createClient(pi).createSession(createConfig());
+    const extensionPath = pi.recordedLaunches[0]?.extensionPaths[0];
+    expect(extensionPath).toBeDefined();
+    const extension = await loadPaseoExtension(extensionPath!);
+    const reload = extension.commands.get("paseo_reload");
+    expect(reload).toBeDefined();
+    const reloadAction = vi.fn();
+
+    await expect(reload!("", { reload: reloadAction })).resolves.toBeUndefined();
+    expect(reloadAction).toHaveBeenCalledOnce();
+    await extension.listeners.get("session_shutdown")?.at(-1)?.({}, {});
+    expect(extension.busListeners.get("subagents:event")).toBeUndefined();
     await session.close();
   });
 
@@ -2134,6 +2161,12 @@ describe("PiRpcAgentClient", () => {
         argumentHint: "[on|off|toggle]",
         kind: "command",
       },
+      {
+        name: "reload",
+        description: "Reload extensions, skills, prompts, themes, and context files",
+        argumentHint: "",
+        kind: "command",
+      },
       { name: "review", description: "Review changes", argumentHint: "", kind: "command" },
       { name: "fix-tests", description: "Fix tests", argumentHint: "", kind: "command" },
       { name: "skill:docs", description: "Read docs", argumentHint: "", kind: "skill" },
@@ -2158,6 +2191,12 @@ describe("PiRpcAgentClient", () => {
       argumentHint: "[on|off|toggle]",
       kind: "command",
     });
+    await expect(session.listCommands()).resolves.toContainEqual({
+      name: "reload",
+      description: "Reload extensions, skills, prompts, themes, and context files",
+      argumentHint: "",
+      kind: "command",
+    });
   });
 
   test("preserves known argument hints when RPC get_commands returns built-in slash commands", async () => {
@@ -2180,7 +2219,68 @@ describe("PiRpcAgentClient", () => {
         argumentHint: "[on|off|toggle]",
         kind: "command",
       },
+      {
+        name: "reload",
+        description: "Reload extensions, skills, prompts, themes, and context files",
+        argumentHint: "",
+        kind: "command",
+      },
     ]);
+  });
+
+  test("executes Pi reload through its internal extension command", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+    const handler = (session as AgentSession).tryHandleOutOfBand?.("/reload");
+    const events: AgentStreamEvent[] = [];
+
+    expect(handler).not.toBeNull();
+    await handler?.run({ emit: (event) => events.push(event) });
+
+    expect(fakeSession.prompts).toEqual([{ message: "/paseo_reload", imageCount: 0 }]);
+    expect(events).toContainEqual({
+      type: "timeline",
+      provider: "pi",
+      item: { type: "assistant_message", text: "Reloaded Pi resources." },
+    });
+  });
+
+  test("does not reload Pi while it is processing", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+    fakeSession.state.isStreaming = true;
+    const handler = (session as AgentSession).tryHandleOutOfBand?.("/reload");
+    const events: AgentStreamEvent[] = [];
+
+    expect(handler).not.toBeNull();
+    await handler?.run({ emit: (event) => events.push(event) });
+
+    expect(fakeSession.prompts).toEqual([]);
+    expect(events).toContainEqual({
+      type: "timeline",
+      provider: "pi",
+      item: {
+        type: "assistant_message",
+        text: "[Error] Wait for the current response to finish before reloading.",
+      },
+    });
+  });
+
+  test("rejects Pi reload arguments", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+    const handler = (session as AgentSession).tryHandleOutOfBand?.("/reload unexpected");
+    const events: AgentStreamEvent[] = [];
+
+    expect(handler).not.toBeNull();
+    await handler?.run({ emit: (event) => events.push(event) });
+
+    expect(fakeSession.prompts).toEqual([]);
+    expect(events).toContainEqual({
+      type: "timeline",
+      provider: "pi",
+      item: { type: "assistant_message", text: "[Error] Usage: /reload" },
+    });
   });
 
   test("executes Pi compact through RPC instead of prompt text", async () => {

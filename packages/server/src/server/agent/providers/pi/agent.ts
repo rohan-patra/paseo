@@ -107,6 +107,7 @@ const PI_BINARY_COMMAND = process.env.PI_COMMAND ?? process.env.PI_ACP_PI_COMMAN
 const PI_CATALOG_REQUEST_TIMEOUT_MS = 120_000;
 const PASEO_PI_TREE_EXTENSION_COMMAND = "paseo_tree";
 const PASEO_PI_CAPTURE_EXTENSION_COMMAND = "paseo_capture_entries";
+const PASEO_PI_RELOAD_EXTENSION_COMMAND = "paseo_reload";
 const PASEO_PI_ENTRY_CAPTURE_MARKER = "PASEO_ENTRY_CAPTURE";
 const PASEO_PI_SUBMITTED_USER_ENTRY_MARKER = "PASEO_SUBMITTED_USER_ENTRY";
 const PASEO_PI_COMMAND_RESULT_MARKER = "PASEO_COMMAND_RESULT";
@@ -137,6 +138,12 @@ const PI_HANDLED_BUILTIN_SLASH_COMMANDS: AgentSlashCommand[] = [
     name: "autocompact",
     description: "Toggle automatic context compaction",
     argumentHint: "[on|off|toggle]",
+    kind: "command",
+  },
+  {
+    name: "reload",
+    description: "Reload extensions, skills, prompts, themes, and context files",
+    argumentHint: "",
     kind: "command",
   },
 ];
@@ -790,7 +797,7 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 	  // session_start. Extension load order decides whether that has happened yet:
 	  // a session restoring earlier work republishes it immediately, and that can
 	  // land before this extension's own session_start. Buffer until there is a ctx.
-	  pi.events.on("subagents:event", (payload) => {
+	  const unsubscribeSubagents = pi.events.on("subagents:event", (payload) => {
 	    try {
 	      if (!uiContext) {
 	        if (pendingSubagentUpdates.length < 100) pendingSubagentUpdates.push(payload);
@@ -800,6 +807,10 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 	    } catch {
 	      // A relay failure must never take down the session that is doing the work.
 	    }
+	  });
+
+	  pi.on("session_shutdown", async () => {
+	    unsubscribeSubagents();
 	  });
 
 	  pi.on("session_start", async (_event, ctx) => {
@@ -846,6 +857,14 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 	  pi.on("turn_end", async (_event, ctx) => {
 	    emitSubmittedUserEntries(ctx);
 	    emitEntryCapture(ctx, "turn_end");
+	  });
+
+	  pi.registerCommand("${PASEO_PI_RELOAD_EXTENSION_COMMAND}", {
+	    description: "Internal Paseo reload bridge",
+	    handler: async (_args, ctx) => {
+	      await ctx.reload();
+	      return;
+	    },
 	  });
 
 	  pi.registerCommand("${PASEO_PI_CAPTURE_EXTENSION_COMMAND}", {
@@ -2042,6 +2061,13 @@ export class PiRpcAgentSession implements AgentSession {
         },
       };
     }
+    if (commandName === "reload") {
+      return {
+        run: async ({ emit }) => {
+          await this.executeReloadCommand(parsed.args, emit);
+        },
+      };
+    }
     return null;
   }
 
@@ -2332,6 +2358,50 @@ export class PiRpcAgentSession implements AgentSession {
         this.outOfBandCompactionStarted = false;
         this.outOfBandCompactionCompleted = false;
       }
+    }
+  }
+
+  private async executeReloadCommand(
+    args: string | undefined,
+    emit: (event: AgentStreamEvent) => void,
+  ): Promise<void> {
+    if (args) {
+      emit({
+        type: "timeline",
+        provider: this.provider,
+        item: { type: "assistant_message", text: "[Error] Usage: /reload" },
+      });
+      return;
+    }
+    const state = await this.runtimeSession.getState();
+    if (state.isStreaming || state.isCompacting) {
+      emit({
+        type: "timeline",
+        provider: this.provider,
+        item: {
+          type: "assistant_message",
+          text: "[Error] Wait for the current response to finish before reloading.",
+        },
+      });
+      return;
+    }
+    try {
+      await this.runtimeSession.prompt(`/${PASEO_PI_RELOAD_EXTENSION_COMMAND}`);
+      emit({
+        type: "timeline",
+        provider: this.provider,
+        item: { type: "assistant_message", text: "Reloaded Pi resources." },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      emit({
+        type: "timeline",
+        provider: this.provider,
+        item: {
+          type: "assistant_message",
+          text: `[Error] Failed to reload Pi resources: ${message}`,
+        },
+      });
     }
   }
 
