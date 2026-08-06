@@ -100,6 +100,7 @@ import {
   type PiToolResult,
   type PiTrackedToolCall,
 } from "./tool-call-mapper.js";
+import { mapPiTodoWrite } from "./todo-mapper.js";
 
 const PI_PROVIDER = "pi";
 const DEFAULT_PI_THINKING_LEVEL: PiThinkingLevel = "medium";
@@ -1667,6 +1668,7 @@ export class PiRpcAgentSession implements AgentSession {
 
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private readonly activeToolCalls = new Map<string, PiTrackedToolCall>();
+  private lastTodoItem: Extract<AgentTimelineItem, { type: "todo" }> | null = null;
   private readonly subagentIndex = new PiSubagentIndex();
   private readonly pendingExtensionUiRequests = new Map<string, AgentPermissionRequest>();
   private readonly backgroundWorkIncarnation = randomUUID();
@@ -2003,6 +2005,7 @@ export class PiRpcAgentSession implements AgentSession {
     });
     this.currentLeafOverrideId = targetEntry.parentId;
     this.activeToolCalls.clear();
+    this.lastTodoItem = null;
   }
 
   private async runPiTreeExtensionCommand(targetId: string): Promise<unknown> {
@@ -2890,7 +2893,9 @@ export class PiRpcAgentSession implements AgentSession {
         this.activeToolCalls.set(event.toolCallId, toolCall);
         this.noteSubagentLaunch(event.toolCallId, toolCall);
         this.activeAskUserDialog = readActiveAskUserDialog(event.toolName, event.args);
-        this.emitToolCallEvent(event.toolCallId, toolCall, "running", null, null);
+        if (!mapPiTodoWrite(event.toolName, toolCall.args)) {
+          this.emitToolCallEvent(event.toolCallId, toolCall, "running", null, null);
+        }
         return;
       }
       case "tool_execution_update": {
@@ -2899,8 +2904,10 @@ export class PiRpcAgentSession implements AgentSession {
           return;
         }
 
-        const partialResult = parseToolResult(event.partialResult);
-        this.emitToolCallEvent(event.toolCallId, toolCall, "running", partialResult, null);
+        if (!mapPiTodoWrite(toolCall.toolName, toolCall.args)) {
+          const partialResult = parseToolResult(event.partialResult);
+          this.emitToolCallEvent(event.toolCallId, toolCall, "running", partialResult, null);
+        }
         return;
       }
       case "tool_execution_end": {
@@ -3151,10 +3158,29 @@ export class PiRpcAgentSession implements AgentSession {
       this.pendingCombinedAskUserResponse = null;
     }
 
+    const todo = event.isError ? null : mapPiTodoWrite(event.toolName, toolCall.args);
+    if (todo) {
+      this.emitTodoItem(todo);
+      return;
+    }
+
     const result = parseToolResult(event.result);
     const error = event.isError ? event.result : null;
     const status = event.isError ? "failed" : "completed";
     this.emitToolCallEvent(event.toolCallId, toolCall, status, result, error);
+  }
+
+  private emitTodoItem(item: Extract<AgentTimelineItem, { type: "todo" }>): void {
+    if (JSON.stringify(item) === JSON.stringify(this.lastTodoItem)) {
+      return;
+    }
+    this.lastTodoItem = item;
+    this.emit({
+      type: "timeline",
+      provider: this.provider,
+      turnId: this.currentTurnIdForEvent(),
+      item,
+    });
   }
 
   private emitCompactionTimeline(input: {

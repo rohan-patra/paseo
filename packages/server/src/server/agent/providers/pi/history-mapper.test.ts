@@ -101,6 +101,42 @@ describe("Pi history mapper", () => {
     ]);
   });
 
+  test("replays successful todowrite calls as timeline todos", async () => {
+    const events = await collectHistory([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "todo-1",
+            name: "todowrite",
+            arguments: {
+              todos: [
+                { content: "done", status: "completed" },
+                { content: "next", status: "in_progress" },
+              ],
+            },
+          },
+        ],
+      },
+      { role: "toolResult", toolCallId: "todo-1", toolName: "todowrite", content: [] },
+    ]);
+
+    expect(events).toEqual([
+      {
+        type: "timeline",
+        provider: "pi",
+        item: {
+          type: "todo",
+          items: [
+            { text: "done", completed: true },
+            { text: "next", completed: false },
+          ],
+        },
+      },
+    ]);
+  });
+
   test("replays bash execution records as completed shell calls", async () => {
     await expect(
       collectHistory([

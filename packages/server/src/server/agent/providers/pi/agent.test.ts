@@ -1167,6 +1167,72 @@ describe("PiRpcAgentSession", () => {
     ]);
   });
 
+  test("streams successful todowrite calls as timeline todos", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+
+    await session.startTurn("track work");
+    fakeSession.emit({
+      type: "tool_execution_start",
+      toolCallId: "todo-1",
+      toolName: "todowrite",
+      args: {
+        todos: [
+          { content: "done", status: "completed" },
+          { content: "next", status: "in_progress" },
+        ],
+      },
+    });
+    fakeSession.emit({
+      type: "tool_execution_end",
+      toolCallId: "todo-1",
+      toolName: "todowrite",
+      result: { text: "Updated todo list." },
+      isError: false,
+    });
+
+    expect(events.timelineItems()).toEqual([
+      {
+        type: "todo",
+        items: [
+          { text: "done", completed: true },
+          { text: "next", completed: false },
+        ],
+      },
+    ]);
+    await session.close();
+  });
+
+  test("does not stream failed todowrite calls as timeline todos", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+
+    fakeSession.emit({
+      type: "tool_execution_start",
+      toolCallId: "todo-failed",
+      toolName: "todowrite",
+      args: { todos: [{ content: "not saved", status: "completed" }] },
+    });
+    fakeSession.emit({
+      type: "tool_execution_end",
+      toolCallId: "todo-failed",
+      toolName: "todowrite",
+      result: { text: "Validation failed" },
+      isError: true,
+    });
+
+    expect(events.timelineItems()).toContainEqual(
+      expect.objectContaining({
+        type: "tool_call",
+        callId: "todo-failed",
+        name: "todowrite",
+        status: "failed",
+      }),
+    );
+    expect(events.timelineItems().filter((item) => item.type === "todo")).toEqual([]);
+    await session.close();
+  });
+
   test("streams Pi task calls as sub-agent cards with lifecycle status", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();
@@ -2481,23 +2547,42 @@ describe("PiRpcAgentClient", () => {
 
   test("rewinds conversation through the Pi tree navigation bridge", async () => {
     const { pi, session, events } = await createSession();
-    pi.latestSession().capturedUserEntries = [
+    const fakeSession = pi.latestSession();
+    fakeSession.capturedUserEntries = [
       { id: "entry-1", parentId: null, text: "first prompt" },
       { id: "entry-3", parentId: "entry-2", text: "second prompt" },
     ];
 
     await session.startTurn("first prompt");
-    pi.latestSession().finishTurn({ role: "assistant", content: [] });
+    fakeSession.finishTurn({ role: "assistant", content: [] });
     await events.nextTurnCompletion();
 
-    await session.revertConversation?.({ messageId: "entry-1" });
+    for (const toolCallId of ["todo-before-rewind", "todo-after-rewind"]) {
+      if (toolCallId === "todo-after-rewind") {
+        await session.revertConversation?.({ messageId: "entry-1" });
+      }
+      fakeSession.emit({
+        type: "tool_execution_start",
+        toolCallId,
+        toolName: "todowrite",
+        args: { todos: [{ content: "repeat", status: "in_progress" }] },
+      });
+      fakeSession.emit({
+        type: "tool_execution_end",
+        toolCallId,
+        toolName: "todowrite",
+        result: { text: "Updated todo list." },
+        isError: false,
+      });
+    }
 
     expect(rewindCapabilities(session.capabilities)).toEqual({
       supportsRewindConversation: true,
       supportsRewindFiles: false,
       supportsRewindBoth: false,
     });
-    expect(pi.latestSession().treeNavigationRequests).toEqual(["entry-1"]);
+    expect(fakeSession.treeNavigationRequests).toEqual(["entry-1"]);
+    expect(events.timelineItems().filter((item) => item.type === "todo")).toHaveLength(2);
   });
 
   test("injects MCP servers without replacing the Pi global MCP config", async () => {

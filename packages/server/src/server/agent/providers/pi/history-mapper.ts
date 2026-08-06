@@ -1,5 +1,6 @@
 import type { AgentStreamEvent, AgentTimelineItem, ToolCallDetail } from "../../agent-sdk-types.js";
 import type { PiAgentMessage, PiImageContent, PiTextContent } from "./rpc-types.js";
+import { mapPiTodoWrite } from "./todo-mapper.js";
 import {
   extractTextFromToolResult,
   mapToolDetail,
@@ -54,6 +55,7 @@ export function getUserMessageText(content: string | (PiTextContent | PiImageCon
 
 export class PiHistoryMapper {
   private readonly pendingToolCalls = new Map<string, PiTrackedToolCall>();
+  private lastTodoItem: Extract<AgentTimelineItem, { type: "todo" }> | null = null;
   private userIndex = 0;
   private assistantIndex = 0;
 
@@ -77,13 +79,9 @@ export class PiHistoryMapper {
         case "assistant":
           events.push(...this.mapAssistantMessage(message));
           break;
-        case "toolResult": {
-          const event = this.mapToolResultMessage(message);
-          if (event) {
-            events.push(event);
-          }
+        case "toolResult":
+          events.push(...this.mapToolResultMessage(message));
           break;
-        }
         case "bashExecution":
           events.push(this.mapBashExecutionMessage(message));
           break;
@@ -159,22 +157,24 @@ export class PiHistoryMapper {
       if (content.type === "toolCall") {
         const tracked = parseToolArgs(content.name, content.arguments);
         this.pendingToolCalls.set(content.id, tracked);
-        const detail = this.mapToolDetail(content.id, tracked, null);
-        if (!detail) {
-          continue;
+        if (!mapPiTodoWrite(tracked.toolName, tracked.args)) {
+          const detail = this.mapToolDetail(content.id, tracked, null);
+          if (!detail) {
+            continue;
+          }
+          events.push({
+            type: "timeline",
+            provider: this.provider,
+            item: {
+              type: "tool_call",
+              callId: this.resolveToolCallId(content.id, tracked),
+              name: tracked.toolName,
+              status: "running",
+              detail,
+              error: null,
+            },
+          });
         }
-        events.push({
-          type: "timeline",
-          provider: this.provider,
-          item: {
-            type: "tool_call",
-            callId: this.resolveToolCallId(content.id, tracked),
-            name: tracked.toolName,
-            status: "running",
-            detail,
-            error: null,
-          },
-        });
       }
     }
     return events;
@@ -182,26 +182,36 @@ export class PiHistoryMapper {
 
   private mapToolResultMessage(
     message: Extract<PiAgentMessage, { role: "toolResult" }>,
-  ): AgentStreamEvent | null {
+  ): AgentStreamEvent[] {
     const tracked =
       this.pendingToolCalls.get(message.toolCallId) ?? parseToolArgs(message.toolName, null);
     this.pendingToolCalls.delete(message.toolCallId);
     const result = parseToolResult({ content: message.content, details: message.details });
-    const detail = this.mapToolDetail(message.toolCallId, tracked, result);
-    if (!detail) {
-      return null;
+    const events: AgentStreamEvent[] = [];
+    const todo = message.isError ? null : mapPiTodoWrite(tracked.toolName, tracked.args);
+    if (todo) {
+      if (JSON.stringify(todo) !== JSON.stringify(this.lastTodoItem)) {
+        this.lastTodoItem = todo;
+        events.push({ type: "timeline", provider: this.provider, item: todo });
+      }
+      return events;
     }
-    return {
-      type: "timeline",
-      provider: this.provider,
-      item: toToolResultTimelineItem({
-        callId: this.resolveToolCallId(message.toolCallId, tracked),
-        name: resolveToolCallName(tracked, result),
-        isError: Boolean(message.isError),
-        detail,
-        errorText: extractTextFromToolResult(result) ?? "Tool call failed",
-      }),
-    };
+
+    const detail = this.mapToolDetail(message.toolCallId, tracked, result);
+    if (detail) {
+      events.push({
+        type: "timeline",
+        provider: this.provider,
+        item: toToolResultTimelineItem({
+          callId: this.resolveToolCallId(message.toolCallId, tracked),
+          name: resolveToolCallName(tracked, result),
+          isError: Boolean(message.isError),
+          detail,
+          errorText: extractTextFromToolResult(result) ?? "Tool call failed",
+        }),
+      });
+    }
+    return events;
   }
 
   private mapBashExecutionMessage(
