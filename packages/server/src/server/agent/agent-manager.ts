@@ -1323,6 +1323,7 @@ export class AgentManager {
     try {
       this.assertAcceptingAgentRegistrations();
 
+      this.cancelRunningProviderSubagents(agentId);
       const closedExisting = this.prepareAgentForClosure(existing, "agent reloaded");
       try {
         await this.persistSnapshot(closedExisting);
