@@ -1167,6 +1167,27 @@ describe("PiRpcAgentSession", () => {
     ]);
   });
 
+  test("streams delta-only Pi RPC updates", async () => {
+    const { pi, session, events } = await createSession();
+
+    await session.startTurn("hello");
+    pi.latestSession().emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "hello" },
+    });
+
+    expect(events.timelineItems()).toEqual([
+      {
+        type: "assistant_message",
+        text: "hello",
+        messageId: expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+        ),
+      },
+    ]);
+    await session.close();
+  });
+
   test("streams successful todowrite calls as timeline todos", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();

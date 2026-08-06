@@ -177,7 +177,7 @@ export type PiAgentSessionEvent =
   | { type: "message_end"; message: PiAgentMessage }
   | {
       type: "message_update";
-      message: PiAgentMessage;
+      message?: PiAgentMessage;
       assistantMessageEvent: PiAssistantMessageEvent;
     }
   | {

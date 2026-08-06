@@ -1458,7 +1458,6 @@ function isPiAgentSessionEvent(event: PiRuntimeEvent): event is PiAgentSessionEv
     case "turn_start":
     case "message_start":
     case "message_end":
-    case "message_update":
     case "tool_execution_start":
     case "tool_execution_update":
     case "tool_execution_end":
@@ -1468,6 +1467,11 @@ function isPiAgentSessionEvent(event: PiRuntimeEvent): event is PiAgentSessionEv
     case "agent_settled":
     case "queue_update":
       return true;
+    case "message_update":
+      return (
+        isRecord(event.assistantMessageEvent) &&
+        typeof event.assistantMessageEvent.type === "string"
+      );
     default:
       return false;
   }
@@ -3218,12 +3222,12 @@ export class PiRpcAgentSession implements AgentSession {
     event: Extract<PiAgentSessionEvent, { type: "message_update" }>,
     turnId: string | undefined,
   ): void {
-    if (event.message.role !== "assistant") {
+    if (event.message && event.message.role !== "assistant") {
       return;
     }
     if (event.assistantMessageEvent.type === "text_delta") {
-      // Pi-compatible runtimes may emit updates without a preceding message_start.
-      this.activeAssistantMessageId ??= event.message.responseId || randomUUID();
+      // COMPAT(pi-message-update): added in v0.84.0, remove after Pi <0.84.0 support is dropped.
+      this.activeAssistantMessageId ??= event.message?.responseId || randomUUID();
       this.emit({
         type: "timeline",
         provider: this.provider,
