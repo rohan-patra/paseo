@@ -1,7 +1,7 @@
 import { Command } from "commander";
 import { resolveHookActivity, type AgentHookActivityState } from "@getpaseo/server/agent-hooks";
 
-interface HookEnvironment {
+interface HookEnvironment extends NodeJS.ProcessEnv {
   PASEO_TERMINAL_ID?: string;
   PASEO_ACTIVITY_TOKEN?: string;
   PASEO_TERMINAL_ACTIVITY_URL?: string;

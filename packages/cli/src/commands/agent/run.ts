@@ -751,8 +751,6 @@ export async function runRunCommand(
   }
 }
 
-export function resolveRunCallerAgentId(
-  env: { PASEO_AGENT_ID?: string } = process.env,
-): string | undefined {
+export function resolveRunCallerAgentId(env: NodeJS.ProcessEnv = process.env): string | undefined {
   return env.PASEO_AGENT_ID?.trim() || undefined;
 }

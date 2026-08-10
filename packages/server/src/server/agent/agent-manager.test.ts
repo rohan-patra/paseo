@@ -512,7 +512,7 @@ interface ControlledInterruptFixture {
   manager: AgentManager;
   session: ControlledInterruptSession;
   startForegroundRun(): Promise<void>;
-  cleanup(): void;
+  cleanup(): Promise<void>;
 }
 
 async function createControlledInterruptFixture(options: {
@@ -556,7 +556,10 @@ async function createControlledInterruptFixture(options: {
       })();
       await manager.waitForAgentRunStart(agent.id);
     },
-    cleanup: () => rmSync(workdir, { recursive: true, force: true }),
+    async cleanup() {
+      await manager.closeAgent(agent.id);
+      rmSync(workdir, { recursive: true, force: true });
+    },
   };
 }
 
@@ -1007,7 +1010,7 @@ test("reload closes both sessions when the closed snapshot cannot be persisted",
   }
 });
 
-test("normalizeConfig injects the provider default model when omitted", async () => {
+test("normalizeConfig injects the provider default model while leaving mode omitted", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
@@ -1030,10 +1033,10 @@ test("normalizeConfig injects the provider default model when omitted", async ()
   );
 
   expect(snapshot.config.model).toBe("gpt-5.4");
-  expect(snapshot.config.modeId).toBe("auto-review");
+  expect(snapshot.config.modeId).toBeUndefined();
 });
 
-test("normalizeConfig injects Claude's automatic approval default when omitted", async () => {
+test("normalizeConfig leaves Claude mode omitted", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-claude-default-test-"));
   const manager = new AgentManager({
     clients: { claude: new TestAgentClient("claude") },
@@ -1044,18 +1047,22 @@ test("normalizeConfig injects Claude's automatic approval default when omitted",
     workspaceId: undefined,
   });
 
-  expect(snapshot.config.modeId).toBe("auto");
+  expect(snapshot.config.modeId).toBeUndefined();
 });
 
-test("normalizeConfig uses a capability-aware provider mode default", async () => {
+test("normalizeConfig does not ask the provider to synthesize an omitted mode", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-mode-default-test-"));
   class CapabilityAwareClient extends TestAgentClient {
+    resolveDefaultModeCalls = 0;
+
     override async resolveDefaultModeId(input: ResolveAgentDefaultModeInput): Promise<string> {
+      this.resolveDefaultModeCalls += 1;
       return input.env?.CLAUDE_CODE_USE_BEDROCK === "1" ? "default" : "auto";
     }
   }
+  const client = new CapabilityAwareClient();
   const manager = new AgentManager({
-    clients: { codex: new CapabilityAwareClient() },
+    clients: { codex: client },
     logger,
   });
 
@@ -1064,7 +1071,8 @@ test("normalizeConfig uses a capability-aware provider mode default", async () =
     env: { CLAUDE_CODE_USE_BEDROCK: "1" },
   });
 
-  expect(snapshot.config.modeId).toBe("default");
+  expect(snapshot.config.modeId).toBeUndefined();
+  expect(client.resolveDefaultModeCalls).toBe(0);
 });
 
 test("createAgent forwards request env into the spawned provider process", async () => {
@@ -1126,7 +1134,7 @@ test("normalizeConfig strips legacy 'default' model id", async () => {
   );
 
   expect(snapshot.config.model).toBe("gpt-5.4");
-  expect(snapshot.config.modeId).toBe("auto-review");
+  expect(snapshot.config.modeId).toBeUndefined();
 });
 
 test("listDraftCommands returns no commands without guessing a missing model", async () => {
@@ -1223,7 +1231,6 @@ test("listDraftCommands uses explicit model config without default model fetchin
       provider: "codex",
       cwd: workdir,
       model: "gpt-5.4",
-      modeId: "auto-review",
     },
   ]);
 });
@@ -1319,7 +1326,6 @@ test("listDraftFeatures uses client feature listing without a model", async () =
     {
       provider: "codex",
       cwd: workdir,
-      modeId: "auto-review",
     },
   ]);
 });
@@ -1372,7 +1378,6 @@ test("listDraftFeatures uses explicit model config without default model fetchin
       provider: "codex",
       cwd: workdir,
       model: "gpt-5.4",
-      modeId: "auto-review",
     },
   ]);
 });
@@ -1658,7 +1663,7 @@ test("cancelAgentRun preserves running state when the provider interrupt hangs",
     expect(fixture.session.interruptCalled).toBe(true);
     expect(fixture.manager.getAgent(fixture.agentId)?.lifecycle).toBe("running");
   } finally {
-    fixture.cleanup();
+    await fixture.cleanup();
   }
 });
 
@@ -1689,7 +1694,7 @@ test("cancelAgentRun preserves the active turn when the provider rejects the int
       turnId: "provider-still-active-turn",
     });
   } finally {
-    fixture.cleanup();
+    await fixture.cleanup();
   }
 });
 
@@ -1722,7 +1727,7 @@ test("cancelAgentRun succeeds when the foreground turn finishes before the provi
       activeForegroundTurnId: null,
     });
   } finally {
-    fixture.cleanup();
+    await fixture.cleanup();
   }
 });
 
@@ -1752,7 +1757,7 @@ test("cancelAgentRun succeeds when the provider queues completion before rejecti
       activeForegroundTurnId: null,
     });
   } finally {
-    fixture.cleanup();
+    await fixture.cleanup();
   }
 });
 
@@ -1829,7 +1834,6 @@ test("createAgent passes daemon launch env through the provider launch context",
     provider: "codex",
     cwd: workdir,
     model: "gpt-5.4",
-    modeId: "auto-review",
   });
   expect(client.lastLaunchContext).toEqual({
     agentId: snapshot.id,
@@ -2788,7 +2792,6 @@ test("resumeAgentFromPersistence keeps metadata config, applies overrides, and p
   });
   expect(client.lastResumeOverrides).toMatchObject({
     model: "gpt-5.4",
-    modeId: "auto-review",
     systemPrompt: "new prompt",
     mcpServers: {
       paseo: {
@@ -2798,6 +2801,7 @@ test("resumeAgentFromPersistence keeps metadata config, applies overrides, and p
       },
     },
   });
+  expect(client.lastResumeOverrides).not.toHaveProperty("modeId");
   expect(client.lastResumeLaunchContext).toEqual({
     agentId: resumed.id,
     env: {

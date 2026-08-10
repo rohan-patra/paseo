@@ -3226,7 +3226,7 @@ export class PiRpcAgentSession implements AgentSession {
       return;
     }
     if (event.assistantMessageEvent.type === "text_delta") {
-      // COMPAT(pi-message-update): added in v0.84.0, remove after Pi <0.84.0 support is dropped.
+      // COMPAT(pi-message-update): Pi-compatible runtimes may emit updates without a preceding message_start.
       this.activeAssistantMessageId ??= event.message?.responseId || randomUUID();
       this.emit({
         type: "timeline",

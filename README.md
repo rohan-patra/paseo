@@ -7,7 +7,8 @@
 <p align="center">
   <a href="README.md">English</a> ·
   <a href="README.zh-CN.md">简体中文</a> ·
-  <a href="README.ja.md">日本語</a>
+  <a href="README.ja.md">日本語</a> ·
+  <a href="README.ko.md">한국어</a>
 </p>
 
 <p align="center">
@@ -104,7 +105,7 @@ Everything you can do in the app, you can do from the terminal.
 
 ```bash
 paseo run --provider claude/opus-4.6 "implement user authentication"
-paseo run --provider codex/gpt-5.4 --worktree feature-x "implement feature X"
+paseo run --provider codex/gpt-5.5 --worktree feature-x "implement feature X"
 
 paseo ls                           # list running agents
 paseo attach abc123                # stream live output
@@ -115,6 +116,30 @@ paseo --host workstation.local:6767 run "run the full test suite"
 ```
 
 See the [full CLI reference](https://paseo.sh/docs/cli) for more.
+
+## TypeScript SDK
+
+Build issue integrations, dashboards, and orchestration services with `@getpaseo/client`:
+
+```ts
+import { createPaseoClient } from "@getpaseo/client";
+
+const client = createPaseoClient({ url: "ws://127.0.0.1:6767/ws" });
+await client.connect();
+
+const agent = await client.agents.create({
+  config: { provider: "codex/gpt-5.5" },
+  cwd: "/Users/me/dev/storefront",
+  prompt: "Review the current diff and name the riskiest change.",
+});
+
+const result = await agent.waitForFinish();
+console.log(result.lastMessage);
+
+await client.close();
+```
+
+See the [SDK quickstart](https://paseo.sh/docs/sdk/quickstart), [recipes](https://paseo.sh/docs/sdk/recipes), and [API reference](https://paseo.sh/docs/sdk/reference).
 
 ## Skills
 

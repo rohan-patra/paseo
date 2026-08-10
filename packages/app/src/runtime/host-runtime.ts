@@ -36,7 +36,6 @@ import {
 import {
   buildLocalDaemonTransportUrl,
   createDesktopLocalDaemonTransportFactory,
-  createDesktopWebSocketTransportFactory,
 } from "@/desktop/daemon/desktop-daemon-transport";
 import { getDesktopHost } from "@/desktop/host";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
@@ -58,6 +57,7 @@ import { encodeImages } from "@/utils/encode-images";
 import { DirectorySync, type RefreshAgentDirectoryResult } from "@/runtime/directory-sync";
 import { ReplicaCache } from "@/runtime/replica-cache";
 import { nativePerformanceTrace } from "@/performance/native-trace";
+import { createAppWebSocketFactory } from "./websocket-factory";
 
 export type HostRuntimeConnectionStatus = "idle" | "connecting" | "online" | "offline" | "error";
 export type HostRegistryStatus = "loading" | "ready";
@@ -478,7 +478,7 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
   return {
     createClient: ({ host, connection, clientId, runtimeGeneration }) => {
       const localTransportFactory = createDesktopLocalDaemonTransportFactory();
-      const webSocketTransportFactory = createDesktopWebSocketTransportFactory();
+      const webSocketConfig = { webSocketFactory: createAppWebSocketFactory() };
       const base = {
         suppressSendErrors: true,
         clientId,
@@ -501,16 +501,16 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
       if (connection.type === "directTcp") {
         return new DaemonClient({
           ...base,
-          ...(webSocketTransportFactory ? { transportFactory: webSocketTransportFactory } : {}),
+          ...webSocketConfig,
           url: buildDaemonWebSocketUrl(connection.endpoint, {
             useTls: connection.useTls ?? false,
           }),
           ...(connection.password ? { password: connection.password } : {}),
-          ...(connection.headers ? { headers: connection.headers } : {}),
         });
       }
       return new DaemonClient({
         ...base,
+        ...webSocketConfig,
         url: buildRelayWebSocketUrl({
           endpoint: connection.relayEndpoint,
           useTls: connection.useTls ?? shouldUseTlsForDefaultHostedRelay(connection.relayEndpoint),
@@ -1648,7 +1648,6 @@ export class HostRuntimeStore {
     endpoint: string;
     useTls?: boolean;
     password?: string;
-    headers?: Record<string, string>;
     label?: string;
     existingClient?: DaemonClient;
   }): Promise<HostProfile> {
@@ -1663,7 +1662,6 @@ export class HostRuntimeStore {
         endpoint,
         useTls: input.useTls ?? false,
         ...(password ? { password } : {}),
-        ...(input.headers ? { headers: input.headers } : {}),
       },
       existingClient: input.existingClient,
     });
@@ -1705,7 +1703,6 @@ export class HostRuntimeStore {
     endpoint: string;
     useTls?: boolean;
     password?: string;
-    headers?: Record<string, string>;
     label?: string;
   }): Promise<{ profile: HostProfile; serverId: string; hostname: string | null }> {
     const endpoint = normalizeHostPort(input.endpoint);
@@ -1718,7 +1715,6 @@ export class HostRuntimeStore {
         endpoint,
         useTls: input.useTls ?? false,
         ...(password ? { password } : {}),
-        ...(input.headers ? { headers: input.headers } : {}),
       },
     });
   }
@@ -2488,14 +2484,12 @@ export interface HostMutations {
     endpoint: string;
     useTls?: boolean;
     password?: string;
-    headers?: Record<string, string>;
     label?: string;
   }) => Promise<HostProfile>;
   probeAndUpsertDirectConnection: (input: {
     endpoint: string;
     useTls?: boolean;
     password?: string;
-    headers?: Record<string, string>;
     label?: string;
   }) => Promise<{ profile: HostProfile; serverId: string; hostname: string | null }>;
   upsertRelayConnection: (input: {

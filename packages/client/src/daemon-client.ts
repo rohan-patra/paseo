@@ -301,7 +301,6 @@ export interface DaemonClientConfig {
   runtimeGeneration?: number | null;
   password?: string;
   authHeader?: string;
-  headers?: Record<string, string>;
   suppressSendErrors?: boolean;
   transportFactory?: DaemonTransportFactory;
   webSocketFactory?: WebSocketFactory;
@@ -790,11 +789,7 @@ export interface CreateScheduleOptions {
           archiveOnFinish?: boolean;
           isolation?: "local" | "worktree";
           title?: string | null;
-          approvalPolicy?: string;
-          sandboxMode?: string;
-          networkAccess?: boolean;
-          webSearch?: boolean;
-          extra?: AgentSessionConfig["extra"];
+          providerOptions?: AgentSessionConfig["providerOptions"];
           systemPrompt?: string;
           mcpServers?: AgentSessionConfig["mcpServers"];
         };
@@ -1250,7 +1245,7 @@ export class DaemonClient {
       return;
     }
 
-    const headers: Record<string, string> = { ...this.config.headers };
+    const headers: Record<string, string> = {};
     const password = normalizePassword(this.config.password);
     if (password) {
       headers.Authorization = `Bearer ${password}`;
@@ -2106,6 +2101,7 @@ export class DaemonClient {
       type: "fetch_agent_history_request",
       requestId: resolvedRequestId,
       ...(options?.filter ? { filter: options.filter } : {}),
+      ...(options?.search ? { search: options.search } : {}),
       ...(options?.sort ? { sort: options.sort } : {}),
       ...(options?.page ? { page: options.page } : {}),
     });
@@ -4331,6 +4327,54 @@ export class DaemonClient {
       responseType: "fs.file.write.response",
     });
     return payload.result;
+  }
+
+  async createFileEntry(input: {
+    cwd: string;
+    parentPath: string;
+    name: string;
+    kind: "file" | "directory";
+  }): Promise<CorrelatedResponsePayload<"fs.entry.create.response">> {
+    return this.sendNamespacedCorrelatedSessionRequest<"fs.entry.create.response">({
+      message: { type: "fs.entry.create.request", ...input },
+    });
+  }
+
+  async renameFileEntry(input: {
+    cwd: string;
+    path: string;
+    name: string;
+  }): Promise<CorrelatedResponsePayload<"fs.entry.rename.response">> {
+    return this.sendNamespacedCorrelatedSessionRequest<"fs.entry.rename.response">({
+      message: { type: "fs.entry.rename.request", ...input },
+    });
+  }
+
+  async duplicateFileEntry(input: {
+    cwd: string;
+    path: string;
+  }): Promise<CorrelatedResponsePayload<"fs.entry.duplicate.response">> {
+    return this.sendNamespacedCorrelatedSessionRequest<"fs.entry.duplicate.response">({
+      message: { type: "fs.entry.duplicate.request", ...input },
+    });
+  }
+
+  async deleteFileEntry(input: {
+    cwd: string;
+    path: string;
+  }): Promise<CorrelatedResponsePayload<"fs.entry.delete.response">> {
+    return this.sendNamespacedCorrelatedSessionRequest<"fs.entry.delete.response">({
+      message: { type: "fs.entry.delete.request", ...input },
+    });
+  }
+
+  async checkoutDiscardChanges(
+    cwd: string,
+    input: { paths: string[] },
+  ): Promise<CorrelatedResponsePayload<"checkout.discard_changes.response">> {
+    return this.sendNamespacedCorrelatedSessionRequest<"checkout.discard_changes.response">({
+      message: { type: "checkout.discard_changes.request", cwd, paths: input.paths },
+    });
   }
 
   async uploadFile(input: FileUploadInput): Promise<FileUploadResult> {
