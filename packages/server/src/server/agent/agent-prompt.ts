@@ -1,6 +1,11 @@
 import type { Logger } from "pino";
 
-import type { AgentEnqueueBehavior, AgentPromptInput, AgentRunOptions } from "./agent-sdk-types.js";
+import type {
+  AgentEnqueueBehavior,
+  AgentPermissionRequest,
+  AgentPromptInput,
+  AgentRunOptions,
+} from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
@@ -363,20 +368,49 @@ export interface SetupFinishNotificationParams {
   logger: Logger;
 }
 
+type FinishNotificationReason = "finished" | "errored" | "needs permission" | "was closed";
+
+const FINISH_NOTIFICATION_MESSAGE_LIMIT = 4000;
+
 interface FinishNotificationBodyInput {
   childAgentId: string;
   title: string;
-  reason: "finished" | "errored" | "needs permission";
+  reason: FinishNotificationReason;
   lastAssistantMessage: string | null;
+  permissionRequest?: AgentPermissionRequest;
 }
 
 function formatFinishNotificationBody(params: FinishNotificationBodyInput): string {
   const statusLine = `Agent ${params.childAgentId} (${params.title}) ${params.reason}.`;
-  const lastAssistantMessage = params.lastAssistantMessage?.trim();
-  if (!lastAssistantMessage) {
-    return statusLine;
+  const sections = [statusLine];
+  if (params.reason === "needs permission" && params.permissionRequest) {
+    sections.push(
+      "Respond with `respond_to_permission` using the `agentId` and `requestId` below.",
+      `<permission-request>\n${JSON.stringify(
+        {
+          agentId: params.childAgentId,
+          requestId: params.permissionRequest.id,
+          request: params.permissionRequest,
+        },
+        null,
+        2,
+      )}\n</permission-request>`,
+    );
   }
-  return `${statusLine}\n\n<agent-response>\n${lastAssistantMessage}\n</agent-response>`;
+  let lastAssistantMessage = params.lastAssistantMessage?.trim();
+  if (lastAssistantMessage) {
+    if (lastAssistantMessage.length > FINISH_NOTIFICATION_MESSAGE_LIMIT) {
+      const omitted = lastAssistantMessage.length - FINISH_NOTIFICATION_MESSAGE_LIMIT;
+      lastAssistantMessage = `${lastAssistantMessage.slice(0, FINISH_NOTIFICATION_MESSAGE_LIMIT)}\n[truncated ${omitted} chars; use get_agent_activity for the full response]`;
+    }
+    sections.push(`<agent-response>\n${lastAssistantMessage}\n</agent-response>`);
+  }
+  return sections.join("\n\n");
+}
+
+interface NotifySafelyOptions {
+  terminal?: boolean;
+  permissionRequest?: AgentPermissionRequest;
 }
 
 export function setupFinishNotification(params: SetupFinishNotificationParams): void {
@@ -389,16 +423,21 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
     logger,
   } = params;
   let hasSeenRunning = false;
-  let fired = false;
+  let stopped = false;
+  const notifiedPermissionRequestIds = new Set<string>();
   let unsubscribe: (() => void) | null = null;
+  let notificationQueue = Promise.resolve();
 
-  async function notify(reason: "finished" | "errored" | "needs permission"): Promise<void> {
-    if (fired) {
-      return;
-    }
-    fired = true;
+  function stop(): void {
+    if (stopped) return;
+    stopped = true;
     unsubscribe?.();
+  }
 
+  async function notify(
+    reason: FinishNotificationReason,
+    permissionRequest?: AgentPermissionRequest,
+  ): Promise<void> {
     const callerRecord = await agentStorage.get(callerAgentId);
     if (callerRecord?.archivedAt) {
       return;
@@ -415,6 +454,7 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
       title,
       reason,
       lastAssistantMessage,
+      permissionRequest,
     });
 
     await sendPromptToAgent({
@@ -427,24 +467,35 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
     });
   }
 
-  function notifySafely(reason: "finished" | "errored" | "needs permission"): void {
-    void notify(reason).catch((error) => {
-      logger.error(
-        { err: error, childAgentId, callerAgentId, reason },
-        "Failed to notify caller agent",
-      );
-    });
+  function notifySafely(reason: FinishNotificationReason, options: NotifySafelyOptions = {}): void {
+    if (stopped) return;
+    if (options.terminal ?? true) stop();
+    notificationQueue = notificationQueue
+      .then(() => notify(reason, options.permissionRequest))
+      .catch((error) => {
+        logger.error(
+          { err: error, childAgentId, callerAgentId, reason },
+          "Failed to notify caller agent",
+        );
+      });
   }
 
   unsubscribe = agentManager.subscribe(
     (event) => {
-      if (fired) {
+      if (stopped) {
         return;
       }
 
       if (event.type === "agent_state") {
+        for (const requestId of notifiedPermissionRequestIds) {
+          if (!event.agent.pendingPermissions.has(requestId)) {
+            notifiedPermissionRequestIds.delete(requestId);
+          }
+        }
         if (event.agent.lifecycle === "running") {
-          hasSeenRunning = true;
+          if (event.agent.pendingPermissions.size === 0) {
+            hasSeenRunning = true;
+          }
           return;
         }
         if (event.agent.lifecycle === "error") {
@@ -456,15 +507,33 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
           return;
         }
         if (event.agent.lifecycle === "closed") {
-          fired = true;
-          unsubscribe?.();
+          notifySafely("was closed");
           return;
         }
         return;
       }
 
       if (event.event.type === "permission_requested") {
-        notifySafely("needs permission");
+        // A permission pause is an intermediate checkpoint. Forget the run
+        // observed before it so an idle state during follow-up startup cannot
+        // masquerade as the final completion.
+        hasSeenRunning = false;
+        if (!notifiedPermissionRequestIds.has(event.event.request.id)) {
+          notifiedPermissionRequestIds.add(event.event.request.id);
+          notifySafely("needs permission", {
+            terminal: false,
+            permissionRequest: event.event.request,
+          });
+        }
+        return;
+      }
+
+      if (event.event.type === "permission_resolved") {
+        notifiedPermissionRequestIds.delete(event.event.requestId);
+        const childAgent = agentManager.getAgent(childAgentId);
+        if (childAgent?.pendingPermissions.size === 0) {
+          hasSeenRunning = childAgent.lifecycle === "running";
+        }
       }
     },
     { agentId: childAgentId, replayState: false },
@@ -477,7 +546,7 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
   // transitioning to "running").
   const childSnapshot = agentManager.getAgent(childAgentId);
   if (!childSnapshot || childSnapshot.lifecycle === "closed") {
-    unsubscribe();
+    stop();
     return;
   }
   if (childSnapshot.lifecycle === "running") {
