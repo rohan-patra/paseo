@@ -769,6 +769,46 @@ describe("PiRpcAgentSession", () => {
     expect(fakeSession.canceledExtensionUiRequests).toEqual([]);
   });
 
+  test("parses tree-styled Agents widgets", async () => {
+    const { pi, events } = await createSession();
+    pi.latestSession().emit({
+      type: "extension_ui_request",
+      id: "widget-tree",
+      method: "setWidget",
+      widgetKey: "background-work",
+      widgetLines: [
+        "Agents — 1 running · 1 completed",
+        "├ ↳ Alpha: inspect auth",
+        "│ claude-code-proxy/gpt-5.6-terra · medium · 1 turn · 00:02",
+        "│ ↳ read: src/auth.ts · 1s",
+        "├ ✓ Beta: run tests",
+        "  model/b · 1 turn · 00:02",
+        "└ … 3 more · /subagents for the full list",
+      ],
+      widgetPlacement: "aboveEditor",
+    });
+
+    expect(widgetToolCallNames(events.events)).toEqual(
+      expect.arrayContaining([expect.stringMatching(/^Alpha/), expect.stringMatching(/^Beta/)]),
+    );
+    const hidden = events
+      .timelineItems()
+      .find((item) => item.type === "tool_call" && item.callId.endsWith(":other"));
+    expect(hidden?.detail).toMatchObject({
+      type: "plain_text",
+      text: expect.stringContaining("3 more"),
+    });
+    const subagentDetails = events
+      .timelineItems()
+      .filter((item) => item.type === "tool_call" && item.callId.includes(":subagent:"))
+      .map((item) => item.detail);
+    expect(subagentDetails).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "plain_text", text: expect.stringMatching(/[├└│]/) }),
+      ]),
+    );
+  });
+
   test("tracks each background subagent independently without rows for internal turns", async () => {
     const { pi, events } = await createSession();
     const fakeSession = pi.latestSession();

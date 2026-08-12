@@ -1198,9 +1198,17 @@ interface BackgroundWorkRun {
   text: string;
 }
 
-const BACKGROUND_WORK_AGENT_ROW =
-  /^(↳|❔|✓|✗|∙|⊘)\s+([A-Za-z0-9][A-Za-z0-9_-]{0,63})(?::(?:\s|$).*)?$/;
-const BACKGROUND_WORK_SHELL_ROW = /^(↳|✓|✗|⊘)\s+shell\s+([A-Za-z0-9_-]+)\s+·(?:\s|$).*$/;
+const BACKGROUND_WORK_HEADER = /^(?:Background work|Agents\s+—\s+.+)$/;
+const BACKGROUND_WORK_TREE_PREFIX = "[├└]\\s+";
+const BACKGROUND_WORK_AGENT_ROW = new RegExp(
+  `^(?:${BACKGROUND_WORK_TREE_PREFIX})?(↳|❔|✓|✗|∙|⊘)\\s+([A-Za-z0-9][A-Za-z0-9_-]{0,63})(?::(?:\\s|$).*)?$`,
+);
+const BACKGROUND_WORK_SHELL_ROW = new RegExp(
+  `^(?:${BACKGROUND_WORK_TREE_PREFIX})?(↳|✓|✗|⊘)\\s+shell\\s+([A-Za-z0-9_-]+)\\s+·(?:\\s|$).*$`,
+);
+const BACKGROUND_WORK_CONTINUATION = /^(?:\s|│)/;
+const BACKGROUND_WORK_HIDDEN_ROW = /^…\s+\d+\s+more\s+(?:—|·)/;
+const BACKGROUND_WORK_TREE_DECORATION = /^(?:[├└]|│)\s/;
 
 function backgroundWorkStatus(glyph: string): BackgroundWorkStatus {
   switch (glyph) {
@@ -1263,7 +1271,7 @@ function parseBackgroundWorkRows(
     const text = stripAnsi(line).trimEnd();
     return text.trim() ? [text] : [];
   });
-  if (lines[0]?.trim() !== "Background work") return null;
+  if (!BACKGROUND_WORK_HEADER.test(lines[0]?.trim() ?? "")) return null;
 
   const rows: BackgroundWorkRow[] = [];
   const otherLines: string[] = [];
@@ -1275,7 +1283,7 @@ function parseBackgroundWorkRows(
     const match = agentMatch ?? shellMatch;
     const block = [line];
     index += 1;
-    while (index < lines.length && /^\s/.test(lines[index]!)) {
+    while (index < lines.length && BACKGROUND_WORK_CONTINUATION.test(lines[index]!)) {
       block.push(lines[index]!);
       index += 1;
     }
@@ -1283,8 +1291,10 @@ function parseBackgroundWorkRows(
       otherLines.push(...block);
       continue;
     }
-    const hiddenLines = block.filter((entry) => /^\s*…\s+\d+\s+more\s+—/.test(entry));
-    const rowLines = block.filter((entry) => !hiddenLines.includes(entry));
+    const hiddenLines = block.filter((entry) => BACKGROUND_WORK_HIDDEN_ROW.test(entry.trimStart()));
+    const rowLines = block
+      .filter((entry) => !hiddenLines.includes(entry))
+      .map((entry) => entry.replace(BACKGROUND_WORK_TREE_DECORATION, "  "));
     otherLines.push(...hiddenLines);
     const turnMatch = rowLines
       .slice(1)
