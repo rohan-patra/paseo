@@ -1198,21 +1198,22 @@ interface BackgroundWorkRun {
   text: string;
 }
 
-const BACKGROUND_WORK_HEADER = /^(?:Background work|Agents\s+—\s+.+)$/;
-const BACKGROUND_WORK_TREE_PREFIX = "[├└]\\s+";
+const BACKGROUND_WORK_HEADER = /^(?:Background work|[●○]\s+Agents\s+—\s+.+|Agents\s+—\s+.+)$/;
+const BACKGROUND_WORK_TREE_PREFIX = "[├└](?:─)?\\s+";
 const BACKGROUND_WORK_AGENT_ROW = new RegExp(
-  `^(?:${BACKGROUND_WORK_TREE_PREFIX})?(↳|❔|✓|✗|∙|⊘)\\s+([A-Za-z0-9][A-Za-z0-9_-]{0,63})(?::(?:\\s|$).*)?$`,
+  `^(?:${BACKGROUND_WORK_TREE_PREFIX})?(↳|❔|○|◐|◆|✓|✗|∙|⊘)\\s+([A-Za-z0-9][A-Za-z0-9_-]{0,63})(?::(?:\\s|$).*)?$`,
 );
 const BACKGROUND_WORK_SHELL_ROW = new RegExp(
-  `^(?:${BACKGROUND_WORK_TREE_PREFIX})?(↳|✓|✗|⊘)\\s+shell\\s+([A-Za-z0-9_-]+)\\s+·(?:\\s|$).*$`,
+  `^(?:${BACKGROUND_WORK_TREE_PREFIX})?(↳|○|◐|✓|✗|⊘)\\s+shell\\s+([A-Za-z0-9_-]+)\\s+·(?:\\s|$).*$`,
 );
 const BACKGROUND_WORK_CONTINUATION = /^(?:\s|│)/;
-const BACKGROUND_WORK_HIDDEN_ROW = /^…\s+\d+\s+more\s+(?:—|·)/;
-const BACKGROUND_WORK_TREE_DECORATION = /^(?:[├└]|│)\s/;
+const BACKGROUND_WORK_HIDDEN_ROW = /^(?:…\s+\d+\s+more\s+—.*|\+\d+\s+more(?:\s+·.*)?)$/;
+const BACKGROUND_WORK_TREE_DECORATION = /^(?:[├└]─?|│)\s*/;
 
 function backgroundWorkStatus(glyph: string): BackgroundWorkStatus {
   switch (glyph) {
     case "❔":
+    case "◆":
       return "waiting";
     case "✓":
       return "completed";
@@ -1288,7 +1289,7 @@ function parseBackgroundWorkRows(
       index += 1;
     }
     if (!match) {
-      otherLines.push(...block);
+      otherLines.push(...block.map((entry) => entry.replace(BACKGROUND_WORK_TREE_DECORATION, "")));
       continue;
     }
     const hiddenLines = block.filter((entry) => BACKGROUND_WORK_HIDDEN_ROW.test(entry.trimStart()));
@@ -1300,6 +1301,7 @@ function parseBackgroundWorkRows(
       .slice(1)
       .join(" ")
       .match(/\b(\d+)\s+turns?\b/);
+    const glyph = match[1]!;
     const id = match[2]!;
     const kind = shellMatch ? "shell" : "subagent";
     const occurrence = kind === "shell" ? (shellOccurrences.get(id) ?? 0) + 1 : 1;
@@ -1310,7 +1312,7 @@ function parseBackgroundWorkRows(
       name: backgroundWorkDisplayName(id, kind, rowLines),
       kind,
       occurrence,
-      status: backgroundWorkStatus(match[1]!),
+      status: backgroundWorkStatus(glyph),
       ...(turnMatch ? { turnCount: Number(turnMatch[1]) } : {}),
       lines: rowLines,
     });

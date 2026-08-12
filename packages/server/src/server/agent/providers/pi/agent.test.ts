@@ -777,13 +777,13 @@ describe("PiRpcAgentSession", () => {
       method: "setWidget",
       widgetKey: "background-work",
       widgetLines: [
-        "Agents — 1 running · 1 completed",
-        "├ ↳ Alpha: inspect auth",
-        "│ claude-code-proxy/gpt-5.6-terra · medium · 1 turn · 00:02",
-        "│ ↳ read: src/auth.ts · 1s",
-        "├ ✓ Beta: run tests",
-        "  model/b · 1 turn · 00:02",
-        "└ … 3 more · /subagents for the full list",
+        "● Agents — 1 running · 1 completed",
+        "├─ ◐ Alpha: inspect auth",
+        "│  claude-code-proxy/gpt-5.6-terra · medium · 1 turn · 00:02",
+        "│  ↳ read: src/auth.ts · 1s",
+        "├─ ✓ Beta: run tests",
+        "│  model/b · 1 turn · 00:02",
+        "└─ +3 more · /subagents",
       ],
       widgetPlacement: "aboveEditor",
     });
@@ -796,12 +796,81 @@ describe("PiRpcAgentSession", () => {
       .find((item) => item.type === "tool_call" && item.callId.endsWith(":other"));
     expect(hidden?.detail).toMatchObject({
       type: "plain_text",
-      text: expect.stringContaining("3 more"),
+      text: "+3 more · /subagents",
     });
     const subagentDetails = events
       .timelineItems()
       .filter((item) => item.type === "tool_call" && item.callId.includes(":subagent:"))
       .map((item) => item.detail);
+    expect(subagentDetails).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "plain_text", text: expect.stringMatching(/[├└│]/) }),
+      ]),
+    );
+  });
+
+  test("keeps parsing the previous Agents header and starting rows", async () => {
+    const { pi, events } = await createSession();
+    pi.latestSession().emit({
+      type: "extension_ui_request",
+      id: "widget-previous-agents",
+      method: "setWidget",
+      widgetKey: "background-work",
+      widgetLines: [
+        "Agents — 1 running",
+        "├ ○ Boot: start",
+        "  model/a · medium · 1 turn · 00:02",
+        "├─ ◆ Blocked: answer question",
+        "  model/b · medium · 1 turn · 00:02",
+      ],
+      widgetPlacement: "aboveEditor",
+    });
+
+    expect(widgetToolCallNames(events.events)).toEqual(
+      expect.arrayContaining([expect.stringMatching(/^Boot/), expect.stringMatching(/^Blocked/)]),
+    );
+    expect(events.timelineItems()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            backgroundWorkId: "Blocked",
+            backgroundWorkStatus: "waiting",
+          }),
+        }),
+      ]),
+    );
+  });
+
+  test("keeps parsing legacy tree-styled Background work widgets", async () => {
+    const { pi, events } = await createSession();
+    pi.latestSession().emit({
+      type: "extension_ui_request",
+      id: "widget-legacy-tree",
+      method: "setWidget",
+      widgetKey: "background-work",
+      widgetLines: [
+        "Background work",
+        "├ ↳ Alpha: inspect auth",
+        "│  claude-code-proxy/gpt-5.6-terra · medium · 1 turn · 00:02",
+        "├ ✓ Beta: run tests",
+        "│  model/b · medium · 1 turn · 00:02",
+        "└ ❔ Gamma: answer question",
+        "   model/c · medium · 1 turn · 00:02",
+        "  … 3 more — /subagents for the full list",
+      ],
+      widgetPlacement: "aboveEditor",
+    });
+
+    const subagentDetails = events
+      .timelineItems()
+      .filter((item) => item.type === "tool_call" && item.callId.includes(":subagent:"))
+      .map((item) => item.detail);
+    expect(subagentDetails).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "plain_text", text: expect.stringContaining("✓ Beta") }),
+        expect.objectContaining({ type: "plain_text", text: expect.stringContaining("❔ Gamma") }),
+      ]),
+    );
     expect(subagentDetails).not.toEqual(
       expect.arrayContaining([
         expect.objectContaining({ type: "plain_text", text: expect.stringMatching(/[├└│]/) }),
