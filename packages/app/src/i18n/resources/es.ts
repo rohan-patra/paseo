@@ -1,4 +1,5 @@
 import type { TranslationResources } from "./en";
+import { pluginSettings } from "./plugin-settings";
 
 export const es: TranslationResources = {
   common: {
@@ -527,6 +528,8 @@ export const es: TranslationResources = {
         screenshotCopied: "Captura copiada al portapapeles",
         elementCopied: "Elemento copiado al portapapeles",
         screenshotFailed: "No se pudo copiar la captura",
+        selectorLoading: "Espera a que la página termine de cargar",
+        selectorFailed: "No se pudo iniciar el selector de elementos",
       },
       annotate: {
         title: "Anotar elemento",
@@ -619,6 +622,7 @@ export const es: TranslationResources = {
         reloadingAgent: "Agente de recarga...",
         reloadedAgent: "Agente recargado",
         failedToReloadAgent: "No se pudo recargar el agente",
+        failedToCloseAgent: "No se pudo cerrar el agente",
       },
       confirmations: {
         unsavedTitle: "Cambios sin guardar",
@@ -1657,6 +1661,7 @@ export const es: TranslationResources = {
     archiveTooltip: "Subagente de archivo",
     archiveFinishedAction: "Archivar subagentes finalizados",
     archiveFinishedTooltip: "Archivar finalizados",
+    archiveFinishedRetry: "Reintentar ({{failed}}/{{total}})",
   },
   panels: {
     draft: {
@@ -1825,8 +1830,10 @@ export const es: TranslationResources = {
       providers: "Proveedores",
       usage: "Uso",
       terminals: "Terminals",
+      plugins: "Plugins",
       host: "Resumen",
     },
+    plugins: pluginSettings.es,
     metadataGeneration: {
       title: "Generación de metadatos",
       description:
@@ -2459,6 +2466,9 @@ export const es: TranslationResources = {
           "Consulte los documentos para obtener más detalles y las variables de entorno disponibles para estos comandos.",
         setup: "Configuración",
         setupAccessibility: "Comandos de configuración del árbol de trabajo",
+        uncommittedTitle: "Confirma los cambios de paseo.json",
+        uncommittedDescription:
+          "Los árboles de trabajo nuevos usan el script de configuración de la rama base que selecciones.",
         teardown: "Demoler",
         teardownAccessibility: "Comandos de desmontaje del árbol de trabajo",
       },

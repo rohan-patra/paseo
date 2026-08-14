@@ -28,6 +28,7 @@ export interface PiRuntimeLaunch {
 
 export interface PiStartSessionInput {
   cwd: string;
+  signal?: AbortSignal;
   env?: Record<string, string>;
   protocolMode?: "rpc" | "rpc-ui";
   model?: string;

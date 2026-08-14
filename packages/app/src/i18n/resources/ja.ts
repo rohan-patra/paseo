@@ -1,4 +1,5 @@
 import type { TranslationResources } from "./en";
+import { pluginSettings } from "./plugin-settings";
 
 export const ja: TranslationResources = {
   common: {
@@ -527,6 +528,8 @@ export const ja: TranslationResources = {
         screenshotCopied: "スクリーンショットをクリップボードにコピーしました",
         elementCopied: "要素をクリップボードにコピーしました",
         screenshotFailed: "スクリーンショットをコピーできませんでした",
+        selectorLoading: "ページの読み込みが完了するまでお待ちください",
+        selectorFailed: "要素セレクターを開始できませんでした",
       },
       annotate: {
         title: "要素に注釈を付ける",
@@ -619,6 +622,7 @@ export const ja: TranslationResources = {
         reloadingAgent: "エージェントを再読み込み中...",
         reloadedAgent: "エージェントを再読み込みしました",
         failedToReloadAgent: "エージェントの再読み込みに失敗しました",
+        failedToCloseAgent: "エージェントを閉じられませんでした",
       },
       confirmations: {
         unsavedTitle: "未保存の変更",
@@ -1630,6 +1634,7 @@ export const ja: TranslationResources = {
     archiveTooltip: "サブエージェントをアーカイブ",
     archiveFinishedAction: "完了したサブエージェントをアーカイブ",
     archiveFinishedTooltip: "完了した項目をアーカイブ",
+    archiveFinishedRetry: "再試行 ({{failed}}/{{total}})",
   },
   panels: {
     draft: {
@@ -1798,8 +1803,10 @@ export const ja: TranslationResources = {
       providers: "プロバイダー",
       usage: "使用状況",
       terminals: "ターミナル",
+      plugins: "プラグイン",
       host: "概要",
     },
+    plugins: pluginSettings.ja,
     metadataGeneration: {
       title: "メタデータ生成",
       description:
@@ -2429,6 +2436,9 @@ export const ja: TranslationResources = {
           "これらのコマンドで使用可能な詳細と環境変数についてはドキュメントを参照してください",
         setup: "セットアップ",
         setupAccessibility: "ワークツリーセットアップコマンド",
+        uncommittedTitle: "paseo.json の変更をコミットしてください",
+        uncommittedDescription:
+          "新しいワークツリーでは、選択したベースブランチのセットアップスクリプトが使われます。",
         teardown: "削除時",
         teardownAccessibility: "ワークツリー削除時のコマンド",
       },

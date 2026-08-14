@@ -173,6 +173,21 @@ const MutableRelayConfigSchema = z
     enabled: z.boolean(),
   })
   .passthrough();
+
+export const PluginIdSchema = z.string().regex(/^[a-z][a-z0-9-]*$/);
+
+export const DirectoryPluginSourceSchema = z
+  .object({
+    source: z.literal("directory"),
+    path: z.string().min(1),
+    enabled: z.boolean().optional(),
+  })
+  .strict();
+
+export const PluginSourceSchema = z.discriminatedUnion("source", [DirectoryPluginSourceSchema]);
+
+export type PluginSource = z.infer<typeof PluginSourceSchema>;
+
 export const MutableDaemonConfigSchema = z
   .object({
     // COMPAT(relayConfig): added in v0.2.6, remove after 2027-01-31 when old daemons are unsupported.
@@ -190,6 +205,8 @@ export const MutableDaemonConfigSchema = z
     appendSystemPrompt: z.string().default(""),
     terminalProfiles: z.array(TerminalProfileSchema).optional(),
     agentProfiles: z.array(AgentProfileSchema).optional(),
+    pluginsEnabled: z.boolean().optional(),
+    plugins: z.record(PluginIdSchema, PluginSourceSchema).optional(),
   })
   .passthrough();
 
@@ -208,6 +225,8 @@ export const MutableDaemonConfigPatchSchema = z
     appendSystemPrompt: z.string().optional(),
     terminalProfiles: z.array(TerminalProfileSchema).optional(),
     agentProfiles: z.array(AgentProfileSchema).optional(),
+    pluginsEnabled: z.boolean().optional(),
+    plugins: z.record(PluginIdSchema, PluginSourceSchema).optional(),
   })
   .partial()
   .passthrough();
@@ -1004,6 +1023,16 @@ export const ForgeIssueAttachmentSchema = z.object({
   projectPath: z.string().optional(),
 });
 
+export const ExternalResourceAttachmentMetadataSchema = z.object({
+  provider: z.string(),
+  providerLabel: z.string(),
+  resourceType: z.string(),
+  id: z.string(),
+  identifier: z.string(),
+  title: z.string(),
+  url: z.string(),
+});
+
 export const TextAttachmentSchema = z
   .object({
     type: z.literal("text"),
@@ -1011,6 +1040,7 @@ export const TextAttachmentSchema = z
     contextKind: z.string().optional(),
     title: z.string().nullable().optional(),
     text: z.string(),
+    externalResource: ExternalResourceAttachmentMetadataSchema.optional(),
   })
   .transform(({ contextKind, ...attachment }) => ({
     ...attachment,
@@ -1105,6 +1135,26 @@ export const SendAgentMessageSchema = z.object({
 // Agent RPCs (requestId-correlated)
 // ============================================================================
 
+const DirectorySyncRequestSchema = z.object({
+  generation: z.string().optional(),
+  afterSeq: z.number().int().nonnegative().optional(),
+});
+
+const DirectorySyncRemovalSchema = z.object({
+  id: z.string(),
+  seq: z.number().int().positive(),
+});
+
+const DirectorySyncMetadataSchema = z.object({
+  generation: z.string(),
+  headSeq: z.number().int().nonnegative(),
+  mode: z.enum(["snapshot", "changes"]),
+  reason: z
+    .enum(["no_cursor", "generation_changed", "cursor_expired", "changes_too_large"])
+    .optional(),
+  removals: z.array(DirectorySyncRemovalSchema),
+});
+
 export const FetchAgentsRequestMessageSchema = z.object({
   type: z.literal("fetch_agents_request"),
   requestId: z.string(),
@@ -1129,6 +1179,8 @@ export const FetchAgentsRequestMessageSchema = z.object({
       subscriptionId: z.string().optional(),
     })
     .optional(),
+  // COMPAT(directorySync): added in v0.3.x, remove optional after 2027-02-12.
+  sync: DirectorySyncRequestSchema.optional(),
 });
 
 const WorkspaceStateBucketSchema = z.enum([
@@ -1169,11 +1221,15 @@ export const FetchWorkspacesRequestMessageSchema = z.object({
       subscriptionId: z.string().optional(),
     })
     .optional(),
+  // COMPAT(directorySync): added in v0.3.x, remove optional after 2027-02-12.
+  sync: DirectorySyncRequestSchema.optional(),
 });
 
 export const ProjectListRequestMessageSchema = z.object({
   type: z.literal("project.list.request"),
   requestId: z.string(),
+  // COMPAT(directorySync): added in v0.3.x, remove optional after 2027-02-12.
+  sync: DirectorySyncRequestSchema.optional(),
 });
 
 export const FetchAgentHistoryRequestMessageSchema = z.object({
@@ -1264,6 +1320,46 @@ export const HubManagementDaemonDisconnectRequestSchema = z.object({
 export const DiagnosticsRequestSchema = z.object({
   type: z.literal("diagnostics.request"),
   requestId: z.string(),
+});
+
+export const PluginCatalogGetRequestSchema = z.object({
+  type: z.literal("plugin.catalog.get.request"),
+  requestId: z.string(),
+});
+
+export const PluginListRequestSchema = z.object({
+  type: z.literal("plugin.list.request"),
+  requestId: z.string(),
+});
+
+export const PluginDirectoryInstallRequestSchema = z.object({
+  type: z.literal("plugin.directory.install.request"),
+  requestId: z.string(),
+  path: z.string().min(1),
+  id: PluginIdSchema.optional(),
+});
+
+export const PluginDirectoryInspectRequestSchema = z.object({
+  type: z.literal("plugin.directory.inspect.request"),
+  requestId: z.string(),
+  path: z.string().min(1),
+});
+
+function pluginIdRequest<const Type extends string>(type: Type) {
+  return z.object({ type: z.literal(type), requestId: z.string(), pluginId: PluginIdSchema });
+}
+
+export const PluginReloadRequestSchema = pluginIdRequest("plugin.reload.request");
+export const PluginEnableRequestSchema = pluginIdRequest("plugin.enable.request");
+export const PluginDisableRequestSchema = pluginIdRequest("plugin.disable.request");
+export const PluginRemoveRequestSchema = pluginIdRequest("plugin.remove.request");
+
+export const PluginRpcInvokeRequestSchema = z.object({
+  type: z.literal("plugin.rpc.invoke.request"),
+  requestId: z.string(),
+  pluginId: PluginIdSchema,
+  method: z.string().min(1),
+  input: z.unknown(),
 });
 
 export const GetDaemonConfigRequestMessageSchema = z.object({
@@ -2735,6 +2831,15 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   HubManagementDaemonGetStatusRequestSchema,
   HubManagementDaemonDisconnectRequestSchema,
   DiagnosticsRequestSchema,
+  PluginCatalogGetRequestSchema,
+  PluginListRequestSchema,
+  PluginDirectoryInstallRequestSchema,
+  PluginDirectoryInspectRequestSchema,
+  PluginReloadRequestSchema,
+  PluginEnableRequestSchema,
+  PluginDisableRequestSchema,
+  PluginRemoveRequestSchema,
+  PluginRpcInvokeRequestSchema,
   GetDaemonConfigRequestMessageSchema,
   SetDaemonConfigRequestMessageSchema,
   ReadProjectConfigRequestMessageSchema,
@@ -3039,6 +3144,8 @@ export const ServerInfoStatusPayloadSchema = z
         providersSnapshot: z.boolean().optional(),
         // COMPAT(providersSnapshotCwd): added in v0.3.2, remove gate after 2027-02-10.
         providersSnapshotCwd: z.boolean().optional(),
+        // COMPAT(directorySync): added in v0.3.x, remove gate after 2027-02-12.
+        directorySync: z.boolean().optional(),
         // COMPAT(checkoutForgeSetAutoMerge): added in v0.1.106, remove old
         // checkoutGithubSetAutoMerge fallback after 2026-12-28.
         checkoutForgeSetAutoMerge: z.boolean().optional(),
@@ -3055,6 +3162,10 @@ export const ServerInfoStatusPayloadSchema = z
         relayConfig: z.boolean().optional(),
         // COMPAT(pushTokenRevocation): added in v0.3.2, remove gate after 2027-02-10.
         pushTokenRevocation: z.boolean().optional(),
+        // COMPAT(plugins): added in v0.3.0, remove gate after 2027-08-07.
+        plugins: z.boolean().optional(),
+        // COMPAT(pluginManagement): added in v0.4.0, remove gate after 2027-08-14.
+        pluginManagement: z.boolean().optional(),
         // COMPAT(terminalRestoreModes): added in v0.1.81, remove gate after 2026-11-23.
         "terminal-restore-modes": z.boolean().optional(),
         // COMPAT(terminalInputModeReplay): added in v0.2.6, remove gate after 2027-02-02.
@@ -3241,6 +3352,11 @@ export const DaemonConfigChangedStatusPayloadSchema = z
   })
   .passthrough();
 
+export const PluginCatalogChangedStatusPayloadSchema = z.object({
+  status: z.literal("plugin_catalog_changed"),
+  pluginId: PluginIdSchema,
+});
+
 export const KnownStatusPayloadSchema = z.discriminatedUnion("status", [
   AgentCreatedStatusPayloadSchema,
   AgentCreateFailedStatusPayloadSchema,
@@ -3249,6 +3365,7 @@ export const KnownStatusPayloadSchema = z.discriminatedUnion("status", [
   ShutdownRequestedStatusPayloadSchema,
   RestartRequestedStatusPayloadSchema,
   DaemonConfigChangedStatusPayloadSchema,
+  PluginCatalogChangedStatusPayloadSchema,
 ]);
 
 export type KnownStatusPayload = z.infer<typeof KnownStatusPayloadSchema>;
@@ -3458,6 +3575,8 @@ export const WorkspaceDescriptorPayloadSchema = z
     // Old daemons omit it; absent means the client falls back to GitHub.
     forge: z.string().optional(),
     project: ProjectPlacementPayloadSchema.optional(),
+    // COMPAT(directorySync): sequence of this latest directory projection.
+    syncSeq: z.number().int().positive().optional(),
   })
   .transform((workspace) => ({
     ...workspace,
@@ -3471,10 +3590,14 @@ export const AgentUpdateMessageSchema = z.object({
       kind: z.literal("upsert"),
       agent: AgentSnapshotPayloadSchema,
       project: ProjectPlacementPayloadSchema.nullable().optional(),
+      generation: z.string().optional(),
+      seq: z.number().int().positive().optional(),
     }),
     z.object({
       kind: z.literal("remove"),
       agentId: z.string(),
+      generation: z.string().optional(),
+      seq: z.number().int().positive().optional(),
     }),
   ]),
 });
@@ -3532,6 +3655,8 @@ const AgentDirectoryResponseEntrySchema = z.object({
   // anyway; sending it keeps the client from re-deriving a second opinion that
   // could disagree with the ranking it is explaining.
   searchMatches: z.array(AgentSearchMatchSchema).optional(),
+  // COMPAT(directorySync): sequence of this latest directory projection.
+  syncSeq: z.number().int().positive().optional(),
 });
 
 const AgentDirectoryPageInfoSchema = z.object({
@@ -3547,6 +3672,7 @@ export const FetchAgentsResponseMessageSchema = z.object({
     subscriptionId: z.string().nullable().optional(),
     entries: z.array(AgentDirectoryResponseEntrySchema),
     pageInfo: AgentDirectoryPageInfoSchema,
+    sync: DirectorySyncMetadataSchema.optional(),
   }),
 });
 
@@ -3584,8 +3710,14 @@ export const WorkspaceProjectDescriptorPayloadSchema = z.object({
   projectCustomName: z.string().nullable().optional(),
   // COMPAT(projectCustomIcon): added in v0.2.0, remove after 2027-01-20.
   projectCustomIconRevision: z.string().nullable().optional(),
+  // Fingerprints the effective icon, including automatic discovery and the
+  // absence of an icon. Clients may persist icon results against this value.
+  // COMPAT(projectIconCache): added in v0.2.7, remove optional after 2027-02-12.
+  projectIconRevision: z.string().optional(),
   projectRootPath: z.string(),
   projectKind: z.enum(["git", "non_git", "directory"]),
+  // COMPAT(directorySync): sequence of this latest directory projection.
+  syncSeq: z.number().int().positive().optional(),
 });
 
 export const FetchWorkspacesResponseMessageSchema = z.object({
@@ -3603,6 +3735,7 @@ export const FetchWorkspacesResponseMessageSchema = z.object({
       prevCursor: z.string().nullable(),
       hasMore: z.boolean(),
     }),
+    sync: DirectorySyncMetadataSchema.optional(),
   }),
 });
 
@@ -3612,6 +3745,8 @@ export const WorkspaceUpdateMessageSchema = z.object({
     z.object({
       kind: z.literal("upsert"),
       workspace: WorkspaceDescriptorPayloadSchema,
+      generation: z.string().optional(),
+      seq: z.number().int().positive().optional(),
     }),
     z.object({
       kind: z.literal("remove"),
@@ -3626,6 +3761,8 @@ export const WorkspaceUpdateMessageSchema = z.object({
       // Project removal is represented on the existing workspace update channel
       // so old clients can still parse the message and ignore the extra field.
       removedProjectId: z.string().optional(),
+      generation: z.string().optional(),
+      seq: z.number().int().positive().optional(),
     }),
   ]),
 });
@@ -3633,8 +3770,18 @@ export const WorkspaceUpdateMessageSchema = z.object({
 export const ProjectUpdateMessageSchema = z.object({
   type: z.literal("project.update"),
   payload: z.discriminatedUnion("kind", [
-    z.object({ kind: z.literal("upsert"), project: WorkspaceProjectDescriptorPayloadSchema }),
-    z.object({ kind: z.literal("remove"), projectId: z.string() }),
+    z.object({
+      kind: z.literal("upsert"),
+      project: WorkspaceProjectDescriptorPayloadSchema,
+      generation: z.string().optional(),
+      seq: z.number().int().positive().optional(),
+    }),
+    z.object({
+      kind: z.literal("remove"),
+      projectId: z.string(),
+      generation: z.string().optional(),
+      seq: z.number().int().positive().optional(),
+    }),
   ]),
 });
 
@@ -3643,6 +3790,7 @@ export const ProjectListResponseMessageSchema = z.object({
   payload: z.object({
     requestId: z.string(),
     projects: z.array(WorkspaceProjectDescriptorPayloadSchema),
+    sync: DirectorySyncMetadataSchema.optional(),
   }),
 });
 
@@ -4220,6 +4368,7 @@ export const ReadProjectConfigResponseMessageSchema = z.object({
       ok: z.literal(true),
       config: PaseoConfigRawSchema.nullable(),
       revision: PaseoConfigRevisionSchema.nullable(),
+      hasUncommittedWorktreeSetupChanges: z.boolean().optional(),
     }),
     z.object({
       requestId: z.string(),
@@ -4241,6 +4390,7 @@ export const WriteProjectConfigResponseMessageSchema = z.object({
       ok: z.literal(true),
       config: PaseoConfigRawSchema,
       revision: PaseoConfigRevisionSchema,
+      hasUncommittedWorktreeSetupChanges: z.boolean().optional(),
     }),
     z.object({
       requestId: z.string(),
@@ -5647,6 +5797,69 @@ export function parseHubExecutionOutboundMessage(value: unknown): HubExecutionOu
 
 export type DaemonUpdateProgressMessage = z.infer<typeof DaemonUpdateProgressMessageSchema>;
 
+export const PluginCatalogGetResponseSchema = z.object({
+  type: z.literal("plugin.catalog.get.response"),
+  payload: z.object({
+    requestId: z.string(),
+    plugins: z.array(
+      z.object({
+        id: PluginIdSchema,
+        clientBundle: z.string(),
+      }),
+    ),
+  }),
+});
+
+export const PluginStatusSchema = z.enum(["running", "disabled", "failed"]);
+export type PluginStatus = z.infer<typeof PluginStatusSchema>;
+
+export const PluginListItemSchema = z.object({
+  id: PluginIdSchema,
+  path: z.string(),
+  enabled: z.boolean(),
+  status: PluginStatusSchema,
+  error: z.string().optional(),
+});
+export type PluginListItem = z.infer<typeof PluginListItemSchema>;
+
+export const PluginListResponseSchema = z.object({
+  type: z.literal("plugin.list.response"),
+  payload: z.object({ requestId: z.string(), plugins: z.array(PluginListItemSchema) }),
+});
+
+export const PluginDirectoryInstallResponseSchema = z.object({
+  type: z.literal("plugin.directory.install.response"),
+  payload: z.object({ requestId: z.string(), plugin: PluginListItemSchema }),
+});
+
+export const PluginDirectoryInspectResponseSchema = z.object({
+  type: z.literal("plugin.directory.inspect.response"),
+  payload: z.object({ requestId: z.string(), id: PluginIdSchema }),
+});
+
+function pluginActionResponse<const Type extends string>(type: Type) {
+  return z.object({
+    type: z.literal(type),
+    payload: z.object({ requestId: z.string(), plugin: PluginListItemSchema }),
+  });
+}
+
+export const PluginReloadResponseSchema = pluginActionResponse("plugin.reload.response");
+export const PluginEnableResponseSchema = pluginActionResponse("plugin.enable.response");
+export const PluginDisableResponseSchema = pluginActionResponse("plugin.disable.response");
+export const PluginRemoveResponseSchema = z.object({
+  type: z.literal("plugin.remove.response"),
+  payload: z.object({ requestId: z.string() }).strict(),
+});
+
+export const PluginRpcInvokeResponseSchema = z.object({
+  type: z.literal("plugin.rpc.invoke.response"),
+  payload: z.object({
+    requestId: z.string(),
+    output: z.unknown(),
+  }),
+});
+
 export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   HubExecutionAgentCreateResponseSchema,
   HubExecutionAgentValidateResponseSchema,
@@ -5654,6 +5867,15 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   HubExecutionAgentUpdateSchema,
   HubExecutionAgentStreamSchema,
   BrowserAutomationExecuteRequestSchema,
+  PluginCatalogGetResponseSchema,
+  PluginListResponseSchema,
+  PluginDirectoryInstallResponseSchema,
+  PluginDirectoryInspectResponseSchema,
+  PluginReloadResponseSchema,
+  PluginEnableResponseSchema,
+  PluginDisableResponseSchema,
+  PluginRemoveResponseSchema,
+  PluginRpcInvokeResponseSchema,
   ActivityLogMessageSchema,
   AssistantChunkMessageSchema,
   AudioOutputMessageSchema,

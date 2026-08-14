@@ -131,9 +131,11 @@ desktop-only environment inherited by terminals opened inside Paseo from couplin
 a new worktree instance to the parent desktop instance's profile or single-instance
 lock.
 
-Electron remains in the desktop dev runner's process group. Closing or stopping the
-workspace-script terminal must terminate Electron with Metro; detaching Electron
-leaves an orphan holding the worktree's single-instance lock and broken output pipes.
+The desktop workspace script `exec`s the dev runner so the terminal owns the runner
+PID. Terminal shutdown reaches the runner as `SIGHUP`; the runner stops Metro and
+asks Electron to quit through its normal app lifecycle. Do not add an npm wrapper or
+detach Electron: either change leaves an orphan holding the worktree's single-instance
+lock and broken output pipes.
 
 With desktop dev running, verify the real BrowserWindow, titlebar clearance, fullscreen
 transition, and 751-pixel settings split with:
@@ -295,9 +297,7 @@ another remote fails closed until the worktree records an explicit local target.
 the optional field and retain the previous local-first behavior; older worktree metadata without the
 exact ref also resolves through its stored branch name.
 
-Worktrees inherit committed Git state. Before lifecycle setup, Paseo copies the source checkout's
-`paseo.json` over the worktree copy so saved Project Settings apply without a commit. Other
-uncommitted source-checkout changes are not copied.
+Worktrees inherit committed Git state only; uncommitted source-checkout changes are not copied.
 
 ## paseo.json service scripts
 

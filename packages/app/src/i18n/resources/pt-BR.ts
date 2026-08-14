@@ -1,4 +1,5 @@
 import type { TranslationResources } from "./en";
+import { pluginSettings } from "./plugin-settings";
 
 export const ptBR: TranslationResources = {
   common: {
@@ -527,6 +528,8 @@ export const ptBR: TranslationResources = {
         screenshotCopied: "Captura copiada para a área de transferência",
         elementCopied: "Elemento copiado para a área de transferência",
         screenshotFailed: "Não foi possível copiar a captura",
+        selectorLoading: "Aguarde o carregamento da página terminar",
+        selectorFailed: "Não foi possível iniciar o seletor de elemento",
       },
       annotate: {
         title: "Anotar elemento",
@@ -618,6 +621,7 @@ export const ptBR: TranslationResources = {
         reloadingAgent: "Recarregando agente...",
         reloadedAgent: "Agente recarregado",
         failedToReloadAgent: "Falha ao recarregar agente",
+        failedToCloseAgent: "Falha ao fechar agente",
       },
       confirmations: {
         unsavedTitle: "Alterações não salvas",
@@ -1643,6 +1647,7 @@ export const ptBR: TranslationResources = {
     archiveTooltip: "Arquivar subagente",
     archiveFinishedAction: "Arquivar subagentes concluídos",
     archiveFinishedTooltip: "Arquivar concluídos",
+    archiveFinishedRetry: "Tentar novamente ({{failed}}/{{total}})",
   },
   panels: {
     draft: {
@@ -1811,8 +1816,10 @@ export const ptBR: TranslationResources = {
       providers: "Provedores",
       usage: "Uso",
       terminals: "Terminais",
+      plugins: "Plugins",
       host: "Visão geral",
     },
+    plugins: pluginSettings["pt-BR"],
     metadataGeneration: {
       title: "Geração de metadados",
       description:
@@ -2444,6 +2451,9 @@ export const ptBR: TranslationResources = {
           "Veja a documentação para mais detalhes e as variáveis de ambiente disponíveis para estes comandos",
         setup: "Configuração",
         setupAccessibility: "Comandos de configuração do worktree",
+        uncommittedTitle: "Faça commit das alterações no paseo.json",
+        uncommittedDescription:
+          "Novos worktrees usam o script de configuração do branch base selecionado.",
         teardown: "Desmontagem",
         teardownAccessibility: "Comandos de desmontagem do worktree",
       },
