@@ -1,16 +1,22 @@
 import type { QueryClient } from "@tanstack/react-query";
 import type {
   PluginAttachmentSourceContribution,
+  PluginCommandCenterItemContribution,
   PluginSidebarContribution,
   PluginSurfaceContribution,
-} from "@paseo/plugin";
+  PluginThemeContribution,
+  PluginWorkspacePanelContribution,
+} from "@getpaseo/plugin";
 
 export interface EvaluatedPlugin {
   id: string;
   cleanup: () => void;
   surfaces: PluginSurfaceContribution[];
   sidebarItems: PluginSidebarContribution[];
+  workspacePanels: PluginWorkspacePanelContribution[];
+  commandCenterItems: PluginCommandCenterItemContribution[];
   attachmentSources: PluginAttachmentSourceContribution[];
+  themes: PluginThemeContribution[];
 }
 
 export interface InstalledPlugin extends EvaluatedPlugin {
@@ -21,6 +27,9 @@ export interface InstalledPlugin extends EvaluatedPlugin {
 
 export type {
   PluginAttachmentSourceContribution,
+  PluginCommandCenterItemContribution,
   PluginSidebarContribution,
   PluginSurfaceContribution,
+  PluginThemeContribution,
+  PluginWorkspacePanelContribution,
 };

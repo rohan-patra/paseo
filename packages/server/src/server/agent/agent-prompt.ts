@@ -1,7 +1,6 @@
 import type { Logger } from "pino";
 
 import type {
-  AgentEnqueueBehavior,
   AgentPermissionRequest,
   AgentPromptInput,
   AgentRunOptions,
@@ -10,6 +9,7 @@ import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
 import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
+import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
 
 export type AgentUnarchiveController = Pick<AgentManager, "notifyAgentState" | "unarchiveSnapshot">;
 
@@ -19,31 +19,63 @@ export type AgentRunController = Pick<
   | "tryRunOutOfBand"
   | "hasInFlightRun"
   | "replaceAgentRun"
+  | "steerOrReplaceActiveTurn"
   | "streamAgent"
-  | "enqueueAgentPrompt"
 >;
-
-/**
- * How to deliver a prompt when the agent already has an in-flight run and the
- * session supports message queueing (`capabilities.supportsMessageQueue`):
- * - "steer": fold into the active turn.
- * - "followUp": run after the active turn completes.
- * - "never" (default): skip queueing and preserve interrupt-and-replace.
- * Providers without queue support are unaffected by this option.
- */
-export type StartAgentRunEnqueueBehavior = AgentEnqueueBehavior | "never";
 
 export interface StartAgentRunOptions {
   replaceRunning?: boolean;
+  activeTurnBehavior?: ActiveTurnBehavior;
   runOptions?: AgentRunOptions;
-  enqueueBehavior?: StartAgentRunEnqueueBehavior;
+  /** Ask the provider to deny permissions blocking this steer. */
+  clearPendingPermissions?: boolean;
 }
 
-export interface StartAgentRunResult {
-  outOfBand: boolean;
-  /** True when the prompt was queued onto the active run instead of starting one. */
-  enqueued: boolean;
-  delivery?: AgentEnqueueBehavior;
+export type PromptDispatchDisposition = "out_of_band" | "steered" | "turn_started";
+
+async function steerOrReplaceActiveRun(
+  agentManager: AgentRunController,
+  agentId: string,
+  prompt: AgentPromptInput,
+  options: StartAgentRunOptions | undefined,
+): Promise<
+  | { disposition: "steered" }
+  | {
+      disposition: "turn_started";
+      iterator: AsyncGenerator<import("./agent-sdk-types.js").AgentStreamEvent>;
+    }
+  | null
+> {
+  if (options?.activeTurnBehavior !== "steer") {
+    return null;
+  }
+  const steerOptions = options.clearPendingPermissions
+    ? { ...options.runOptions, clearPendingPermissions: true }
+    : options.runOptions;
+  const result = await agentManager.steerOrReplaceActiveTurn(agentId, prompt, steerOptions);
+  if (result.status === "steered") {
+    return { disposition: "steered" };
+  }
+  if (result.status === "replaced") {
+    return { disposition: "turn_started", iterator: result.iterator };
+  }
+  return null;
+}
+
+async function startOrReplaceRun(
+  agentManager: AgentRunController,
+  agentId: string,
+  prompt: AgentPromptInput,
+  options: StartAgentRunOptions | undefined,
+): Promise<{
+  iterator: AsyncGenerator<import("./agent-sdk-types.js").AgentStreamEvent>;
+  replaced: boolean;
+}> {
+  const replaced = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
+  const iterator = replaced
+    ? await agentManager.replaceAgentRun(agentId, prompt, options?.runOptions)
+    : agentManager.streamAgent(agentId, prompt, options?.runOptions);
+  return { iterator, replaced };
 }
 
 export async function startAgentRun(
@@ -52,7 +84,7 @@ export async function startAgentRun(
   prompt: AgentPromptInput,
   logger: Logger,
   options?: StartAgentRunOptions,
-): Promise<StartAgentRunResult> {
+): Promise<{ disposition: PromptDispatchDisposition }> {
   const snapshot = agentManager.getAgent(agentId);
   logger.trace(
     {
@@ -69,134 +101,52 @@ export async function startAgentRun(
   // Out-of-band commands (e.g. /goal pause) must run WITHOUT canceling an
   // in-flight turn — replaceAgentRun would interrupt the running turn. The
   // intercept lives at this layer so it covers every prompt entrypoint.
-
   if (agentManager.tryRunOutOfBand(agentId, prompt, options?.runOptions)) {
-    return { outOfBand: true, enqueued: false };
+    return { disposition: "out_of_band" };
   }
-  // Sessions that support message queueing take precedence over replacement:
-  // an active run keeps going and the prompt is queued against it. "never"
-  // opts out and preserves the interrupt-and-replace path below.
-  const enqueueResult = await tryEnqueueOnActiveRun({
-    agentManager,
-    agentId,
-    prompt,
-    logger,
-    options,
-    snapshot,
-  });
-  if (enqueueResult?.accepted) {
-    return toEnqueuedRunResult(enqueueResult, options?.runOptions?.clientMessageId);
+  const steered = await steerOrReplaceActiveRun(agentManager, agentId, prompt, options);
+  if (steered?.disposition === "steered") {
+    return steered;
   }
-  return startNormalAgentRun({ agentManager, agentId, prompt, logger, options, snapshot });
-}
-
-async function startNormalAgentRun(input: {
-  agentManager: AgentRunController;
-  agentId: string;
-  prompt: AgentPromptInput;
-  logger: Logger;
-  options: StartAgentRunOptions | undefined;
-  snapshot: ManagedAgent | null;
-}): Promise<StartAgentRunResult> {
-  const { agentManager, agentId, prompt, logger, options, snapshot } = input;
-  const shouldReplace = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
-  const iterator = shouldReplace
-    ? await agentManager.replaceAgentRun(agentId, prompt, options?.runOptions)
-    : agentManager.streamAgent(agentId, prompt, options?.runOptions);
+  const { iterator, replaced } = steered
+    ? { iterator: steered.iterator, replaced: true }
+    : await startOrReplaceRun(agentManager, agentId, prompt, options);
   logger.trace(
     {
       agentId,
       provider: snapshot?.provider,
       providerSessionId: snapshot?.persistence?.sessionId ?? undefined,
-      shouldReplace,
+      shouldReplace: replaced,
     },
     "agent.session.start_stream.iterator_returned",
   );
-  void drainAgentIterator(iterator, { agentId, logger, snapshot });
-  return { outOfBand: false, enqueued: false };
-}
-
-async function drainAgentIterator(
-  iterator: AsyncIterable<unknown>,
-  input: { agentId: string; logger: Logger; snapshot: ManagedAgent | null },
-): Promise<void> {
-  const { agentId, logger, snapshot } = input;
-  try {
-    for await (const _ of iterator) {
-      // Events are broadcast via AgentManager subscribers.
+  void (async () => {
+    try {
+      for await (const _ of iterator) {
+        // Events are broadcast via AgentManager subscribers.
+      }
+      logger.trace(
+        {
+          agentId,
+          provider: snapshot?.provider,
+          providerSessionId: snapshot?.persistence?.sessionId ?? undefined,
+        },
+        "agent.session.iterator.drained",
+      );
+    } catch (error) {
+      logger.trace(
+        {
+          agentId,
+          provider: snapshot?.provider,
+          providerSessionId: snapshot?.persistence?.sessionId ?? undefined,
+          err: error,
+        },
+        "agent.session.iterator.error",
+      );
+      logger.error({ err: error, agentId }, "Agent stream failed");
     }
-    logger.trace(
-      {
-        agentId,
-        provider: snapshot?.provider,
-        providerSessionId: snapshot?.persistence?.sessionId ?? undefined,
-      },
-      "agent.session.iterator.drained",
-    );
-  } catch (error) {
-    logger.trace(
-      {
-        agentId,
-        provider: snapshot?.provider,
-        providerSessionId: snapshot?.persistence?.sessionId ?? undefined,
-        err: error,
-      },
-      "agent.session.iterator.error",
-    );
-    logger.error({ err: error, agentId }, "Agent stream failed");
-  }
-}
-
-function toEnqueuedRunResult(
-  result: Extract<import("./agent-sdk-types.js").AgentEnqueueResult, { accepted: true }>,
-  _clientMessageId: string | undefined,
-): StartAgentRunResult {
-  return {
-    outOfBand: false,
-    enqueued: true,
-    delivery: result.behavior,
-  };
-}
-
-/**
- * Attempt to queue the prompt onto the agent's active run. Returns true only
- * when the session accepted the enqueue; a decline (e.g. the turn just ended)
- * falls back to the normal run path.
- */
-async function tryEnqueueOnActiveRun(params: {
-  agentManager: AgentRunController;
-  agentId: string;
-  prompt: AgentPromptInput;
-  logger: Logger;
-  options: StartAgentRunOptions | undefined;
-  snapshot: ManagedAgent | null;
-}): Promise<import("./agent-sdk-types.js").AgentEnqueueResult | null> {
-  const { agentManager, agentId, prompt, logger, options, snapshot } = params;
-  const enqueueBehavior = options?.enqueueBehavior ?? "never";
-  if (
-    enqueueBehavior === "never" ||
-    !snapshot?.capabilities?.supportsMessageQueue ||
-    !agentManager.hasInFlightRun(agentId)
-  ) {
-    return null;
-  }
-  const enqueueResult = await agentManager.enqueueAgentPrompt(agentId, prompt, {
-    behavior: enqueueBehavior,
-    clientMessageId: options?.runOptions?.clientMessageId,
-  });
-  if (!enqueueResult.accepted) {
-    return enqueueResult;
-  }
-  logger.trace(
-    {
-      agentId,
-      provider: snapshot.provider,
-      requestedBehavior: enqueueBehavior,
-      behavior: enqueueResult.behavior,
-    },
-    "agent.session.start_stream.enqueued",
-  );
-  return enqueueResult;
+  })();
+  return { disposition: "turn_started" };
 }
 
 /**
@@ -238,21 +188,18 @@ export interface SendPromptToAgentParams {
   /** Prompt to dispatch to the provider (may include image blocks or wrapped text). */
   prompt: AgentPromptInput;
   messageId?: string;
+  activeTurnBehavior?: ActiveTurnBehavior;
   runOptions?: AgentRunOptions;
   /** Optional mode to set on the agent before the run starts. */
   sessionMode?: string;
-  /**
-   * Queue delivery when the agent is mid-run and the session supports it.
-   * Defaults to "never" so internal callers preserve replacement semantics;
-   * the external client-message boundary explicitly requests "steer".
-   */
-  enqueueBehavior?: StartAgentRunEnqueueBehavior;
   /**
    * Default true. When false, archived agents are skipped instead of being
    * unarchived. Use false for system-injected prompts (chat mentions,
    * schedule fires, notify-on-finish).
    */
   unarchive?: boolean;
+  /** See {@link StartAgentRunOptions.clearPendingPermissions}. */
+  clearPendingPermissions?: boolean;
   logger: Logger;
 }
 
@@ -290,17 +237,17 @@ export async function waitForAgentRunStartWithTimeout(
  * drift between them.
  *
  * When `unarchive` is false and the agent is archived, the call is a silent
- * no-op (returns `{ outOfBand: false }`) — the agent is not run.
+ * no-op (returns the normal turn-start disposition) — the agent is not run.
  */
 export async function sendPromptToAgent(
   params: SendPromptToAgentParams,
-): Promise<StartAgentRunResult> {
+): Promise<{ disposition: PromptDispatchDisposition }> {
   const unarchive = params.unarchive ?? true;
 
   const record = await params.agentStorage.get(params.agentId);
   if (record?.archivedAt) {
     if (!unarchive) {
-      return { outOfBand: false, enqueued: false };
+      return { disposition: "turn_started" };
     }
     await unarchiveAgentState(params.agentStorage, params.agentManager, params.agentId);
   }
@@ -321,8 +268,9 @@ export async function sendPromptToAgent(
 
   return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
     replaceRunning: true,
+    activeTurnBehavior: params.activeTurnBehavior,
+    clearPendingPermissions: params.clearPendingPermissions,
     runOptions,
-    enqueueBehavior: params.enqueueBehavior,
   });
 }
 
@@ -348,7 +296,7 @@ export async function startCreatedAgentInitialPrompt(
     },
   );
 
-  if (!dispatchResult.outOfBand && !dispatchResult.enqueued) {
+  if (dispatchResult.disposition === "turn_started") {
     await waitForAgentRunStartWithTimeout(params.agentManager, params.agentId);
   }
 
@@ -462,6 +410,7 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
       agentStorage,
       agentId: callerAgentId,
       prompt: formatSystemNotificationPrompt(body),
+      activeTurnBehavior: "steer",
       unarchive: false,
       logger,
     });

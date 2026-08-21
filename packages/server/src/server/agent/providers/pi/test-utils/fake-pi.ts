@@ -140,6 +140,7 @@ export class FakePiSession implements PiRuntimeSession {
   compactError: Error | null = null;
   emitCompactEnd = true;
   getStateError: Error | null = null;
+  getSessionStatsError: Error | null = null;
   promptAck: PiPromptAck = {};
   branchResponse: { text?: string; cancelled?: boolean } = { text: "" };
   readonly branchRequests: string[] = [];
@@ -295,6 +296,9 @@ export class FakePiSession implements PiRuntimeSession {
   }
 
   async getSessionStats(): Promise<PiSessionStats> {
+    if (this.getSessionStatsError) {
+      throw this.getSessionStatsError;
+    }
     return this.stats;
   }
 
@@ -398,7 +402,25 @@ export class FakePiSession implements PiRuntimeSession {
     }
   }
 
+  finishAgentRun({ message, willRetry }: { message: PiAgentMessage; willRetry: boolean }): void {
+    this.messages = [...this.messages, message];
+    this.emit({
+      type: "agent_end",
+      messages: this.messages,
+      willRetry,
+    });
+  }
+
+  settleTurn(): void {
+    this.emit({ type: "agent_settled" });
+  }
+
   finishTurn(message: PiAgentMessage = { role: "assistant", content: [] }): void {
+    this.finishAgentRun({ message, willRetry: false });
+    this.settleTurn();
+  }
+
+  finishLegacyTurn(message: PiAgentMessage = { role: "assistant", content: [] }): void {
     this.messages = [...this.messages, message];
     this.emit({ type: "agent_end", messages: this.messages });
   }

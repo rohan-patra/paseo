@@ -33,7 +33,6 @@ import {
   type AgentSlashCommandKind,
   type AgentStreamEvent,
   type AgentTimelineItem,
-  type AgentUsage,
   type FetchCatalogOptions,
   type ImportableProviderSession,
   type ImportProviderSessionContext,
@@ -79,11 +78,11 @@ import type {
   PiPromptAck,
   PiRpcSlashCommand,
   PiRuntimeEvent,
-  PiSessionStats,
   PiSessionState,
   PiStreamingBehavior,
   PiThinkingLevel,
 } from "./rpc-types.js";
+import { PiUsagePoller, type PiUsagePollScheduler } from "./usage-poller.js";
 import {
   parsePiSubagentLaunchCommand,
   PiSubagentIndex,
@@ -210,6 +209,7 @@ export interface PiRpcAgentClientOptions {
   runtimeSettings?: ProviderRuntimeSettings;
   providerParams?: unknown;
   runtime?: PiRuntime;
+  usagePollScheduler?: PiUsagePollScheduler;
 }
 
 interface PiPromptPayload {
@@ -250,6 +250,8 @@ interface PiRpcAgentSessionOptions {
   currentModeId?: string | null;
   cleanup?: () => void;
   extensionTimeoutMs?: number;
+  logger: Logger;
+  usagePollScheduler?: PiUsagePollScheduler;
 }
 
 interface PiResumeConfig {
@@ -390,35 +392,6 @@ function mapThinkingOption(option: (typeof PI_THINKING_OPTIONS)[number]) {
 function describePiModelForNotice(model: PiModel | null | undefined): string {
   const id = modelToId(model);
   return id ? `model '${id}'` : "the current model";
-}
-
-function toAgentUsage(stats: PiSessionStats): AgentUsage | undefined {
-  const inputTokens = stats.tokens?.input ?? 0;
-  const cachedInputTokens = stats.tokens?.cacheRead ?? 0;
-  const outputTokens = stats.tokens?.output ?? 0;
-  const totalCostUsd = stats.cost ?? 0;
-  const contextWindowMaxTokens = stats.contextUsage?.contextWindow ?? undefined;
-  const contextWindowUsedTokens = stats.contextUsage?.tokens ?? undefined;
-
-  if (
-    inputTokens === 0 &&
-    cachedInputTokens === 0 &&
-    outputTokens === 0 &&
-    totalCostUsd === 0 &&
-    contextWindowMaxTokens === undefined &&
-    contextWindowUsedTokens === undefined
-  ) {
-    return undefined;
-  }
-
-  return {
-    inputTokens,
-    cachedInputTokens,
-    outputTokens,
-    totalCostUsd,
-    ...(typeof contextWindowMaxTokens === "number" ? { contextWindowMaxTokens } : {}),
-    ...(typeof contextWindowUsedTokens === "number" ? { contextWindowUsedTokens } : {}),
-  };
 }
 
 function piModelSupportsImageInput(model: PiModel | null | undefined): boolean {
@@ -1478,7 +1451,7 @@ function isPiAgentSessionEvent(event: PiRuntimeEvent): event is PiAgentSessionEv
     case "compaction_end":
     case "agent_end":
     case "agent_settled":
-    case "queue_update":
+    case "auto_retry_start":
       return true;
     case "message_update":
       return (
@@ -1701,7 +1674,8 @@ export class PiRpcAgentSession implements AgentSession {
   private activeReasoningId: string | null = null;
   private reasoningSequence = 0;
   private activeTurnStarted = false;
-  private activeForegroundPromptText: string | null = null;
+  private activeTurnStartedEmitted = false;
+  private pendingSettledMessages: PiAgentMessage[] | null = null;
   private activeNoTurnPromptText: string | null = null;
   private readonly pendingNoTurnOutputs: Array<{ turnId: string; message: string }> = [];
   private readonly pendingNoTurnUiItems: Array<{ turnId: string; item: AgentTimelineItem }> = [];
@@ -1733,6 +1707,8 @@ export class PiRpcAgentSession implements AgentSession {
   private promptDeliveryBlockedUntilSettlementOrRestart = false;
   private deferredPromptStartInFlight = false;
   private readonly currentModeId: string | null;
+  private readonly logger: Logger;
+  private readonly usagePoller: PiUsagePoller;
   private closed = false;
   // Pi reports an aborted OpenAI Responses stream before the abort RPC resolves.
   // Keep the turn active until that RPC acknowledges the user-requested cancellation.
@@ -1753,6 +1729,22 @@ export class PiRpcAgentSession implements AgentSession {
       this.state.thinkingLevel ??
       null;
     this.extensionTimeoutMs = options.extensionTimeoutMs ?? DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS;
+    this.logger = options.logger;
+    this.usagePoller = new PiUsagePoller({
+      scheduler: options.usagePollScheduler,
+      readStats: () => this.runtimeSession.getSessionStats(),
+      onUsage: (usage, turnId) => {
+        this.emit({
+          type: "usage_updated",
+          provider: this.provider,
+          usage,
+          ...(turnId === undefined ? {} : { turnId }),
+        });
+      },
+      onPollError: (error) => {
+        this.logger.debug({ err: error }, "Pi context usage poll failed");
+      },
+    });
 
     this.runtimeSession.onEvent((event) => {
       this.handleRuntimeEvent(event);
@@ -1788,12 +1780,14 @@ export class PiRpcAgentSession implements AgentSession {
     const payload = convertPromptInput(prompt, { model: this.state.model });
     const turnId = randomUUID();
     this.activeTurnId = turnId;
+    this.usagePoller.startTurn();
     this.lastInterruptedTurnId = null;
     this.activeClientMessageId = options?.clientMessageId ?? null;
     this.activeAssistantMessageId = null;
     this.activeTurnStarted = false;
+    this.activeTurnStartedEmitted = false;
+    this.pendingSettledMessages = null;
     this.activePromptRequestId = null;
-    this.activeForegroundPromptText = payload.text;
     this.clearNoTurnBuffers();
     this.activeNoTurnPromptText = payload.text;
     const shouldProbeForNoTurnPrompt = this.parseSlashCommandInput(payload.text) !== null;
@@ -1831,10 +1825,13 @@ export class PiRpcAgentSession implements AgentSession {
         if (this.activeTurnId !== turnId) {
           return;
         }
+        this.usagePoller.stopTurn();
         this.activeTurnId = null;
         this.pendingSettlement = null;
         this.activeClientMessageId = null;
         this.activeTurnStarted = false;
+        this.activeTurnStartedEmitted = false;
+        this.pendingSettledMessages = null;
         this.activeAssistantMessageId = null;
         this.clearNoTurnBuffers();
         if (isPiRequestAbortError(error)) {
@@ -1959,9 +1956,12 @@ export class PiRpcAgentSession implements AgentSession {
       if (this.interruptedTerminalError?.turnId === turnId) {
         const terminalError = this.interruptedTerminalError;
         this.interruptedTerminalError = null;
+        this.usagePoller.stopTurn();
         this.activeTurnId = null;
         this.activeClientMessageId = null;
         this.activeTurnStarted = false;
+        this.activeTurnStartedEmitted = false;
+        this.pendingSettledMessages = null;
         this.activeAssistantMessageId = null;
         this.clearNoTurnBuffers();
         this.emit({
@@ -1981,9 +1981,12 @@ export class PiRpcAgentSession implements AgentSession {
     this.promptDeliveryBlockedUntilSettlementOrRestart = false;
     this.deferredPromptStartInFlight = false;
     if (turnId && this.activeTurnId === turnId) {
+      this.usagePoller.stopTurn();
       this.activeTurnId = null;
       this.activeClientMessageId = null;
       this.activeTurnStarted = false;
+      this.activeTurnStartedEmitted = false;
+      this.pendingSettledMessages = null;
       this.activeAssistantMessageId = null;
       this.clearNoTurnBuffers();
       if (this.pendingSettlement?.turnId === turnId) {
@@ -2038,6 +2041,7 @@ export class PiRpcAgentSession implements AgentSession {
       return;
     }
     this.closed = true;
+    this.usagePoller.close();
     try {
       for (const event of this.subagentIndex.terminalizeRunning()) this.emit(event);
       await this.runtimeSession.close();
@@ -2546,16 +2550,6 @@ export class PiRpcAgentSession implements AgentSession {
     if (!entry) {
       return true;
     }
-    // Match an exact queued echo first, but never let the FIFO fallback steal
-    // the foreground prompt when a steer was accepted before its marker arrived.
-    let enqueued = this.takeExactEnqueuedPrompt(entry.text);
-    let clientMessageId = enqueued?.clientMessageId ?? null;
-    if (!clientMessageId && entry.text === this.activeForegroundPromptText) {
-      clientMessageId = this.activeClientMessageId;
-    } else if (!enqueued) {
-      enqueued = this.pendingEnqueuedPrompts.shift() ?? null;
-      clientMessageId = enqueued?.clientMessageId ?? null;
-    }
     this.emit({
       type: "timeline",
       provider: this.provider,
@@ -2564,7 +2558,7 @@ export class PiRpcAgentSession implements AgentSession {
         type: "user_message",
         text: entry.text,
         messageId: entry.id,
-        ...(clientMessageId ? { clientMessageId } : {}),
+        ...(this.activeClientMessageId ? { clientMessageId: this.activeClientMessageId } : {}),
       },
     });
     return true;
@@ -2877,9 +2871,12 @@ export class PiRpcAgentSession implements AgentSession {
       return;
     }
     const turnId = this.activeTurnId;
+    this.usagePoller.stopTurn();
     this.activeTurnId = null;
     this.activeClientMessageId = null;
     this.activeTurnStarted = false;
+    this.activeTurnStartedEmitted = false;
+    this.pendingSettledMessages = null;
     this.clearNoTurnBuffers();
     this.emit({
       type: "turn_failed",
@@ -2890,12 +2887,35 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   private handleSessionEvent(event: PiAgentSessionEvent): void {
-    if (this.handleRunLifecycleEvent(event)) {
+    const turnId = this.currentTurnIdForEvent();
+    if (event.type === "agent_end" || event.type === "agent_settled") {
+      this.handleTurnBoundaryEvent({ event, turnId });
       return;
     }
-    const turnId = this.currentTurnIdForEvent();
 
     switch (event.type) {
+      case "agent_start":
+        this.activeTurnStarted = true;
+        this.clearNoTurnBuffers();
+        this.emit({
+          type: "thread_started",
+          provider: this.provider,
+          sessionId: this.state.sessionId,
+        });
+        return;
+      case "turn_start":
+        this.activeTurnStarted = true;
+        this.clearNoTurnBuffers();
+        if (this.activeTurnStartedEmitted) {
+          return;
+        }
+        this.activeTurnStartedEmitted = true;
+        this.emit({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        });
+        return;
       case "message_start":
         this.handleMessageStart(event);
         return;
@@ -2951,216 +2971,44 @@ export class PiRpcAgentSession implements AgentSession {
           },
         });
         return;
+      case "auto_retry_start":
+        this.emit({
+          type: "timeline",
+          provider: this.provider,
+          turnId,
+          item: {
+            type: "error",
+            message: `Provider retry (attempt ${event.attempt}): ${event.errorMessage}`,
+          },
+        });
+        return;
       default:
         return;
     }
   }
 
-  /** Run lifecycle: start, settlement, and queue events. Returns true when handled. */
-  private handleRunLifecycleEvent(event: PiAgentSessionEvent): boolean {
-    const turnId = this.currentTurnIdForEvent();
-
-    switch (event.type) {
-      case "agent_start":
-        this.promptDeliveryBlockedUntilSettlementOrRestart = false;
-        this.ensureActiveTurnForPiRun();
-        this.activeTurnStarted = true;
-        this.clearNoTurnBuffers();
-        this.emit({
-          type: "thread_started",
-          provider: this.provider,
-          sessionId: this.state.sessionId,
-        });
-        void this.flushDeferredPromptsIntoActiveRun();
-        return true;
-      case "turn_start":
-        this.ensureActiveTurnForPiRun();
-        this.activeTurnStarted = true;
-        this.clearNoTurnBuffers();
-        this.emit({
-          type: "turn_started",
-          provider: this.provider,
-          turnId: this.currentTurnIdForEvent(),
-        });
-        return true;
-      case "queue_update":
-        this.promptQueue = {
-          steering: readStringArray(event.steering),
-          followUp: readStringArray(event.followUp),
-        };
-        return true;
-      case "agent_end": {
-        if (!turnId) return true;
-        const messages = event.messages ?? [];
-        // COMPAT(piAgentSettled): added in v0.2.3 — old Pi binaries omit
-        // willRetry and never emit agent_settled, so settle on agent_end. New
-        // Pi always sends an explicit willRetry boolean and follows the fully
-        // settled run with agent_settled; defer completion so automatic
-        // retries and queued continuations stay inside one turn. Remove the
-        // fallback after 2026-08-01 once the Pi floor emits agent_settled.
-        if (typeof event.willRetry !== "boolean") {
-          this.completeTurn(turnId, messages);
-          return true;
-        }
-        const priorSettlement = this.pendingSettlement;
-        // Once an identified agent_end is pending, a different identified end is
-        // stale. Current Pi lacks IDs, so untagged legacy events retain ordering.
-        if (priorSettlement?.piRunId && event.runId && priorSettlement.piRunId !== event.runId) {
-          return true;
-        }
-        this.pendingSettlement = {
-          turnId,
-          messages,
-          ...(event.runId ? { piRunId: event.runId } : {}),
-        };
-        this.promptDeliveryBlockedUntilSettlementOrRestart = true;
-        return true;
+  private handleTurnBoundaryEvent({
+    event,
+    turnId,
+  }: {
+    event: Extract<PiAgentSessionEvent, { type: "agent_end" | "agent_settled" }>;
+    turnId: string | undefined;
+  }): void {
+    if (event.type === "agent_end") {
+      // COMPAT(piAgentSettled): added in v0.5.0, remove after 2027-02-21 once the Pi
+      // floor emits agent_settled and willRetry.
+      if (event.willRetry === undefined) {
+        this.completeTurn(turnId, event.messages ?? []);
+        return;
       }
-      case "agent_settled": {
-        const settlement = this.pendingSettlement;
-        if (!settlement || !this.isSettlementForPendingRun(settlement, event.runId)) {
-          return true;
-        }
-        this.pendingSettlement = null;
-        this.promptDeliveryBlockedUntilSettlementOrRestart = false;
-        this.completeTurn(settlement.turnId, settlement.messages);
-        this.clearSettledNativePromptCorrelations();
-        void this.startDeferredPromptAfterSettlement();
-        return true;
+      if (this.activeTurnId) {
+        this.pendingSettledMessages = event.messages ?? [];
       }
-      default:
-        return false;
-    }
-  }
-
-  private isSettlementForPendingRun(
-    settlement: { piRunId?: string },
-    eventRunId: string | undefined,
-  ): boolean {
-    // Partial rollout stays legacy: compare only when both terminal events carry
-    // a run id. Do not let a new agent_start/turn_start gate current Pi traffic.
-    return !settlement.piRunId || !eventRunId || settlement.piRunId === eventRunId;
-  }
-
-  private clearSettledNativePromptCorrelations(): void {
-    // Pi drains its native steer/follow-up queues before agent_settled. Their
-    // submitted-user markers have already had a chance to consume correlation;
-    // retain only daemon-held prompts that have not been sent yet.
-    for (let index = this.pendingEnqueuedPrompts.length - 1; index >= 0; index -= 1) {
-      if (this.pendingEnqueuedPrompts[index]?.delivery !== "deferred") {
-        this.pendingEnqueuedPrompts.splice(index, 1);
-      }
-    }
-  }
-
-  private async startDeferredPromptAfterSettlement(): Promise<void> {
-    if (this.activeTurnId || this.deferredPromptStartInFlight) return;
-    const pending = this.pendingEnqueuedPrompts.find((entry) => entry.delivery === "deferred");
-    if (!pending) return;
-
-    this.deferredPromptStartInFlight = true;
-    this.promptDeliveryBlockedUntilSettlementOrRestart = true;
-    pending.delivery = "starting";
-    const turnId = randomUUID();
-    this.activeTurnId = turnId;
-    this.activeTurnStarted = false;
-    this.activePromptRequestId = null;
-    this.activeNoTurnPromptText = pending.text;
-    this.emit({
-      type: "queued_message_adopted",
-      provider: this.provider,
-      clientMessageId: pending.clientMessageId,
-      behavior: pending.behavior,
-      turnId,
-    });
-    try {
-      // The old run is fully settled. Omit streamingBehavior so this is
-      // unambiguously a fresh Pi run rather than a racy enqueue attempt.
-      const ack = await this.runtimeSession.prompt(pending.text, pending.images);
-      this.activePromptRequestId = ack.requestId ?? null;
-      const correlatedResult = ack.requestId
-        ? this.pendingPromptResults.get(ack.requestId)
-        : undefined;
-      if (ack.requestId) this.pendingPromptResults.delete(ack.requestId);
-      if ((correlatedResult ?? ack.agentInvoked) === false) {
-        this.removePendingEnqueuedPrompt(pending);
-        await this.completeNoTurnPrompt(turnId);
-      }
-    } catch (error) {
-      this.removePendingEnqueuedPrompt(pending);
-      if (this.activeTurnId === turnId) {
-        this.activeTurnId = null;
-        this.activeTurnStarted = false;
-        this.emit({
-          type: "turn_failed",
-          provider: this.provider,
-          turnId,
-          error: toDiagnosticErrorMessage(error),
-        });
-      }
-    } finally {
-      this.deferredPromptStartInFlight = false;
-      if (!this.activeTurnId) this.promptDeliveryBlockedUntilSettlementOrRestart = false;
-    }
-    if (!this.activeTurnId) void this.startDeferredPromptAfterSettlement();
-  }
-
-  private async flushDeferredPromptsIntoActiveRun(): Promise<void> {
-    for (;;) {
-      const pending = this.pendingEnqueuedPrompts.find((entry) => entry.delivery === "deferred");
-      if (!pending) return;
-      if (!(await this.queuePromptNatively(pending, false))) return;
-    }
-  }
-
-  private ensureActiveTurnForPiRun(): void {
-    this.maybeAdoptEnqueuedTurn();
-    if (this.activeTurnId) return;
-
-    // Extensions can trigger a root Pi run without going through Paseo's
-    // startTurn/enqueuePrompt APIs. Bind it immediately so agent_end and
-    // agent_settled can terminate the manager's autonomous run.
-    this.activeTurnId = randomUUID();
-    this.lastInterruptedTurnId = null;
-    this.activeClientMessageId = null;
-    this.activeAssistantMessageId = null;
-    this.activeTurnStarted = false;
-    this.activeForegroundPromptText = null;
-    this.clearNoTurnBuffers();
-  }
-
-  // Race-safe adopted turn: a prompt queued near the end of a run can be
-  // delivered after the previous turn settled, starting a fresh agent run
-  // with no locally active turn. Adopt that run into a new turn so its events
-  // stay attributed instead of streaming turn-less.
-  private maybeAdoptEnqueuedTurn(): void {
-    if (this.activeTurnId || this.pendingEnqueuedPrompts.length === 0) {
       return;
     }
-    this.activeTurnId = randomUUID();
-    const [pending] = this.pendingEnqueuedPrompts;
-    if (pending) {
-      this.emit({
-        type: "queued_message_adopted",
-        provider: this.provider,
-        clientMessageId: pending.clientMessageId,
-        behavior: pending.behavior,
-        turnId: this.activeTurnId,
-      });
+    if (this.activeTurnId) {
+      this.completeTurn(turnId, this.pendingSettledMessages ?? []);
     }
-    this.lastInterruptedTurnId = null;
-    this.activeClientMessageId = null;
-    this.activeAssistantMessageId = null;
-    this.activeTurnStarted = true;
-    this.clearNoTurnBuffers();
-  }
-
-  private takeExactEnqueuedPrompt(text: string): PiPendingEnqueuedPrompt | null {
-    const exactIndex = this.pendingEnqueuedPrompts.findIndex((pending) => pending.text === text);
-    if (exactIndex === -1) {
-      return null;
-    }
-    return this.pendingEnqueuedPrompts.splice(exactIndex, 1)[0] ?? null;
   }
 
   private handleToolExecutionEnd(
@@ -3373,10 +3221,12 @@ export class PiRpcAgentSession implements AgentSession {
     this.activeClientMessageId = null;
     this.activeAssistantMessageId = null;
     this.activeTurnStarted = false;
-    this.activeForegroundPromptText = null;
+    this.activeTurnStartedEmitted = false;
+    this.pendingSettledMessages = null;
     this.clearNoTurnBuffers();
     const errorMessage = latestPiErrorMessage(messages);
     if (typeof errorMessage === "string" && errorMessage.length > 0) {
+      this.usagePoller.stopTurn();
       this.emit({
         type: "turn_failed",
         provider: this.provider,
@@ -3385,34 +3235,21 @@ export class PiRpcAgentSession implements AgentSession {
       });
       return;
     }
+    const finalUsage = this.usagePoller.completeTurn(turnId);
     this.emit({
       type: "turn_completed",
       provider: this.provider,
       turnId,
     });
-    void this.refreshAfterTurn(turnId);
+    void this.refreshAfterTurn(finalUsage);
   }
 
   private async refreshState(): Promise<void> {
     this.state = await this.runtimeSession.getState();
   }
 
-  private async refreshAfterTurn(turnId: string | undefined): Promise<void> {
-    await this.refreshState().catch(() => undefined);
-    const usage = await this.runtimeSession
-      .getSessionStats()
-      .then((stats) => {
-        return toAgentUsage(stats);
-      })
-      .catch(() => undefined);
-    if (usage) {
-      this.emit({
-        type: "usage_updated",
-        provider: this.provider,
-        turnId,
-        usage,
-      });
-    }
+  private async refreshAfterTurn(finalUsage: Promise<void>): Promise<void> {
+    await Promise.all([this.refreshState().catch(() => undefined), finalUsage]);
   }
 }
 
@@ -3424,6 +3261,7 @@ export class PiRpcAgentClient implements AgentClient {
   private readonly runtimeSettings?: ProviderRuntimeSettings;
   private readonly providerParams: PiProviderParams;
   private readonly runtime: PiRuntime;
+  private readonly usagePollScheduler?: PiUsagePollScheduler;
 
   constructor(options: PiRpcAgentClientOptions) {
     this.provider = PI_PROVIDER;
@@ -3432,6 +3270,7 @@ export class PiRpcAgentClient implements AgentClient {
     this.runtimeSettings = options.runtimeSettings;
     this.providerParams = PiProviderParamsSchema.parse(options.providerParams ?? {});
     this.runtime = options.runtime ?? createRuntime(options.logger, options.runtimeSettings);
+    this.usagePollScheduler = options.usagePollScheduler;
   }
 
   async createSession(
@@ -3471,6 +3310,8 @@ export class PiRpcAgentClient implements AgentClient {
         capabilities: capabilitiesForSession(mcpConfig !== null),
         cleanup: combineCleanup([mcpConfig?.cleanup, paseoExtension?.cleanup]),
         extensionTimeoutMs: this.providerParams.extensionTimeoutMs,
+        logger: this.logger,
+        usagePollScheduler: this.usagePollScheduler,
       });
     } catch (error) {
       await runtimeSession.close().catch(() => undefined);
@@ -3532,6 +3373,8 @@ export class PiRpcAgentClient implements AgentClient {
         capabilities: capabilitiesForSession(mcpConfig !== null),
         cleanup: combineCleanup([mcpConfig?.cleanup, paseoExtension?.cleanup]),
         extensionTimeoutMs: this.providerParams.extensionTimeoutMs,
+        logger: this.logger,
+        usagePollScheduler: this.usagePollScheduler,
       });
     } catch (error) {
       await runtimeSession.close().catch(() => undefined);

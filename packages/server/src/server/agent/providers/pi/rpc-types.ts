@@ -214,7 +214,15 @@ export type PiAgentSessionEvent =
   // and follows the settled run with agent_settled.
   | { type: "agent_end"; messages?: PiAgentMessage[]; willRetry?: boolean; runId?: string }
   | { type: "agent_settled"; runId?: string }
-  | { type: "queue_update"; steering?: string[]; followUp?: string[] };
+  | { type: "queue_update"; steering?: string[]; followUp?: string[] }
+  | {
+      type: "auto_retry_start";
+      attempt: number;
+      maxAttempts: number;
+      delayMs: number;
+      errorMessage: string;
+    }
+  | { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
 
 export type PiRuntimeEvent =
   | PiAgentSessionEvent
