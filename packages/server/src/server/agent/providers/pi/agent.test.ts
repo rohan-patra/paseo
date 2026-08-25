@@ -1770,6 +1770,138 @@ describe("PiRpcAgentSession", () => {
     );
   });
 
+  test("acknowledges interrupt immediately while pi abort is still settling", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    let releaseAbort: (() => void) | null = null;
+    fakeSession.abort = () =>
+      new Promise<void>((resolve) => {
+        releaseAbort = resolve;
+      });
+
+    const { turnId } = await session.startTurn("stop this turn");
+    // interrupt() must not block on pi's slow abort (ESC parity): it resolves
+    // and emits turn_canceled before the runtime acknowledges anything.
+    await session.interrupt();
+    await expect(events.nextTurnCancellation()).resolves.toEqual({
+      type: "turn_canceled",
+      provider: "pi",
+      reason: "interrupted",
+      turnId,
+    });
+
+    releaseAbort?.();
+  });
+
+  test("queues a prompt started during a settling abort behind the abort", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+    let releaseAbort: (() => void) | null = null;
+    fakeSession.abort = () =>
+      new Promise<void>((resolve) => {
+        releaseAbort = resolve;
+      });
+
+    await session.startTurn("stop this turn");
+    await session.interrupt();
+    const pendingTurn = session.startTurn("fresh request");
+    await expect(
+      Promise.race([
+        pendingTurn.then(
+          () => "settled",
+          () => "settled",
+        ),
+        flushTurnScheduling().then(() => "pending"),
+      ]),
+    ).resolves.toBe("pending");
+
+    releaseAbort?.();
+    await pendingTurn;
+    expect(fakeSession.prompts.map((p) => p.message)).toEqual(["stop this turn", "fresh request"]);
+  });
+
+  test("canceling a pending start during a settling abort prevents the prompt from launching", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+    let releaseAbort: (() => void) | null = null;
+    fakeSession.abort = () =>
+      new Promise<void>((resolve) => {
+        releaseAbort = resolve;
+      });
+
+    await session.startTurn("stop this turn");
+    const firstStop = session.interrupt();
+    const pendingTurn = session.startTurn("fresh request");
+    // Turnless coalesced stop must acknowledge immediately, not adopt the
+    // slow in-flight abort promise.
+    const secondStopStartedAt = Date.now();
+    await session.interrupt();
+    expect(Date.now() - secondStopStartedAt).toBeLessThan(100);
+
+    releaseAbort?.();
+    await firstStop;
+    await expect(pendingTurn).rejects.toThrow("canceled before it could start");
+    expect(fakeSession.prompts.map((p) => p.message)).toEqual(["stop this turn"]);
+  });
+
+  test("drops dying-run events emitted between interrupt acknowledgement and settlement", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    let releaseAbort: (() => void) | null = null;
+    fakeSession.abort = () =>
+      new Promise<void>((resolve) => {
+        releaseAbort = resolve;
+      });
+
+    const { turnId } = await session.startTurn("stop this turn");
+    await session.interrupt();
+    await expect(events.nextTurnCancellation()).resolves.toEqual({
+      type: "turn_canceled",
+      provider: "pi",
+      reason: "interrupted",
+      turnId,
+    });
+    const recordedEvents = (events as unknown as { events: AgentStreamEvent[] }).events;
+    const eventCountAfterCancel = recordedEvents.length;
+
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "turn_start" });
+    fakeSession.emit({
+      type: "message_update",
+      message: { role: "assistant", content: [], responseId: "response-late" },
+      assistantMessageEvent: { type: "text_delta", delta: "late" },
+    });
+    fakeSession.emit({
+      type: "tool_execution_end",
+      toolCallId: "tool-late",
+      toolName: "bash",
+      result: { output: "late" },
+      isError: false,
+    });
+
+    expect(recordedEvents.length).toBe(eventCountAfterCancel);
+    releaseAbort?.();
+  });
+
+  test("fails prompts and rewinds behind a rejected abort until the session is replaced", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+    fakeSession.abort = async () => {
+      throw new Error("pi rpc died");
+    };
+
+    await session.startTurn("stop this turn");
+    await session.interrupt();
+    await flushTurnScheduling();
+    // The failure barrier is sticky: even after the rejection settles, later
+    // work keeps failing instead of talking to a pi whose abort never landed.
+    await expect(session.startTurn("fresh request")).rejects.toThrow("pi rpc died");
+    await expect(session.revertConversation({ messageId: "entry-1" })).rejects.toThrow(
+      "pi rpc died",
+    );
+    expect(fakeSession.prompts.map((p) => p.message)).toEqual(["stop this turn"]);
+  });
+
   test("treats Pi's aborted terminal response as cancellation after an interrupt", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();

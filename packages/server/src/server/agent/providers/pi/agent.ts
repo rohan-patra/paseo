@@ -1711,9 +1711,16 @@ export class PiRpcAgentSession implements AgentSession {
   private readonly usagePoller: PiUsagePoller;
   private closed = false;
   // Pi reports an aborted OpenAI Responses stream before the abort RPC resolves.
-  // Keep the turn active until that RPC acknowledges the user-requested cancellation.
+  // Identifies the turn an in-flight interrupt() targets so late aborted
+  // terminal responses are suppressed instead of surfacing as failures.
   private interruptingTurnId: string | null = null;
   private lastInterruptedTurnId: string | null = null;
+  // Abort RPC still settling inside pi after interrupt() already acknowledged.
+  // Runtime mutations that need an idle pi (startTurn, rewind) await it so they
+  // cannot talk to the dying run; abortGeneration invalidates pending starts
+  // when a second stop lands during the settle window.
+  private abortInFlight: Promise<void> | null = null;
+  private abortGeneration = 0;
   private interruptedTerminalError: { turnId: string; error: string } | null = null;
 
   constructor(options: PiRpcAgentSessionOptions) {
@@ -1773,6 +1780,15 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   async startTurn(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<StartTurnResult> {
+    const abortGeneration = this.abortGeneration;
+    if (this.abortInFlight) {
+      // A rejected abort propagates here so the turn fails visibly instead of
+      // steering onto a run whose cancellation was lost.
+      await this.abortInFlight;
+    }
+    if (abortGeneration !== this.abortGeneration) {
+      throw new Error("Turn was canceled before it could start");
+    }
     if (this.activeTurnId) {
       throw new Error("A Pi turn is already active");
     }
@@ -1943,36 +1959,60 @@ export class PiRpcAgentSession implements AgentSession {
 
   async interrupt(): Promise<void> {
     const turnId = this.activeTurnId;
+    this.abortGeneration += 1;
+    if (!turnId && this.abortInFlight) {
+      // Turnless stop while an abort is already settling: acknowledge
+      // immediately. The in-flight abort owns the settle; the generation bump
+      // above already cancels any pending start waiting behind it.
+      return;
+    }
     if (turnId) {
       this.interruptingTurnId = turnId;
       this.lastInterruptedTurnId = turnId;
     }
-    try {
-      await this.runtimeSession.abort();
-    } catch (error) {
-      if (this.interruptingTurnId === turnId) {
-        this.interruptingTurnId = null;
-      }
-      if (this.interruptedTerminalError?.turnId === turnId) {
-        const terminalError = this.interruptedTerminalError;
-        this.interruptedTerminalError = null;
-        this.usagePoller.stopTurn();
-        this.activeTurnId = null;
-        this.activeClientMessageId = null;
-        this.activeTurnStarted = false;
-        this.activeTurnStartedEmitted = false;
-        this.pendingSettledMessages = null;
-        this.activeAssistantMessageId = null;
-        this.clearNoTurnBuffers();
-        this.emit({
-          type: "turn_failed",
-          provider: this.provider,
-          turnId,
-          error: terminalError.error,
-        });
-      }
-      throw error;
-    }
+    // ESC parity: pi's RPC abort only responds after full idle, including
+    // extension agent_settled handlers, which blew past AgentManager's 2s
+    // interrupt acknowledgement budget and failed stops with "active run
+    // cancellation was not acknowledged". The CLI's ESC fires agent.abort()
+    // and returns immediately; mirror that by acknowledging locally now and
+    // letting the runtime event stream own the real settle.
+    const settledAbort = this.runtimeSession
+      .abort()
+      .then(() => {
+        if (this.interruptingTurnId === turnId) {
+          this.interruptingTurnId = null;
+        }
+        if (this.interruptedTerminalError?.turnId === turnId) {
+          this.interruptedTerminalError = null;
+        }
+        return undefined;
+      })
+      .catch((error: unknown) => {
+        if (this.interruptingTurnId === turnId) {
+          this.interruptingTurnId = null;
+        }
+        if (this.interruptedTerminalError?.turnId === turnId) {
+          this.interruptedTerminalError = null;
+        }
+        // Process death is reported via handleProcessExit; anything else is a
+        // lost abort signal. Rethrow into the settlement barrier so startTurn
+        // and rewind fail loudly instead of talking to a pi that never stopped.
+        this.logger.warn({ err: error }, "Pi abort rejected after interrupt was acknowledged");
+        throw error instanceof Error ? error : new Error(String(error));
+      });
+    this.abortInFlight = settledAbort;
+    // Cleared only on success: a rejected abort stays installed as a sticky
+    // barrier so later prompts/rewinds keep failing until the session is
+    // closed or replaced.
+    void settledAbort.then(
+      () => {
+        if (this.abortInFlight === settledAbort) {
+          this.abortInFlight = null;
+        }
+        return undefined;
+      },
+      () => undefined,
+    );
     // Pi RPC currently has no clear_queue command. Forget local correlation so
     // any native message that survives abort is surfaced honestly if Pi later
     // replays it instead of being silently treated as the old queued row.
@@ -1992,6 +2032,11 @@ export class PiRpcAgentSession implements AgentSession {
       if (this.pendingSettlement?.turnId === turnId) {
         this.pendingSettlement = null;
       }
+      // The blanket dying-run event guard drops late tool_execution_end
+      // events, so clear their local bookkeeping here instead.
+      this.activeToolCalls.clear();
+      this.activeAskUserDialog = null;
+      this.pendingCombinedAskUserResponse = null;
       this.emit({
         type: "turn_canceled",
         provider: this.provider,
@@ -1999,15 +2044,14 @@ export class PiRpcAgentSession implements AgentSession {
         turnId,
       });
     }
-    if (this.interruptingTurnId === turnId) {
-      this.interruptingTurnId = null;
-    }
-    if (this.interruptedTerminalError?.turnId === turnId) {
-      this.interruptedTerminalError = null;
-    }
   }
 
   async revertConversation(input: { messageId: string }): Promise<void> {
+    if (this.abortInFlight) {
+      // Rewind reads and navigates the session tree; wait for the dying run to
+      // settle so it cannot race the rewind.
+      await this.abortInFlight;
+    }
     if (this.activeTurnId) {
       throw new Error("Cannot rewind the Pi conversation while a turn is active");
     }
@@ -2850,7 +2894,17 @@ export class PiRpcAgentSession implements AgentSession {
       return;
     }
     if (isPiAgentSessionEvent(event)) {
-      this.handleSessionEvent(event);
+      // Between the local interrupt acknowledgement and pi's actual settlement
+      // every runtime event belongs to the dying run. Drop it: a late turn_start
+      // would resurrect the agent as an untracked autonomous run and stray
+      // deltas/tool rows have no turn identity to live under.
+      if (!this.shouldDropDyingRunEvent()) {
+        if (event.type === "agent_end" || event.type === "agent_settled") {
+          this.handleTurnBoundaryEvent({ event, turnId: this.currentTurnIdForEvent() });
+        } else {
+          this.handleSessionEvent(event);
+        }
+      }
       return;
     }
   }
@@ -2886,13 +2940,12 @@ export class PiRpcAgentSession implements AgentSession {
     });
   }
 
+  private shouldDropDyingRunEvent(): boolean {
+    return !this.activeTurnId && this.abortInFlight !== null;
+  }
+
   private handleSessionEvent(event: PiAgentSessionEvent): void {
     const turnId = this.currentTurnIdForEvent();
-    if (event.type === "agent_end" || event.type === "agent_settled") {
-      this.handleTurnBoundaryEvent({ event, turnId });
-      return;
-    }
-
     switch (event.type) {
       case "agent_start":
         this.activeTurnStarted = true;
