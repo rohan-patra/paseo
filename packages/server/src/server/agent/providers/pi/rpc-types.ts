@@ -8,8 +8,6 @@ export type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "x
  */
 export type PiThinkingLevelMap = Partial<Record<PiThinkingLevel, string | null>>;
 
-/** Queueing behavior for prompts sent while the agent is streaming. */
-export type PiStreamingBehavior = "steer" | "followUp";
 
 export interface PiImageContent {
   type: "image";
@@ -135,13 +133,9 @@ export interface PiRpcSlashCommand {
 }
 
 export type PiRpcCommand =
-  | {
-      id?: string;
-      type: "prompt";
-      message: string;
-      images?: PiImageContent[];
-      streamingBehavior?: PiStreamingBehavior;
-    }
+  | { id?: string; type: "prompt"; message: string; images?: PiImageContent[] }
+  | { id?: string; type: "steer"; message: string; images?: PiImageContent[] }
+  | { id?: string; type: "clear_queue" }
   | { id?: string; type: "compact"; customInstructions?: string }
   | { id?: string; type: "set_auto_compaction"; enabled: boolean }
   | { id?: string; type: "abort" }
@@ -214,7 +208,6 @@ export type PiAgentSessionEvent =
   // and follows the settled run with agent_settled.
   | { type: "agent_end"; messages?: PiAgentMessage[]; willRetry?: boolean; runId?: string }
   | { type: "agent_settled"; runId?: string }
-  | { type: "queue_update"; steering?: string[]; followUp?: string[] }
   | {
       type: "auto_retry_start";
       attempt: number;

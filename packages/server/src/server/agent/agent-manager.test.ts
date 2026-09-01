@@ -16,6 +16,7 @@ import {
 import { AgentStorage } from "./agent-storage.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { toAgentPayload } from "./agent-projections.js";
+import { projectTimelineRows } from "./timeline-projection.js";
 import { getOpenAgentTabLabel, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { formatSystemNotificationPrompt, startAgentRun } from "./agent-prompt.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent-loading.js";
@@ -29,10 +30,7 @@ import type {
 import type {
   AgentClient,
   AgentCreateSessionOptions,
-  AgentEnqueueOptions,
-  AgentEnqueueResult,
   AgentFeature,
-  AgentQueuedMessage,
   AgentLaunchContext,
   AgentPromptInput,
   AgentProvider,
@@ -1478,43 +1476,6 @@ function fakeCodexEmitting(args: FakeCodexEmitterArgs): AgentClient {
 }
 
 const logger = createTestLogger();
-
-test("publishes terminal stream events before lifecycle state for every provider", async () => {
-  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-terminal-order-"));
-  const manager = new AgentManager({
-    clients: { codex: new TestAgentClient() },
-    logger,
-    idFactory: () => "00000000-0000-4000-8000-000000000098",
-  });
-  const observed: Array<{ type: string; lifecycle?: string }> = [];
-  manager.subscribe(
-    (event) => {
-      observed.push({
-        type: event.type === "agent_stream" ? event.event.type : event.type,
-        ...(event.type === "agent_state" ? { lifecycle: event.agent.lifecycle } : {}),
-      });
-    },
-    { replayState: false },
-  );
-
-  try {
-    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
-      workspaceId: undefined,
-    });
-    observed.length = 0;
-    for await (const _event of await manager.streamAgent(agent.id, "finish in order")) {
-      // Drain through the terminal event.
-    }
-
-    expect(observed.findIndex((event) => event.type === "turn_completed")).toBeLessThan(
-      observed.findIndex((event) => event.type === "agent_state" && event.lifecycle === "idle"),
-    );
-  } finally {
-    manager.prepareForShutdown();
-    await manager.flushForShutdown();
-    rmSync(workdir, { recursive: true, force: true });
-  }
-});
 
 test("does not register a session that finishes starting after shutdown begins", async () => {
   const client = new HeldAgentCreationClient();
@@ -5009,34 +4970,52 @@ test("coalesces assistant chunks and persists the canonical row", async () => {
     }
   }
 
+  // The coalescer flushes the first chunk on the leading edge, so "final " ships
+  // as its own row and "reply" follows on the trailing window. Clients read the
+  // projected timeline, which merges the two back into one assistant message.
   const assistantTimelineEvents = streamEvents.filter(
     (event) => event.itemType === "assistant_message",
   );
-  expect(assistantTimelineEvents).toHaveLength(1);
+  expect(assistantTimelineEvents).toHaveLength(2);
   expect(assistantTimelineEvents[0]).toMatchObject({
     eventType: "timeline",
     itemType: "assistant_message",
-    text: "final reply",
+    text: "final ",
     seq: 1,
+    epoch: expect.any(String),
+  });
+  expect(assistantTimelineEvents[1]).toMatchObject({
+    eventType: "timeline",
+    itemType: "assistant_message",
+    text: "reply",
+    seq: 2,
     epoch: expect.any(String),
   });
 
   expect(manager.getTimeline(snapshot.id)).toEqual([
     {
       type: "assistant_message",
-      text: "final reply",
+      text: "final ",
+    },
+    {
+      type: "assistant_message",
+      text: "reply",
     },
   ]);
   const fetched = await manager.fetchTimeline(snapshot.id, {
     direction: "tail",
     limit: 0,
   });
-  expect(fetched.rows).toHaveLength(1);
+  expect(fetched.rows).toHaveLength(2);
   expect(assistantTimelineEvents[0]?.epoch).toBe(fetched.epoch);
-  expect(fetched.rows[0]?.item).toEqual({
-    type: "assistant_message",
-    text: "final reply",
-  });
+  expect(projectTimelineRows({ rows: fetched.rows, mode: "projected" }).map((e) => e.item)).toEqual(
+    [
+      {
+        type: "assistant_message",
+        text: "final reply",
+      },
+    ],
+  );
 });
 
 test("fetchTimeline supports older-history pagination with before seq", async () => {
@@ -5562,6 +5541,88 @@ test("waitForAgentRunStart resolves while a foreground run is still only pending
 
   await drainRun;
   expect(manager.getAgent(snapshot.id)?.lifecycle).toBe("idle");
+});
+
+test("waitForAgentRunStart ignores a prior turn error while the next run starts", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-error-resume-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const retryStartEntered = deferred<void>();
+  const releaseRetryStart = deferred<void>();
+
+  class ErrorThenResumeSession extends TestAgentSession {
+    override async startTurn(): Promise<{ turnId: string }> {
+      const turnId = `turn-${++this.turnIdCounter}`;
+      if (this.turnIdCounter === 1) {
+        void (async () => {
+          this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+          this.pushEvent({
+            type: "turn_failed",
+            provider: this.provider,
+            turnId,
+            error: "model at capacity",
+          });
+        })();
+        return { turnId };
+      }
+
+      retryStartEntered.resolve();
+      await releaseRetryStart.promise;
+      void (async () => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+      })();
+      return { turnId };
+    }
+  }
+
+  class ErrorThenResumeClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new ErrorThenResumeSession(config);
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new ErrorThenResumeClient() },
+    registry: storage,
+    logger,
+  });
+  let agentId: string | null = null;
+
+  try {
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = snapshot.id;
+
+    await manager.runAgent(agentId, "fail").catch(() => undefined);
+    expect(manager.getAgent(agentId)?.lifecycle).toBe("error");
+
+    const dispatch = await startAgentRun(manager, agentId, "resume", logger);
+    expect(dispatch.disposition).toBe("turn_started");
+    const wait = manager.waitForAgentRunStart(agentId);
+    let earlyResult: "pending" | "resolved" | "rejected" = "pending";
+    void wait.then(
+      () => {
+        earlyResult = "resolved";
+        return earlyResult;
+      },
+      () => {
+        earlyResult = "rejected";
+        return earlyResult;
+      },
+    );
+    await retryStartEntered.promise;
+    await Promise.resolve();
+
+    expect(earlyResult).toBe("pending");
+    releaseRetryStart.resolve();
+    await expect(wait).resolves.toBeUndefined();
+    await manager.waitForAgentEvent(agentId);
+  } finally {
+    releaseRetryStart.resolve();
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("replaceAgentRun does not emit idle or resolve waiters between interrupted and replacement runs", async () => {
@@ -10124,244 +10185,40 @@ test("onWorkspaceStateMayHaveChanged is not called for running shell tool calls"
   expect(onWorkspaceStateMayHaveChanged).not.toHaveBeenCalled();
 });
 
-// --- Message queue orchestration -------------------------------------------
 
-class QueueingAgentSession extends TestAgentSession {
-  override readonly capabilities = { ...TEST_CAPABILITIES, supportsMessageQueue: true };
-  readonly enqueueCalls: Array<{ prompt: AgentPromptInput; options: AgentEnqueueOptions }> = [];
-  acceptEnqueues = true;
-  activeTurnId: string | null = null;
-  private readonly queued: AgentQueuedMessage[] = [];
-
-  override async startTurn(): Promise<{ turnId: string }> {
-    const turnId = `turn-queue-${this.enqueueCalls.length}-${randomUUID()}`;
-    this.activeTurnId = turnId;
-    setTimeout(() => {
-      this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
-    }, 0);
-    return { turnId };
-  }
-
-  completeActiveTurn(): void {
-    const turnId = this.activeTurnId;
-    if (!turnId) {
-      throw new Error("no active turn to complete");
-    }
-    this.activeTurnId = null;
-    this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
-  }
-
-  async enqueuePrompt(
-    prompt: AgentPromptInput,
-    options: AgentEnqueueOptions,
-  ): Promise<AgentEnqueueResult> {
-    this.enqueueCalls.push({ prompt, options });
-    if (!this.acceptEnqueues) {
-      return { accepted: false };
-    }
-    this.queued.push({
-      clientMessageId: options.clientMessageId,
-      behavior: options.behavior,
-      text: typeof prompt === "string" ? prompt : "",
-    });
-    return { accepted: true, behavior: options.behavior, queue: [...this.queued] };
-  }
-}
-
-interface QueueFixture {
-  manager: AgentManager;
-  session: QueueingAgentSession;
-  agentId: string;
-  cleanup: () => void;
-}
-
-async function createQueueFixture(): Promise<QueueFixture> {
-  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-queue-"));
-  let session!: QueueingAgentSession;
-  const client = new (class extends TestAgentClient {
-    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
-      session = new QueueingAgentSession(config);
-      return session;
-    }
-  })();
+test("publishes terminal stream events before lifecycle state for every provider", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-terminal-order-"));
   const manager = new AgentManager({
-    clients: { codex: client },
-    registry: new AgentStorage(join(workdir, "agents"), logger),
+    clients: { codex: new TestAgentClient() },
     logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000098",
   });
-  const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
-    workspaceId: undefined,
-  });
-  return {
-    manager,
-    session,
-    agentId: snapshot.id,
-    cleanup: () => rmSync(workdir, { recursive: true, force: true }),
-  };
-}
+  const observed: Array<{ type: string; lifecycle?: string }> = [];
+  manager.subscribe(
+    (event) => {
+      observed.push({
+        type: event.type === "agent_stream" ? event.event.type : event.type,
+        ...(event.type === "agent_state" ? { lifecycle: event.agent.lifecycle } : {}),
+      });
+    },
+    { replayState: false },
+  );
 
-function countCanonicalUserRows(
-  manager: AgentManager,
-  agentId: string,
-  clientMessageId: string,
-): number {
-  return manager
-    .getTimeline(agentId)
-    .filter((item) => item.type === "user_message" && item.clientMessageId === clientMessageId)
-    .length;
-}
-
-test("enqueueAgentPrompt persists one canonical user row and allocates no competing run", async () => {
-  const fixture = await createQueueFixture();
   try {
-    const { manager, session, agentId } = fixture;
-
-    const drained = (async () => {
-      for await (const _ of manager.streamAgent(agentId, "first prompt")) {
-        // drain
-      }
-    })();
-    await vi.waitFor(() => {
-      expect(manager.getAgent(agentId)?.lifecycle).toBe("running");
-    });
-    const foregroundTurnId = manager.getAgent(agentId)?.activeForegroundTurnId;
-    expect(foregroundTurnId).not.toBeNull();
-
-    const result = await manager.enqueueAgentPrompt(agentId, "queued message", {
-      behavior: "steer",
-      clientMessageId: "cmid-1",
-    });
-
-    expect(result).toEqual({
-      accepted: true,
-      behavior: "steer",
-      queue: [{ clientMessageId: "cmid-1", behavior: "steer", text: "queued message" }],
-    });
-    expect(session.enqueueCalls).toEqual([
-      { prompt: "queued message", options: { behavior: "steer", clientMessageId: "cmid-1" } },
-    ]);
-    // Exactly one canonical user row, and the foreground run is untouched.
-    expect(countCanonicalUserRows(manager, agentId, "cmid-1")).toBe(1);
-    expect(manager.getAgent(agentId)?.activeForegroundTurnId).toBe(foregroundTurnId);
-
-    // A provider echo of the queued message must not duplicate the row.
-    session.pushEvent({
-      type: "timeline",
-      provider: session.provider,
-      turnId: foregroundTurnId ?? undefined,
-      item: { type: "user_message", text: "queued message", clientMessageId: "cmid-1" },
-    });
-    session.pushEvent({
-      type: "timeline",
-      provider: session.provider,
-      turnId: foregroundTurnId ?? undefined,
-      item: { type: "assistant_message", text: "echo marker" },
-    });
-    await vi.waitFor(() => {
-      expect(
-        manager
-          .getTimeline(agentId)
-          .some((item) => item.type === "assistant_message" && item.text === "echo marker"),
-      ).toBe(true);
-    });
-    expect(countCanonicalUserRows(manager, agentId, "cmid-1")).toBe(1);
-
-    session.completeActiveTurn();
-    await drained;
-    expect(manager.getAgent(agentId)?.lifecycle).toBe("idle");
-  } finally {
-    fixture.cleanup();
-  }
-});
-
-test("queued follow-up adoption tracks the provider-owned turn without broadcasting", async () => {
-  const fixture = await createQueueFixture();
-  try {
-    const { manager, session, agentId } = fixture;
-    const streamed: AgentStreamEvent[] = [];
-    const unsubscribe = manager.subscribe(
-      (event) => {
-        if (event.type === "agent_stream") {
-          streamed.push(event.event);
-        }
-      },
-      { agentId, replayState: false },
-    );
-
-    session.pushEvent({
-      type: "queued_message_adopted",
-      provider: session.provider,
-      clientMessageId: "cmid-follow",
-      behavior: "followUp",
-      turnId: "turn-follow-1",
-    });
-    await vi.waitFor(() => {
-      expect(manager.getAgent(agentId)?.lifecycle).toBe("running");
-    });
-    expect(manager.hasInFlightRun(agentId)).toBe(true);
-    // The adopted turn is provider-owned: no manager foreground turn exists.
-    expect(manager.getAgent(agentId)?.activeForegroundTurnId).toBeNull();
-
-    session.pushEvent({
-      type: "turn_completed",
-      provider: session.provider,
-      turnId: "turn-follow-1",
-    });
-    await vi.waitFor(() => {
-      expect(manager.getAgent(agentId)?.lifecycle).toBe("idle");
-    });
-    expect(manager.hasInFlightRun(agentId)).toBe(false);
-    expect(streamed.some((event) => event.type === "queued_message_adopted")).toBe(false);
-    unsubscribe();
-  } finally {
-    fixture.cleanup();
-  }
-});
-
-test("enqueueAgentPrompt declines for sessions without queue support", async () => {
-  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-queue-unsupported-"));
-  try {
-    const manager = new AgentManager({ clients: { codex: new TestAgentClient() }, logger });
-    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
       workspaceId: undefined,
     });
+    observed.length = 0;
+    for await (const _event of await manager.streamAgent(agent.id, "finish in order")) {
+      // Drain through the terminal event.
+    }
 
-    const result = await manager.enqueueAgentPrompt(snapshot.id, "hello", {
-      behavior: "steer",
-      clientMessageId: "cmid-unsupported",
-    });
-
-    expect(result).toEqual({ accepted: false });
-    expect(countCanonicalUserRows(manager, snapshot.id, "cmid-unsupported")).toBe(0);
+    expect(observed.findIndex((event) => event.type === "turn_completed")).toBeLessThan(
+      observed.findIndex((event) => event.type === "agent_state" && event.lifecycle === "idle"),
+    );
   } finally {
+    manager.prepareForShutdown();
+    await manager.flushForShutdown();
     rmSync(workdir, { recursive: true, force: true });
-  }
-});
-
-test("a declined enqueue leaves later provider user rows untouched", async () => {
-  const fixture = await createQueueFixture();
-  try {
-    const { manager, session, agentId } = fixture;
-    session.acceptEnqueues = false;
-
-    const result = await manager.enqueueAgentPrompt(agentId, "declined message", {
-      behavior: "followUp",
-      clientMessageId: "cmid-declined",
-    });
-    expect(result).toEqual({ accepted: false });
-    expect(countCanonicalUserRows(manager, agentId, "cmid-declined")).toBe(0);
-
-    // The dedup registration must be rolled back: a provider-emitted user row
-    // with the same id persists normally afterwards.
-    session.pushEvent({
-      type: "timeline",
-      provider: session.provider,
-      item: { type: "user_message", text: "declined message", clientMessageId: "cmid-declined" },
-    });
-    await vi.waitFor(() => {
-      expect(countCanonicalUserRows(manager, agentId, "cmid-declined")).toBe(1);
-    });
-  } finally {
-    fixture.cleanup();
   }
 });

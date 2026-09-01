@@ -4,7 +4,6 @@ import type {
   PiRuntimeSession,
   PiStartSessionInput,
 } from "../runtime.js";
-import type { PiPromptOptions } from "../runtime.js";
 import type {
   PiAgentMessage,
   PiModel,
@@ -13,7 +12,6 @@ import type {
   PiRuntimeEvent,
   PiSessionState,
   PiSessionStats,
-  PiStreamingBehavior,
   PiThinkingLevel,
 } from "../rpc-types.js";
 import { buildPiLaunch } from "../runtime.js";
@@ -96,11 +94,11 @@ export class FakePi implements PiRuntime {
 }
 
 export class FakePiSession implements PiRuntimeSession {
-  readonly prompts: Array<{
-    message: string;
-    imageCount: number;
-    streamingBehavior?: PiStreamingBehavior;
-  }> = [];
+  readonly prompts: Array<{ message: string; imageCount: number }> = [];
+  readonly steerCalls: Array<{ message: string; imageCount: number }> = [];
+  steerError: Error | null = null;
+  readonly controlRequests: string[] = [];
+  clearQueueError: Error | null = null;
   readonly compactRequests: Array<{ customInstructions?: string }> = [];
   readonly setAutoCompactionRequests: boolean[] = [];
   readonly subagentSubscriptionRequests: FakePiSubagentSubscriptionLevel[] = [];
@@ -126,7 +124,6 @@ export class FakePiSession implements PiRuntimeSession {
   // When set, setThinkingLevel reports this level from get_state (simulates
   // Pi clamping the requested level to the model's supported set).
   effectiveThinkingLevel: PiThinkingLevel | null = null;
-  queue: { steering: string[]; followUp: string[] } = { steering: [], followUp: [] };
   models: PiModel[] = [];
   messages: PiAgentMessage[] = [];
   stats: PiSessionStats = {
@@ -176,24 +173,11 @@ export class FakePiSession implements PiRuntimeSession {
   async prompt(
     message: string,
     images?: Array<{ type: "image"; data: string; mimeType: string }>,
-    options?: PiPromptOptions,
   ): Promise<PiPromptAck> {
-    this.prompts.push({
-      message,
-      imageCount: images?.length ?? 0,
-      ...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior } : {}),
-    });
+    this.prompts.push({ message, imageCount: images?.length ?? 0 });
     const promptError = this.promptErrors.shift() ?? this.promptError;
     if (promptError) {
       throw promptError;
-    }
-    if (options?.streamingBehavior && this.state.isStreaming) {
-      // Real Pi queues only while streaming; the same option starts a normal
-      // run when idle. queue_update precedes the prompt response.
-      const queued =
-        options.streamingBehavior === "steer" ? this.queue.steering : this.queue.followUp;
-      queued.push(message);
-      this.emitQueueUpdate();
     }
     const heldPrompt = this.nextHeldPrompt;
     if (heldPrompt) {
@@ -232,6 +216,23 @@ export class FakePiSession implements PiRuntimeSession {
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
 
+  async steer(
+    message: string,
+    images?: Array<{ type: "image"; data: string; mimeType: string }>,
+  ): Promise<void> {
+    this.steerCalls.push({ message, imageCount: images?.length ?? 0 });
+    if (this.steerError) {
+      throw this.steerError;
+    }
+  }
+
+  async clearQueue(): Promise<void> {
+    this.controlRequests.push("clear_queue");
+    if (this.clearQueueError) {
+      throw this.clearQueueError;
+    }
+  }
+
   async compact(customInstructions?: string): Promise<void> {
     this.compactRequests.push(customInstructions === undefined ? {} : { customInstructions });
     this.emit({ type: "compaction_start", reason: "manual" });
@@ -252,6 +253,7 @@ export class FakePiSession implements PiRuntimeSession {
   }
 
   async abort(): Promise<void> {
+    this.controlRequests.push("abort");
     this.abortRequested = true;
   }
 
@@ -448,22 +450,6 @@ export class FakePiSession implements PiRuntimeSession {
     this.emit({ type: "agent_settled" });
   }
 
-  emitQueueUpdate(): void {
-    this.emit({
-      type: "queue_update",
-      steering: [...this.queue.steering],
-      followUp: [...this.queue.followUp],
-    });
-  }
-
-  deliverQueuedPrompt(behavior: PiStreamingBehavior, message: string): void {
-    const queued = behavior === "steer" ? this.queue.steering : this.queue.followUp;
-    const index = queued.indexOf(message);
-    if (index !== -1) {
-      queued.splice(index, 1);
-    }
-    this.emitQueueUpdate();
-  }
 
   finishSubmittedUserMessage(entry: FakePiUserEntry): void {
     this.emit({
