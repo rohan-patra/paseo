@@ -125,6 +125,7 @@ export interface ProviderSnapshotEntry {
   fetchedAt?: string;
   label?: string;
   description?: string;
+  iconSvg?: string;
   defaultModeId?: string | null;
 }
 
@@ -214,7 +215,6 @@ export interface AgentRunOptions {
   maxThinkingTokens?: number;
   clientMessageId?: string;
 }
-
 
 export interface AgentSteerOptions extends AgentRunOptions {
   /** Deny permissions that block this steer. An accepted steer must honor this contract. */
@@ -408,6 +408,11 @@ export type AgentTimelineItem =
   | ToolCallTimelineItem
   | { type: "todo"; items: AgentTaskItem[] }
   | { type: "error"; message: string }
+  | {
+      type: "notification";
+      level: "info" | "warning" | "error";
+      message: string;
+    }
   | CompactionTimelineItem
   | PluginTimelineItem;
 
@@ -467,7 +472,7 @@ export type AgentStreamEvent =
       type: "provider_subagent";
       provider: AgentProvider;
       event: import("./provider-subagents/store.js").ProviderSubagentInputEvent;
-    }
+    };
 
 export function getAgentStreamEventTurnId(event: AgentStreamEvent): string | undefined {
   return "turnId" in event ? event.turnId : undefined;

@@ -912,7 +912,6 @@ function isPiRequestAbortError(error: unknown): boolean {
   return /\brequest was aborted\b|\babort(ed)?\b/i.test(toDiagnosticErrorMessage(error));
 }
 
-
 // Effective get_state precedence: the runtime's reported thinkingLevel is the
 // effective value (Pi may clamp a requested level to the model's supported
 // set); the locally cached option is only a fallback for Pi-compatible
@@ -981,6 +980,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function toNotificationLevel(value: unknown): "info" | "warning" | "error" {
+  if (value === "info" || value === "warning" || value === "error") {
+    return value;
+  }
+  return "info";
 }
 
 function parseExtensionMarkerPayload(
@@ -1384,19 +1390,9 @@ function mapExtensionUiSideEffect(
   event: Extract<PiRuntimeEvent, { type: "extension_ui_request" }>,
 ): Extract<AgentTimelineItem, { type: "tool_call" }> | null {
   let name: string;
-  let label: string | undefined;
   let text: string | undefined;
 
   switch (event.method) {
-    case "notify": {
-      const message = extensionUiText(event.message);
-      if (!message) return null;
-      const level = extensionUiText(event.notifyType);
-      name = "Notification";
-      label = level && level !== "info" ? level : undefined;
-      text = message;
-      break;
-    }
     case "setWidget": {
       const key = extensionUiText(event.widgetKey) ?? "update";
       const lines = extensionUiLines(event.widgetLines);
@@ -1422,7 +1418,7 @@ function mapExtensionUiSideEffect(
     name,
     status: "completed",
     error: null,
-    detail: { type: "plain_text", ...(label ? { label } : {}), text, icon: "sparkles" },
+    detail: { type: "plain_text", text, icon: "sparkles" },
     metadata: { source: "pi_extension_ui", method: event.method },
   };
 }
@@ -2238,7 +2234,6 @@ export class PiRpcAgentSession implements AgentSession {
     return supportedPiThinkingLevels(this.state.model);
   }
 
-
   private emit(event: AgentStreamEvent): void {
     for (const subscriber of this.subscribers) {
       subscriber(event);
@@ -2694,14 +2689,25 @@ export class PiRpcAgentSession implements AgentSession {
     if (event.method === "setStatus") return;
 
     const message = optionalString(event.message);
-    if (
-      event.method === "notify" &&
-      message &&
-      (this.handleSubmittedUserEntryMarker(message) ||
+    if (event.method === "notify" && message) {
+      if (
+        this.handleSubmittedUserEntryMarker(message) ||
         this.handleEntryCaptureMarker(message) ||
         this.handleCommandResultMarker(message) ||
-        this.handleSubagentMarker(message))
-    ) {
+        this.handleSubagentMarker(message)
+      ) {
+        return;
+      }
+      this.emit({
+        type: "timeline",
+        provider: this.provider,
+        turnId: this.currentTurnIdForEvent(),
+        item: {
+          type: "notification",
+          level: toNotificationLevel(event.notifyType),
+          message: extensionUiText(message) ?? message,
+        },
+      });
       return;
     }
 
