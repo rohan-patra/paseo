@@ -103,6 +103,8 @@ interface PiSubagentState {
   openToolDetails: Map<string, string>;
   /** Last prose row emitted, so a final summary that repeats it is not shown twice. */
   lastTimelineText: string;
+  /** Launch prompt already appended to the child timeline, keyed by its Bash call. */
+  launchInputMessageId: string | null;
 }
 
 export class PiSubagentIndex {
@@ -139,6 +141,9 @@ export class PiSubagentIndex {
 
     const descriptor = this.diffDescriptor(id, state, update);
     if (descriptor) events.push(descriptor);
+
+    const launchInput = this.consumeLaunchInput(id, state);
+    if (launchInput) events.push(launchInput);
 
     const item = this.consumeEvent(state, update);
     if (item) events.push({ type: "timeline", id, item });
@@ -195,6 +200,7 @@ export class PiSubagentIndex {
       seenMessageIds: new Set(),
       openToolDetails: new Map(),
       lastTimelineText: "",
+      launchInputMessageId: null,
     };
     this.states.set(id, state);
     return state;
@@ -216,7 +222,7 @@ export class PiSubagentIndex {
     const launch = this.launches.get(id);
     const next = {
       ...resolvePiSubagentIdentity(id, state, update),
-      description: launch?.task ?? state.description,
+      description: launch?.task ? bound(launch.task) : state.description,
       // A publish that carries no metrics yet must not blank a subtitle already
       // shown, so an empty build preserves the previous value.
       subtitle: buildPiSubagentSubtitle(update) ?? state.subtitle,
@@ -247,6 +253,22 @@ export class PiSubagentIndex {
     if (next.cwd !== state.cwd) event.cwd = next.cwd;
     Object.assign(state, next, { seen: true });
     return event;
+  }
+
+  private consumeLaunchInput(
+    id: string,
+    state: PiSubagentState,
+  ): ProviderSubagentInputEvent | null {
+    const launch = this.launches.get(id);
+    if (!launch?.task) return null;
+    const messageId = `pi-subagent:${id}:launch:${launch.toolCallId}`;
+    if (state.launchInputMessageId === messageId) return null;
+    state.launchInputMessageId = messageId;
+    return {
+      type: "timeline",
+      id,
+      item: { type: "user_message", text: launch.task, messageId },
+    };
   }
 
   /**
@@ -513,5 +535,5 @@ export function parsePiSubagentLaunchCommand(
   const flags = taskMatch ? command.replace(taskMatch[0], "") : command;
   if (/--(status|await|cancel|transcript|respond|message)\b/.test(flags)) return null;
   if (!task && !/--task-file\b/.test(flags)) return null;
-  return task ? { name, task: bound(task) } : { name };
+  return task ? { name, task } : { name };
 }

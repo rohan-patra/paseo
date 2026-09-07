@@ -403,6 +403,15 @@ describe("PiRpcAgentSession", () => {
         type: "timeline",
         id: "auth-research",
         item: {
+          type: "user_message",
+          text: "Trace token refresh.",
+          messageId: "pi-subagent:auth-research:launch:call_7",
+        },
+      },
+      {
+        type: "timeline",
+        id: "auth-research",
+        item: {
           type: "assistant_message",
           text: "Reading the refresh path.",
           messageId: "pi-subagent:auth-research:1",

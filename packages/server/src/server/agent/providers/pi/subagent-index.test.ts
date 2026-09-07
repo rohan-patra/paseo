@@ -73,13 +73,106 @@ describe("Pi provider subagent mapper", () => {
     ]);
   });
 
-  test("attaches the launching Bash call and its task text", () => {
+  test("adds the inline launch task after its descriptor and before child output", () => {
     const index = new PiSubagentIndex();
     index.noteLaunch("auth-research", { toolCallId: "call_7", task: "Trace token refresh." });
-    expect(upserts(index.apply(running))[0]).toMatchObject({
-      description: "Trace token refresh.",
-      toolCallId: "call_7",
+
+    expect(
+      index.apply({
+        ...running,
+        event: {
+          at: 1,
+          kind: "text",
+          summary: "Found the flow.",
+          details: { messageId: "auth-research:text:1" },
+        },
+      }),
+    ).toEqual([
+      {
+        type: "provider_subagent",
+        provider: "pi",
+        event: expect.objectContaining({
+          type: "upsert",
+          id: "auth-research",
+          description: "Trace token refresh.",
+          toolCallId: "call_7",
+        }),
+      },
+      {
+        type: "provider_subagent",
+        provider: "pi",
+        event: {
+          type: "timeline",
+          id: "auth-research",
+          item: {
+            type: "user_message",
+            text: "Trace token refresh.",
+            messageId: "pi-subagent:auth-research:launch:call_7",
+          },
+        },
+      },
+      {
+        type: "provider_subagent",
+        provider: "pi",
+        event: {
+          type: "timeline",
+          id: "auth-research",
+          item: {
+            type: "assistant_message",
+            text: "Found the flow.",
+            messageId: "pi-subagent:auth-research:auth-research:text:1",
+          },
+        },
+      },
+    ]);
+  });
+
+  test("preserves full multiline task text while bounding only the descriptor", () => {
+    const index = new PiSubagentIndex();
+    const task = `First line\n\nSecond line\n${"x".repeat(210)}`;
+    const description = `${task.replaceAll(/\s+/g, " ").trim().slice(0, 200)}…`;
+    index.noteLaunch("auth-research", { toolCallId: "call_7", task });
+
+    const events = index.apply(running);
+    expect(upserts(events)[0]?.description).toBe(description);
+    expect(timelines(events)).toContainEqual({
+      type: "timeline",
+      id: "auth-research",
+      item: {
+        type: "user_message",
+        text: task,
+        messageId: "pi-subagent:auth-research:launch:call_7",
+      },
     });
+  });
+
+  test("does not repeat a launch prompt when the relay republishes its first update", () => {
+    const index = new PiSubagentIndex();
+    const event = {
+      at: 1,
+      kind: "text",
+      summary: "Found the flow.",
+      details: { messageId: "auth-research:text:1" },
+    };
+    index.noteLaunch("auth-research", { toolCallId: "call_7", task: "Trace token refresh." });
+    index.apply({ ...running, event });
+
+    expect(index.apply({ ...running, event })).toEqual([]);
+  });
+
+  test("does not add a prompt row for a task-file launch", () => {
+    const index = new PiSubagentIndex();
+    const launch = parsePiSubagentLaunchCommand(
+      "pi --mode rpc --no-session --subagent --parent-session s1 --subagent-name auth-research --task-file /tmp/task.md",
+    );
+    expect(launch).toEqual({ name: "auth-research" });
+    if (!launch) throw new Error("expected task-file launch");
+    index.noteLaunch(launch.name, {
+      toolCallId: "call_7",
+      ...(launch.task ? { task: launch.task } : {}),
+    });
+
+    expect(timelines(index.apply(running))).toEqual([]);
   });
 
   test("maps every terminal task status onto a descriptor status", () => {
