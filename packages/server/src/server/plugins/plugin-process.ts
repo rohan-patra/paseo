@@ -1,10 +1,17 @@
+import { PluginHookHandlers } from "./lifecycle/index.js";
 import {
   PluginProcessRequestSchema,
   type PluginProcessMessage,
   type PluginProcessRequest,
 } from "./plugin-process-protocol.js";
 import { createRequire } from "node:module";
-import { defineAttachmentSource, defineRpc, type PluginRpcContract } from "@getpaseo/plugin";
+import {
+  defineSettings,
+  type SettingsDefinition,
+  defineAttachmentSource,
+  defineRpc,
+  type PluginRpcContract,
+} from "@getpaseo/plugin";
 import {
   ProviderEventSchema,
   type ProviderConnection,
@@ -21,6 +28,20 @@ import {
 } from "./plugin-sdk-specifiers.js";
 import { createPluginClientId } from "./plugin-session-identity.js";
 
+import { PluginSettingsStore } from "./settings/index.js";
+let settingsStore: PluginSettingsStore | null = null;
+function registerSettings(definition: SettingsDefinition) {
+  if (!settingsStore) throw new Error("Plugin settings storage is unavailable");
+  const handlers = settingsStore.register(definition);
+  register(handlers.read.contract, handlers.read.handle);
+  register(handlers.write.contract, (input) =>
+    handlers.write.handle(handlers.write.contract.input.parse(input)),
+  );
+  register(handlers.reset.contract, (input) =>
+    handlers.reset.handle(handlers.reset.contract.input.parse(input)),
+  );
+}
+
 type RpcHandler = (input: unknown, context: PluginHandlerContext) => unknown | Promise<unknown>;
 
 interface RegisteredRpc {
@@ -28,6 +49,9 @@ interface RegisteredRpc {
   handler: RpcHandler;
 }
 
+const hooks = new PluginHookHandlers(() => {
+  send({ type: "hooks.changed", hooks: hooks.catalog() });
+});
 const handlers = new Map<string, RegisteredRpc>();
 const providers = new Map<string, ProviderRegistration>();
 const providerConnections = new Map<
@@ -93,6 +117,12 @@ function registerProvider(provider: ProviderRegistration): void {
   if (typeof provider.connect !== "function") {
     throw new Error(`Plugin provider ${id} must implement connect()`);
   }
+  if (
+    provider.getCatalogCacheKey !== undefined &&
+    typeof provider.getCatalogCacheKey !== "function"
+  ) {
+    throw new Error(`Invalid catalogue key callback for plugin provider ${id}`);
+  }
   if (providers.has(id)) throw new Error(`Duplicate plugin provider ID: ${id}`);
   providers.set(id, { ...provider, id });
 }
@@ -103,6 +133,7 @@ function providerMetadata(provider: ProviderRegistration) {
     label: provider.label,
     description: provider.description,
     iconPath: provider.icon,
+    hasCatalogCacheKey: provider.getCatalogCacheKey !== undefined,
   };
 }
 
@@ -186,6 +217,7 @@ async function closeProviderConnection(connectionId: string): Promise<void> {
 
 const pluginAuthorRuntime = {
   defineAttachmentSource,
+  defineSettings,
   defineRpc,
   Icon() {
     throw new Error("Icon is available only in plugin client code");
@@ -211,7 +243,13 @@ function evaluateBundle(bundle: string): void {
   if (typeof setup !== "function") {
     throw new Error("Plugin server bundle must default export a function");
   }
-  const contributedCleanup = setup({ handle: register, registerProvider });
+  const contributedCleanup = setup({
+    handle: register,
+    registerProvider,
+    registerSettings,
+    on: hooks.on,
+    before: hooks.before,
+  });
   if (typeof contributedCleanup !== "function") {
     throw new Error("Plugin contribution must return a cleanup function");
   }
@@ -237,10 +275,16 @@ async function initialize(message: Extract<PluginProcessRequest, { type: "initia
   });
   paseo = createPaseoApi(daemonClient);
   await daemonClient.connect();
+  settingsStore = message.settingsDirectory
+    ? new PluginSettingsStore(message.settingsDirectory, (settingsId) =>
+        send({ type: "settings.changed", settingsId }),
+      )
+    : null;
   evaluateBundle(message.bundle);
   send({
     type: "ready",
     methods: [...handlers.keys()].sort(),
+    hooks: hooks.catalog(),
     providers: [...providers.values()]
       .sort((left, right) => left.id.localeCompare(right.id))
       .map(providerMetadata),
@@ -250,6 +294,7 @@ async function initialize(message: Extract<PluginProcessRequest, { type: "initia
 async function shutdown(): Promise<void> {
   if (stopping) return;
   stopping = true;
+  hooks.close();
   for (const pending of pendingProviderConnections.values()) pending.tombstoned = true;
   const currentCleanup = cleanup;
   cleanup = null;
@@ -297,7 +342,9 @@ process.on("message", (rawMessage: unknown) => {
     return;
   }
   if (stopping) {
-    if (message.type === "provider.connect") {
+    if (message.type === "provider.catalog_key") {
+      send({ type: "error", requestId: message.requestId, error: "Plugin is stopping" });
+    } else if (message.type === "provider.connect") {
       send({
         type: "provider.connect_failed",
         connectionId: message.connectionId,
@@ -313,6 +360,19 @@ process.on("message", (rawMessage: unknown) => {
     } else if (message.type === "provider.close") {
       send({ type: "provider.closed", connectionId: message.connectionId });
     }
+    return;
+  }
+  if (message.type === "provider.catalog_key") {
+    void (async () => {
+      const provider = providers.get(message.providerId);
+      if (!provider) throw new Error(`Unknown provider: ${message.providerId}`);
+      const output = await provider.getCatalogCacheKey?.(message.options);
+      if (output !== undefined && typeof output !== "string")
+        throw new Error("Invalid catalogue key");
+      send({ type: "result", requestId: message.requestId, output });
+    })().catch((error) =>
+      send({ type: "error", requestId: message.requestId, error: describeError(error) }),
+    );
     return;
   }
   if (message.type === "provider.connect") {
@@ -349,6 +409,10 @@ process.on("message", (rawMessage: unknown) => {
     return;
   }
   if (message.type === "paseo_frame" || message.type === "paseo_close") return;
+  if (isHookMessage(message)) {
+    handleHookMessage(message);
+    return;
+  }
   const registered = handlers.get(message.method);
   if (!registered) {
     send({
@@ -370,3 +434,37 @@ process.on("message", (rawMessage: unknown) => {
       (error) => send({ type: "error", requestId: message.requestId, error: describeError(error) }),
     );
 });
+
+function handleHookMessage(
+  message: Extract<PluginProcessRequest, { type: "hook" | "hook.cancel" }>,
+): void {
+  if (message.type === "hook.cancel") {
+    hooks.cancel(message.requestId);
+    return;
+  }
+  if (message.type === "hook") {
+    if (!paseo) {
+      send({
+        type: "error",
+        requestId: message.requestId,
+        error: "Plugin Paseo API is unavailable",
+      });
+      return;
+    }
+    void hooks.invoke(message.requestId, message.kind, message.name, message.input, paseo).then(
+      (output) => {
+        return send({ type: "result", requestId: message.requestId, output });
+      },
+      (error) => {
+        return send({ type: "error", requestId: message.requestId, error: describeError(error) });
+      },
+    );
+    return;
+  }
+}
+
+function isHookMessage(
+  message: PluginProcessRequest,
+): message is Extract<PluginProcessRequest, { type: "hook" | "hook.cancel" }> {
+  return message.type === "hook" || message.type === "hook.cancel";
+}

@@ -1704,7 +1704,9 @@ export class PiRpcAgentSession implements AgentSession {
   // Identifies the turn an in-flight interrupt() targets so late aborted
   // terminal responses are suppressed instead of surfacing as failures.
   private interruptingTurnId: string | null = null;
-  private lastInterruptedTurnId: string | null = null;
+  // Autonomous runs have no Paseo turn ID. Retain their terminal errors until
+  // the nonblocking abort promise settles.
+  private interruptingTurn: { error: string | null } | null = null;
   // Abort RPC still settling inside pi after interrupt() already acknowledged.
   // Runtime mutations that need an idle pi (startTurn, rewind) await it so they
   // cannot talk to the dying run; abortGeneration invalidates pending starts
@@ -1787,7 +1789,6 @@ export class PiRpcAgentSession implements AgentSession {
     const turnId = randomUUID();
     this.activeTurnId = turnId;
     this.usagePoller.startTurn();
-    this.lastInterruptedTurnId = null;
     this.activeClientMessageId = options?.clientMessageId ?? null;
     this.activeAssistantMessageId = null;
     this.activeTurnStarted = false;
@@ -1997,16 +1998,17 @@ export class PiRpcAgentSession implements AgentSession {
 
   async interrupt(): Promise<void> {
     const turnId = this.activeTurnId;
+    const autonomousInterruption = !turnId && this.activeTurnStarted ? { error: null } : null;
     this.abortGeneration += 1;
-    if (!turnId && this.abortInFlight) {
+    if (!turnId && !autonomousInterruption && this.abortInFlight) {
       // Turnless stop while an abort is already settling: acknowledge
       // immediately. The in-flight abort owns the settle; the generation bump
       // above already cancels any pending start waiting behind it.
       return;
     }
+    this.interruptingTurn = autonomousInterruption;
     if (turnId) {
       this.interruptingTurnId = turnId;
-      this.lastInterruptedTurnId = turnId;
     }
     void this.runtimeSession.clearQueue().catch((error: unknown) => {
       // COMPAT(piClearQueueFallback): added in v0.5.0, remove after 2027-03-01 once
@@ -2030,6 +2032,25 @@ export class PiRpcAgentSession implements AgentSession {
         if (this.interruptedTerminalError?.turnId === turnId) {
           this.interruptedTerminalError = null;
         }
+        if (this.interruptingTurn === autonomousInterruption && this.activeTurnStarted) {
+          this.usagePoller.stopTurn();
+          this.activeTurnStarted = false;
+          this.activeTurnStartedEmitted = false;
+          this.pendingSettledMessages = null;
+          this.activeAssistantMessageId = null;
+          this.pendingSteerSubmissions.length = 0;
+          this.clearNoTurnBuffers();
+          this.activeToolCalls.clear();
+          this.activeAskUserDialog = null;
+          this.pendingCombinedAskUserResponse = null;
+          this.emit({
+            type: "turn_canceled",
+            provider: this.provider,
+            reason: "interrupted",
+            turnId: undefined,
+          });
+          this.interruptingTurn = null;
+        }
         return undefined;
       })
       .catch((error: unknown) => {
@@ -2038,6 +2059,26 @@ export class PiRpcAgentSession implements AgentSession {
         }
         if (this.interruptedTerminalError?.turnId === turnId) {
           this.interruptedTerminalError = null;
+        }
+        const terminalError =
+          this.interruptingTurn === autonomousInterruption ? autonomousInterruption?.error : null;
+        if (this.interruptingTurn === autonomousInterruption) {
+          this.interruptingTurn = null;
+        }
+        if (terminalError && this.activeTurnStarted) {
+          this.usagePoller.stopTurn();
+          this.activeTurnStarted = false;
+          this.activeTurnStartedEmitted = false;
+          this.pendingSettledMessages = null;
+          this.activeAssistantMessageId = null;
+          this.pendingSteerSubmissions.length = 0;
+          this.clearNoTurnBuffers();
+          this.emit({
+            type: "turn_failed",
+            provider: this.provider,
+            turnId: undefined,
+            error: terminalError,
+          });
         }
         // Process death is reported via handleProcessExit; anything else is a
         // lost abort signal. Rethrow into the settlement barrier so startTurn
@@ -2082,6 +2123,9 @@ export class PiRpcAgentSession implements AgentSession {
         reason: "interrupted",
         turnId,
       });
+    }
+    if (autonomousInterruption) {
+      await settledAbort;
     }
   }
 
@@ -2896,10 +2940,11 @@ export class PiRpcAgentSession implements AgentSession {
     for (const event of this.subagentIndex.terminalizeRunning()) this.emit(event);
     this.rejectAllExtensionResults(new Error(error));
     this.pendingSettlement = null;
-    if (!this.activeTurnId) {
+    this.interruptingTurn = null;
+    if (!this.activeTurnId && !this.activeTurnStarted) {
       return;
     }
-    const turnId = this.activeTurnId;
+    const turnId = this.activeTurnId ?? undefined;
     this.usagePoller.stopTurn();
     this.activeTurnId = null;
     this.activeClientMessageId = null;
@@ -2917,7 +2962,7 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   private shouldDropDyingRunEvent(): boolean {
-    return !this.activeTurnId && this.abortInFlight !== null;
+    return this.interruptingTurnId !== null && !this.activeTurnId && this.abortInFlight !== null;
   }
 
   private handleSessionEvent(event: PiAgentSessionEvent): void {
@@ -3023,6 +3068,9 @@ export class PiRpcAgentSession implements AgentSession {
     event: Extract<PiAgentSessionEvent, { type: "agent_end" | "agent_settled" }>;
     turnId: string | undefined;
   }): void {
+    if (!this.activeTurnId && !this.activeTurnStarted) {
+      return;
+    }
     if (event.type === "agent_end") {
       // COMPAT(piAgentSettled): added in v0.5.0, remove after 2027-02-21 once the Pi
       // floor emits agent_settled and willRetry.
@@ -3030,14 +3078,10 @@ export class PiRpcAgentSession implements AgentSession {
         this.completeTurn(turnId, event.messages ?? []);
         return;
       }
-      if (this.activeTurnId) {
-        this.pendingSettledMessages = event.messages ?? [];
-      }
+      this.pendingSettledMessages = event.messages ?? [];
       return;
     }
-    if (this.activeTurnId) {
-      this.completeTurn(turnId, this.pendingSettledMessages ?? []);
-    }
+    this.completeTurn(turnId, this.pendingSettledMessages ?? []);
   }
 
   private handleToolExecutionEnd(
@@ -3168,7 +3212,7 @@ export class PiRpcAgentSession implements AgentSession {
     if (event.message.role === "custom") {
       // Extension output can arrive after cancellation. It is not a terminal
       // event unless a live Paseo turn still owns it.
-      if (!turnId || turnId !== this.activeTurnId) return;
+      if (turnId ? turnId !== this.activeTurnId : !this.activeTurnStarted) return;
       const text = getUserMessageText(event.message.content);
       if (text) {
         this.emit({
@@ -3227,23 +3271,26 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   private completeTurn(turnId: string | undefined, messages: PiAgentMessage[]): void {
-    // Terminal delivery is exactly once and only for the live Paseo turn.
-    // Pi can emit late/overlapping terminal-shaped events (custom message_end,
-    // agent_end, agent_settled) around cancellation and extension handling.
-    if (!turnId || this.activeTurnId !== turnId) return;
-    if (this.interruptingTurnId === turnId && isPiAbortedTerminalResponse(messages)) {
-      this.interruptedTerminalError = {
-        turnId,
-        error: latestPiErrorMessage(messages) ?? "Pi turn failed",
-      };
-      return;
-    }
-    if (
-      isPiAbortedTerminalResponse(messages) &&
-      (turnId === this.lastInterruptedTurnId || (!turnId && this.lastInterruptedTurnId !== null))
-    ) {
-      this.lastInterruptedTurnId = null;
-      return;
+    const errorMessage = latestPiErrorMessage(messages);
+    if (turnId) {
+      // Terminal delivery is exactly once and only for the live Paseo turn.
+      // Pi can emit late/overlapping terminal-shaped events (custom message_end,
+      // agent_end, agent_settled) around cancellation and extension handling.
+      if (this.activeTurnId !== turnId) return;
+      if (this.interruptingTurnId === turnId && isPiAbortedTerminalResponse(messages)) {
+        this.interruptedTerminalError = {
+          turnId,
+          error: errorMessage ?? "Pi turn failed",
+        };
+        return;
+      }
+    } else {
+      if (!this.activeTurnStarted) return;
+      if (this.interruptingTurn && (errorMessage || isPiAbortedTerminalResponse(messages))) {
+        this.interruptingTurn.error = errorMessage ?? "Pi turn failed";
+        return;
+      }
+      this.interruptingTurn = null;
     }
     this.activeTurnId = null;
     this.pendingSettlement = null;
@@ -3254,7 +3301,6 @@ export class PiRpcAgentSession implements AgentSession {
     this.pendingSettledMessages = null;
     this.pendingSteerSubmissions.length = 0;
     this.clearNoTurnBuffers();
-    const errorMessage = latestPiErrorMessage(messages);
     if (typeof errorMessage === "string" && errorMessage.length > 0) {
       this.usagePoller.stopTurn();
       this.emit({
