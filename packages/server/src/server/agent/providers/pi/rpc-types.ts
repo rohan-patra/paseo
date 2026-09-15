@@ -8,7 +8,6 @@ export type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "x
  */
 export type PiThinkingLevelMap = Partial<Record<PiThinkingLevel, string | null>>;
 
-
 export interface PiImageContent {
   type: "image";
   data: string;

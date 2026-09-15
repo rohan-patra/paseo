@@ -450,7 +450,6 @@ export class FakePiSession implements PiRuntimeSession {
     this.emit({ type: "agent_settled" });
   }
 
-
   finishSubmittedUserMessage(entry: FakePiUserEntry): void {
     this.emit({
       type: "message_end",
