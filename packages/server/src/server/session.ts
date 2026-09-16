@@ -564,11 +564,23 @@ export type SessionLifecycleIntent =
 function parseClientCapabilities(
   capabilities: Record<string, unknown> | null | undefined,
 ): ReadonlySet<ClientCapability> {
+  // COMPAT(projectedSubagentTimeline): TEMPORARY FORK PATCH, added 2026-09-16.
+  // Every released client (desktop v0.8.0, iOS App Store) predates the
+  // `projected_subagent_timeline` capability introduced after v0.8.0
+  // (upstream #4838), so without this the daemon degrades all subagent
+  // transcripts to the "Please upgrade the Paseo app" placeholder row. This
+  // shim makes the daemon grant the capability to every client, restoring
+  // pre-#4838 timeline delivery (projection/seqStart/seqEnd/sourceSeqRanges
+  // fields are additive per the protocol contract, so old clients parse the
+  // responses). Known risk: v0.8.0 clients were never tested against
+  // projected rows; revert if subagent transcripts render duplicated or
+  // glitched tool rows. REMOVE once a client release advertises the
+  // capability on its own; grep for TEMPORARY FORK PATCH to find this site.
+  const result: ClientCapability[] = [CLIENT_CAPS.projectedSubagentTimeline];
   if (!capabilities) {
-    return new Set();
+    return new Set(result);
   }
   const known = new Set<ClientCapability>(Object.values(CLIENT_CAPS));
-  const result: ClientCapability[] = [];
   for (const [key, value] of Object.entries(capabilities)) {
     if (value === true && known.has(key as ClientCapability)) {
       result.push(key as ClientCapability);

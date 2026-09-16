@@ -11,7 +11,14 @@ import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.j
 import { createFakeCodexAppServer } from "./providers/codex/test-utils/fake-app-server.js";
 import type { AgentClient } from "./agent-sdk-types.js";
 
-test("projects Codex child history and confines old-client degradation to the child transcript", async () => {
+// TEMPORARY FORK PATCH, added 2026-09-16: upstream pins old-client degradation
+// (the "Please upgrade the Paseo app" placeholder), but this fork grants
+// `projected_subagent_timeline` to every client in parseClientCapabilities
+// (server/session.ts) because no released client advertises it yet. The
+// legacy-client assertions below expect real projected rows accordingly.
+// Restore upstream's degradation assertions when removing the fork patch
+// (once a client release advertises the capability).
+test("projects Codex child history and serves projected rows to legacy clients", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "paseo-projected-contract-"));
   const app = createFakeCodexAppServer();
   const session = new CodexAppServerAgentSession(
@@ -80,8 +87,11 @@ test("projects Codex child history and confines old-client degradation to the ch
     });
     expect(catchUp.rows).toMatchObject([{ item: { text: "ABC" } }]);
     const oldChild = await legacy.fetchProviderSubagentTimeline(agent.id, "child-thread");
+    // TEMPORARY FORK PATCH: legacy clients receive real projected rows (see top
+    // of file); upstream expects the upgrade placeholder here instead.
+    expect(oldChild.projection).toBe("projected");
     expect(oldChild.rows).toMatchObject([
-      { item: { type: "assistant_message", text: expect.stringContaining("upgrade") } },
+      { seqStart: 1, seqEnd: 3, item: { type: "assistant_message", text: "ABC" } },
     ]);
     expect((await legacy.listProviderSubagents(agent.id)).subagents).toHaveLength(1);
     expect(
@@ -90,12 +100,14 @@ test("projects Codex child history and confines old-client degradation to the ch
           message.type === "agent.provider_subagents.update" && message.payload.kind === "upsert",
       ),
     ).toBe(true);
+    // TEMPORARY FORK PATCH: with the capability granted, legacy clients also
+    // receive streaming child timeline updates, as they did pre-#4838.
     expect(
       messages.messages.some(
         (message) =>
           message.type === "agent.provider_subagents.update" && message.payload.kind === "timeline",
       ),
-    ).toBe(false);
+    ).toBe(true);
     const root = await legacy.fetchAgentTimeline(agent.id, { projection: "canonical", limit: 0 });
     expect(root.error).toBeNull();
     expect(root.projection).toBe("projected");

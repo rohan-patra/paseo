@@ -91,3 +91,13 @@ When a tag's condition is met, delete the shim and the tag in the same change.
 ## QA
 
 Tests don't fully cover compatibility. If you touched `packages/protocol`, say in the pull request why an older app still parses your message and why an older daemon still satisfies your app. See [qa.md](qa.md).
+
+## Fork patches (temporary)
+
+This fork carries temporary compatibility patches that upstream does not have. Each one is tagged
+`TEMPORARY FORK PATCH` at the site and listed here with its removal condition. When the condition is
+met, delete the patch, its tests' fork-specific assertions, and this entry in the same change.
+
+| Patch                                                                                                                                                                                | Site                                                                                                                                | Removal condition                                                                                                                                 |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Grant `projected_subagent_timeline` to every client (upstream #4838 gates it; no released client advertises it, so subagent transcripts degrade to the "Please upgrade" placeholder) | `parseClientCapabilities` in `packages/server/src/server/session.ts`, plus fork assertions in `projected-timeline-contract.test.ts` | A Paseo desktop/iOS release ships a client that advertises `projected_subagent_timeline` on its own. Search `TEMPORARY FORK PATCH` for all sites. |
