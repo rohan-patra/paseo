@@ -24,6 +24,7 @@ import {
   type AgentRunOptions,
   type AgentRunResult,
   type AgentRuntimeInfo,
+  type AgentSelectOption,
   type AgentSession,
   type AgentSessionConfig,
   type AgentSlashCommand,
@@ -85,11 +86,7 @@ import {
   PiSubagentIndex,
   type PiSubagentUpdate,
 } from "./subagent-index.js";
-import {
-  clampPiThinkingLevel,
-  normalizePiThinkingOption,
-  supportedPiThinkingLevels,
-} from "./thinking-levels.js";
+import { normalizePiThinkingOption, supportedPiThinkingLevels } from "./thinking-levels.js";
 import {
   mapToolDetail,
   parseToolArgs,
@@ -191,12 +188,11 @@ const PI_THINKING_OPTIONS: ReadonlyArray<{
   id: PiThinkingLevel;
   label: string;
   description: string;
-  isDefault?: boolean;
 }> = [
   { id: "off", label: "Off", description: "No extra reasoning" },
   { id: "minimal", label: "Minimal", description: "Light reasoning" },
   { id: "low", label: "Low", description: "Faster reasoning" },
-  { id: "medium", label: "Medium", description: "Balanced reasoning", isDefault: true },
+  { id: "medium", label: "Medium", description: "Balanced reasoning" },
   { id: "high", label: "High", description: "Deeper reasoning" },
   { id: "xhigh", label: "XHigh", description: "Very deep reasoning" },
   { id: "max", label: "Max", description: "Extreme reasoning" },
@@ -374,26 +370,10 @@ function parseAutoCompactMode(value: string | undefined): AutoCompactMode {
   return "unknown";
 }
 
-function mapThinkingOption(option: (typeof PI_THINKING_OPTIONS)[number]) {
-  const mappedOption = {
-    id: option.id,
-    label: option.label,
-    description: option.description,
-  };
-  if (option.isDefault) {
-    return {
-      ...mappedOption,
-      isDefault: true,
-    };
-  }
-  return mappedOption;
-}
-
 function describePiModelForNotice(model: PiModel | null | undefined): string {
   const id = modelToId(model);
   return id ? `model '${id}'` : "the current model";
 }
-
 function piModelSupportsImageInput(model: PiModel | null | undefined): boolean {
   return model?.input?.includes("image") === true;
 }
@@ -910,20 +890,6 @@ function isPiRequestAbortError(error: unknown): boolean {
   }
 
   return /\brequest was aborted\b|\babort(ed)?\b/i.test(toDiagnosticErrorMessage(error));
-}
-
-// Effective get_state precedence: the runtime's reported thinkingLevel is the
-// effective value (Pi may clamp a requested level to the model's supported
-// set); the locally cached option is only a fallback for Pi-compatible
-// runtimes that omit it from state.
-function resolveThinkingOptionId(
-  cachedThinkingOptionId: string | null,
-  sessionThinkingLevel: PiThinkingLevel | undefined,
-): PiThinkingLevel | null {
-  return (
-    normalizePiThinkingOption(sessionThinkingLevel) ??
-    normalizePiThinkingOption(cachedThinkingOptionId)
-  );
 }
 
 function modelToId(model: PiModel | null | undefined): string | null {
@@ -1612,8 +1578,50 @@ function buildExtensionUiResponse(
   return { value: answer };
 }
 
+function resolvePiThinkingConfig(
+  model: PiModel,
+): Pick<AgentModelDefinition, "thinkingOptions" | "defaultThinkingOptionId"> {
+  if (!model.reasoning) {
+    return { thinkingOptions: undefined, defaultThinkingOptionId: undefined };
+  }
+
+  const supportedOptions = PI_THINKING_OPTIONS.filter((option) => {
+    const mapped = model.thinkingLevelMap?.[option.id];
+    if (mapped === null) {
+      return false;
+    }
+    if (option.id === "xhigh" || option.id === "max") {
+      return mapped !== undefined;
+    }
+    return true;
+  });
+  const defaultIndex = PI_THINKING_OPTIONS.findIndex(
+    (option) => option.id === DEFAULT_PI_THINKING_LEVEL,
+  );
+  // Pi clamps upward first, then falls back to the highest remaining lower level.
+  const higherDefault = supportedOptions.find(
+    (option) => PI_THINKING_OPTIONS.indexOf(option) >= defaultIndex,
+  );
+  const defaultOption = higherDefault ?? supportedOptions.at(-1);
+  const defaultThinkingOptionId = defaultOption?.id ?? "off";
+  return {
+    thinkingOptions: supportedOptions.map((option) => {
+      const mappedOption: AgentSelectOption = {
+        id: option.id,
+        label: option.label,
+        description: option.description,
+      };
+      if (option.id === defaultThinkingOptionId) {
+        mappedOption.isDefault = true;
+      }
+      return mappedOption;
+    }),
+    defaultThinkingOptionId,
+  };
+}
+
 function mapPiModel(model: PiModel, provider: AgentProvider): AgentModelDefinition {
-  const supportedLevels = supportedPiThinkingLevels(model);
+  const { thinkingOptions, defaultThinkingOptionId } = resolvePiThinkingConfig(model);
   return {
     provider,
     id: `${model.provider}/${model.id}`,
@@ -1623,14 +1631,8 @@ function mapPiModel(model: PiModel, provider: AgentProvider): AgentModelDefiniti
       provider: model.provider,
       modelId: model.id,
     },
-    thinkingOptions: model.reasoning
-      ? PI_THINKING_OPTIONS.filter((option) => supportedLevels.includes(option.id)).map(
-          mapThinkingOption,
-        )
-      : undefined,
-    defaultThinkingOptionId: model.reasoning
-      ? clampPiThinkingLevel(DEFAULT_PI_THINKING_LEVEL, supportedLevels)
-      : undefined,
+    thinkingOptions,
+    defaultThinkingOptionId,
   };
 }
 
@@ -1678,7 +1680,6 @@ export class PiRpcAgentSession implements AgentSession {
   private activePromptRequestId: string | null = null;
   private readonly pendingPromptResults = new Map<string, boolean>();
   private readonly pendingSteerSubmissions: PiPendingSteerSubmission[] = [];
-  private lastKnownThinkingOptionId: string | null;
   currentLeafOverrideId: string | null | undefined;
   private readonly capturedUserEntries: PiCapturedEntry[] = [];
   private readonly capturedUserEntriesById = new Map<string, PiCapturedEntry>();
@@ -1719,14 +1720,11 @@ export class PiRpcAgentSession implements AgentSession {
     this.runtimeSession = options.runtimeSession;
     this.config = options.config;
     this.state = options.initialState;
+    this.config.thinkingOptionId = this.state.thinkingLevel;
     this.capabilities = options.capabilities;
     this.provider = PI_PROVIDER;
     this.currentModeId = options.currentModeId ?? null;
     this.cleanup = options.cleanup;
-    this.lastKnownThinkingOptionId =
-      normalizePiThinkingOption(options.config.thinkingOptionId) ??
-      this.state.thinkingLevel ??
-      null;
     this.extensionTimeoutMs = options.extensionTimeoutMs ?? DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS;
     this.logger = options.logger;
     this.usagePoller = new PiUsagePoller({
@@ -1932,10 +1930,7 @@ export class PiRpcAgentSession implements AgentSession {
       provider: this.provider,
       sessionId: this.state.sessionId,
       model: modelToId(this.state.model),
-      thinkingOptionId: resolveThinkingOptionId(
-        this.lastKnownThinkingOptionId,
-        this.state.thinkingLevel,
-      ),
+      thinkingOptionId: this.state.thinkingLevel,
       modeId: this.currentModeId,
     };
   }
@@ -2232,29 +2227,17 @@ export class PiRpcAgentSession implements AgentSession {
     }
 
     const model = await this.runtimeSession.setModel(parsedReference.provider, parsedReference.id);
-    this.state = {
-      ...this.state,
-      model,
-    };
+    await this.refreshState();
     this.config.model = `${model.provider}/${model.id}`;
   }
 
   async setThinkingOption(thinkingOptionId: string | null): Promise<void | AgentProviderNotice> {
     const requested = normalizePiThinkingOption(thinkingOptionId) ?? DEFAULT_PI_THINKING_LEVEL;
-    const supportedLevels = await this.getAvailableThinkingLevels();
-    const clamped = clampPiThinkingLevel(requested, supportedLevels);
-    await this.runtimeSession.setThinkingLevel(clamped);
-    // Effective get_state precedence: Pi may clamp beyond our supported-level
-    // view (e.g. per-provider mapping quirks); the runtime's reported level is
-    // the effective one.
-    await this.refreshState().catch(() => undefined);
-    const effective = normalizePiThinkingOption(this.state.thinkingLevel) ?? clamped;
-    this.lastKnownThinkingOptionId = effective;
-    this.config.thinkingOptionId = effective;
-    this.state = {
-      ...this.state,
-      thinkingLevel: effective,
-    };
+    // Ask the runtime first: Pi clamps unsupported requests itself, so send the
+    // requested level verbatim and adopt whatever get_state reports afterwards.
+    await this.runtimeSession.setThinkingLevel(requested);
+    await this.refreshState();
+    const effective = normalizePiThinkingOption(this.state.thinkingLevel) ?? requested;
     if (effective !== requested) {
       return {
         type: "info",
@@ -3322,6 +3305,7 @@ export class PiRpcAgentSession implements AgentSession {
 
   private async refreshState(): Promise<void> {
     this.state = await this.runtimeSession.getState();
+    this.config.thinkingOptionId = this.state.thinkingLevel;
   }
 
   private async refreshAfterTurn(finalUsage: Promise<void>): Promise<void> {
@@ -3368,8 +3352,7 @@ export class PiRpcAgentClient implements AgentClient {
       runtimeSession = await this.runtime.startSession({
         cwd: config.cwd,
         model: config.model,
-        thinkingOptionId:
-          normalizePiThinkingOption(config.thinkingOptionId) ?? DEFAULT_PI_THINKING_LEVEL,
+        thinkingOptionId: normalizePiThinkingOption(config.thinkingOptionId) ?? undefined,
         noSession: config.internal === true,
         env: launchContext?.env,
         mcpConfigPath: mcpConfig?.path,

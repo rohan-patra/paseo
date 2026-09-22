@@ -121,9 +121,6 @@ export class FakePiSession implements PiRuntimeSession {
   readonly promptErrors: Error[] = [];
   availableThinkingLevels: PiThinkingLevel[] | null = null;
   availableThinkingLevelsError: Error | null = null;
-  // When set, setThinkingLevel reports this level from get_state (simulates
-  // Pi clamping the requested level to the model's supported set).
-  effectiveThinkingLevel: PiThinkingLevel | null = null;
   models: PiModel[] = [];
   messages: PiAgentMessage[] = [];
   stats: PiSessionStats = {
@@ -277,15 +274,12 @@ export class FakePiSession implements PiRuntimeSession {
     if (!this.setModelResult) {
       throw new Error("FakePi setModel requires setModelResult to be scripted");
     }
+    this.state = { ...this.state, model: this.setModelResult };
     return this.setModelResult;
   }
 
   async setThinkingLevel(level: string): Promise<void> {
     this.setThinkingLevelRequests.push(level);
-    this.state = {
-      ...this.state,
-      thinkingLevel: this.effectiveThinkingLevel ?? (level as PiThinkingLevel),
-    };
   }
 
   async getAvailableThinkingLevels(): Promise<PiThinkingLevel[]> {
