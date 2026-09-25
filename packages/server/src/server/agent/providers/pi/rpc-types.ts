@@ -1,13 +1,5 @@
 export type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
-/**
- * Model-specific thinking controls. Tristate per Pi level: a string maps the
- * level to a provider value (supported), `null` marks it unsupported, and an
- * omitted key keeps standard levels (off..high) on the provider default while
- * extended levels (xhigh, max) stay unsupported.
- */
-export type PiThinkingLevelMap = Partial<Record<PiThinkingLevel, string | null>>;
-
 export interface PiImageContent {
   type: "image";
   data: string;
@@ -78,6 +70,7 @@ export interface PiModel {
   id: string;
   name?: string;
   reasoning?: boolean;
+  thinkingLevelMap?: Record<string, string | null>;
   contextWindow?: number;
   maxTokens?: number;
   api?: string;
@@ -85,7 +78,6 @@ export interface PiModel {
   input?: string[];
   cost?: Record<string, unknown>;
   compat?: unknown;
-  thinkingLevelMap?: PiThinkingLevelMap;
 }
 
 export interface PiSessionState {
@@ -159,7 +151,9 @@ export interface PiRpcResponse {
 export type PiAssistantMessageEvent =
   | { type: "text_delta"; delta?: string }
   | { type: "thinking_delta"; delta?: string; contentIndex?: number }
-  | { type: "start" | "text_start" | "text_end" | "thinking_start" | "thinking_end" | "done" };
+  | {
+      type: "start" | "text_start" | "text_end" | "thinking_start" | "thinking_end" | "done";
+    };
 
 export type PiAgentSessionEvent =
   // `runId` is optional for compatibility with current Pi RPC. New Pi runtimes
@@ -195,7 +189,10 @@ export type PiAgentSessionEvent =
       result: unknown;
       isError?: boolean;
     }
-  | { type: "compaction_start"; reason?: "manual" | "threshold" | "overflow" | string }
+  | {
+      type: "compaction_start";
+      reason?: "manual" | "threshold" | "overflow" | string;
+    }
   | {
       type: "compaction_end";
       reason?: string;
@@ -205,7 +202,12 @@ export type PiAgentSessionEvent =
     }
   // Old Pi omits willRetry entirely; new Pi always sends an explicit boolean
   // and follows the settled run with agent_settled.
-  | { type: "agent_end"; messages?: PiAgentMessage[]; willRetry?: boolean; runId?: string }
+  | {
+      type: "agent_end";
+      messages?: PiAgentMessage[];
+      willRetry?: boolean;
+      runId?: string;
+    }
   | { type: "agent_settled"; runId?: string }
   | {
       type: "auto_retry_start";
@@ -214,7 +216,12 @@ export type PiAgentSessionEvent =
       delayMs: number;
       errorMessage: string;
     }
-  | { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
+  | {
+      type: "auto_retry_end";
+      success: boolean;
+      attempt: number;
+      finalError?: string;
+    };
 
 export type PiRuntimeEvent =
   | PiAgentSessionEvent

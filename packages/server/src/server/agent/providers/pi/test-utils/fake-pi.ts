@@ -109,7 +109,10 @@ export class FakePiSession implements PiRuntimeSession {
   readonly handoffRequests: Array<{ customInstructions?: string }> = [];
   readonly sessionNameRequests: string[] = [];
   readonly rawFrames: Array<object & { type: string }> = [];
-  capturedUserEntries: Array<{ id: string; parentId: string | null; text: string }> = [];
+  // Every user entry in the session file, including rewound and compacted ones.
+  treeUserEntries: FakePiUserEntry[] = [];
+  // The user entries on the current branch that getMessages() replays.
+  contextUserEntries: FakePiUserEntry[] = [];
   abortRequested = false;
   readonly canceledExtensionUiRequests: string[] = [];
   readonly extensionUiResponses: Array<{
@@ -498,7 +501,8 @@ export class FakePiSession implements PiRuntimeSession {
       message: `PASEO_ENTRY_CAPTURE ${JSON.stringify({
         reason,
         requestId,
-        entries: this.capturedUserEntries,
+        treeEntries: this.treeUserEntries,
+        contextEntries: this.contextUserEntries,
       })}`,
     });
   }
