@@ -23,7 +23,9 @@ import {
   PiRpcAgentSession,
   transformPiModels,
 } from "./agent.js";
-import { FakePi } from "./test-utils/fake-pi.js";
+import { FakePi, type FakePiSession } from "./test-utils/fake-pi.js";
+import { createPiExtensionHost } from "./extensions/index.js";
+import { PiExtensionHost } from "./extensions/host.js";
 import type { PiModel, PiThinkingLevel } from "./rpc-types.js";
 import type { PiUsagePollScheduler } from "./usage-poller.js";
 
@@ -247,6 +249,71 @@ async function createSession(
   const events = new SessionEvents(session);
   return { pi, session, events };
 }
+
+test("Pi usage reference follows the current OAuth model and agent directory", async () => {
+  const agentDir = mkdtempSync(path.join(tmpdir(), "paseo-pi-usage-"));
+  try {
+    writeFileSync(
+      path.join(agentDir, "auth.json"),
+      JSON.stringify({
+        "openai-codex": {
+          type: "oauth",
+          access: "codex-token",
+          accountId: "account-1",
+          refresh: "refresh",
+          expires: Date.now() + 60_000,
+        },
+        anthropic: {
+          type: "oauth",
+          access: "claude-token",
+          refresh: "refresh",
+          expires: Date.now() + 60_000,
+        },
+      }),
+    );
+    const pi = new FakePi();
+    let runtime!: FakePiSession;
+    pi.queueSessionSetup((sessionRuntime) => {
+      runtime = sessionRuntime;
+      runtime.state.model = { provider: "openai-codex", id: "gpt", name: "GPT" };
+    });
+    const session = await createClient(pi).createSession(createConfig(), {
+      env: { PI_CODING_AGENT_DIR: agentDir },
+    });
+    expect(await session.getUsageReference?.()).toEqual({
+      source: "codex",
+      input: { accessToken: "codex-token", accountId: "account-1" },
+    });
+    runtime.state.model = { provider: "anthropic", id: "claude", name: "Claude" };
+    expect(await session.getUsageReference?.()).toEqual({
+      source: "claude",
+      input: { accessToken: "claude-token" },
+    });
+    writeFileSync(
+      path.join(agentDir, "auth.json"),
+      JSON.stringify({
+        "openai-codex": { type: "oauth", access: "codex-token" },
+        anthropic: { type: "api_key", key: "api-key" },
+      }),
+    );
+    runtime.state.model = { provider: "openai-codex", id: "gpt", name: "GPT" };
+    expect(await session.getUsageReference?.()).toEqual({
+      source: "codex",
+      input: { accessToken: "codex-token" },
+    });
+    runtime.state.model = { provider: "anthropic", id: "claude", name: "Claude" };
+    writeFileSync(
+      path.join(agentDir, "auth.json"),
+      JSON.stringify({ anthropic: { type: "api_key", key: "api-key" } }),
+    );
+    expect(await session.getUsageReference?.()).toBeNull();
+    runtime.state.model = { provider: "other", id: "other", name: "Other" };
+    expect(await session.getUsageReference?.()).toBeNull();
+    await session.close();
+  } finally {
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
 
 test("forwards launch-context env to the Pi process launch", async () => {
   const pi = new FakePi();
@@ -659,6 +726,103 @@ describe("PiRpcAgentSession", () => {
     await session.close();
   });
 
+  test("completes a turn and answers a dialog when an adapter throws", async () => {
+    const { pi, session, events } = await createSession();
+    Object.assign(session, {
+      extensionHost: createPiExtensionHost(undefined, [
+        {
+          id: "throwing-test-adapter",
+          createSession: () => ({
+            mapToolCall: () => {
+              throw new Error("tool failed");
+            },
+            onToolStart: () => {
+              throw new Error("start failed");
+            },
+            onToolEnd: () => {
+              throw new Error("end failed");
+            },
+            mapDialog: () => {
+              throw new Error("dialog failed");
+            },
+            respondToPermission: () => {
+              throw new Error("response failed");
+            },
+          }),
+        },
+      ]),
+    });
+    const fakeSession = pi.latestSession();
+    await session.startTurn("run");
+    fakeSession.emit({
+      type: "tool_execution_start",
+      toolCallId: "x",
+      toolName: "other",
+      args: {},
+    });
+    fakeSession.emit({
+      type: "tool_execution_end",
+      toolCallId: "x",
+      toolName: "other",
+      result: { content: [{ type: "text", text: "ok" }] },
+      isError: false,
+    });
+    fakeSession.emit({
+      type: "extension_ui_request",
+      id: "ui-1",
+      method: "select",
+      title: "Pick",
+      options: ["A", "B"],
+    });
+    const permission = await events.nextPermissionRequest();
+    expect(permission.request.kind).toBe("question");
+    await session.respondToPermission("ui-1", {
+      behavior: "allow",
+      updatedInput: { answers: { Response: "B" } },
+    });
+    expect(fakeSession.extensionUiResponses).toEqual([{ id: "ui-1", response: { value: "B" } }]);
+    fakeSession.finishTurn();
+    await events.nextTurnCompletion();
+    expect(events.timelineItems()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "tool_call",
+          name: "other",
+          status: "completed",
+          detail: expect.objectContaining({ type: "unknown" }),
+        }),
+      ]),
+    );
+  });
+
+  test("close resolves after rejected child hydration", async () => {
+    const { pi, session } = await createSession();
+    Object.assign(session, {
+      extensionHost: new PiExtensionHost(
+        [
+          {
+            id: "child-test",
+            createSession: () => ({
+              mapToolCall: () => ({ childSessions: [{ id: "child-1", file: "unused" }] }),
+            }),
+          },
+        ],
+        undefined,
+        2 * 1024 * 1024,
+        async () => {
+          throw new Error("read failed");
+        },
+      ),
+    });
+    await session.startTurn("run");
+    pi.latestSession().emit({
+      type: "tool_execution_start",
+      toolCallId: "x",
+      toolName: "other",
+      args: {},
+    });
+    await expect(session.close()).resolves.toBeUndefined();
+  });
   test("bridges Pi RPC select extension UI requests through question permissions", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();
@@ -857,6 +1021,56 @@ describe("PiRpcAgentSession", () => {
       { id: "comment-1", response: { value: "Looks good" } },
     ]);
     expect(session.getPendingPermissions()).toEqual([]);
+  });
+
+  test("forgets an interrupted ask_user answer so later dialogs are not auto-answered", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    let releaseAbort: (() => void) | null = null;
+    fakeSession.abort = () =>
+      new Promise<void>((resolve) => {
+        releaseAbort = resolve;
+      });
+
+    await session.startTurn("ask me");
+    fakeSession.emit({
+      type: "tool_execution_start",
+      toolCallId: "tool-1",
+      toolName: "ask_user",
+      args: { question: "Pick one", options: ["A", "B"], allowComment: true },
+    });
+    fakeSession.emit({
+      type: "extension_ui_request",
+      id: "select-1",
+      method: "select",
+      title: "Pick one",
+      options: ["A", "B"],
+    });
+    await events.nextPermissionRequest();
+    await session.respondToPermission("select-1", {
+      behavior: "allow",
+      updatedInput: { answers: { Response: "B", Comment: "stale comment" } },
+    });
+
+    // Pi's tool_execution_end for the abandoned ask_user is dropped with the
+    // dying run, so the interrupt itself must end the tool for adapters.
+    await session.interrupt();
+    await events.nextTurnCancellation();
+    releaseAbort?.();
+    await flushTurnScheduling();
+
+    fakeSession.emit({
+      type: "extension_ui_request",
+      id: "comment-late",
+      method: "input",
+      title: "Unrelated prompt",
+      placeholder: "Optional comment (press Enter to skip)...",
+    });
+
+    expect(session.getPendingPermissions().map((request) => request.id)).toEqual(["comment-late"]);
+    expect(fakeSession.extensionUiResponses).toEqual([
+      { id: "select-1", response: { value: "B" } },
+    ]);
   });
 
   test("cancels Pi RPC extension UI dialogs when question permission is denied", async () => {

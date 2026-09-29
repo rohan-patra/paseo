@@ -62,11 +62,7 @@ interface PiToolResultDetails {
   diff?: string;
   patch?: string;
   oldContent?: string;
-  mode?: string;
-  server?: string;
-  tool?: string;
-  mcpResult?: unknown;
-  xdev?: unknown;
+  [key: string]: unknown;
 }
 
 interface PiToolResultTextContent {
@@ -197,6 +193,14 @@ function readNonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 
+export function resolveToolCallName(toolCall: PiTrackedToolCall, result?: PiToolResult): string {
+  if (toolCall.kind === "write" && result && typeof result !== "string") {
+    const xdev = XdevExecuteDetailsSchema.safeParse(result.details?.xdev);
+    if (xdev.success) return xdev.data.tool;
+  }
+  return toolCall.toolName;
+}
+
 const BashToolInputSchema: z.ZodType<BashToolInput> = z.object({
   command: z.string(),
   timeout: z.number().optional(),
@@ -300,54 +304,9 @@ export function parseToolArgs(toolName: string, rawArgs: unknown): PiTrackedTool
   return { kind: "unknown", toolName, args: rawArgs ?? null };
 }
 
-function stripMcpProxyPrefix(toolName: string, serverName: string): string {
-  const prefix = `${serverName}_`;
-  return toolName.startsWith(prefix) ? toolName.slice(prefix.length) : toolName;
-}
-
-export function resolveToolCallName(toolCall: PiTrackedToolCall, result?: PiToolResult): string {
-  if (toolCall.kind === "write" && result && typeof result !== "string") {
-    const xdev = XdevExecuteDetailsSchema.safeParse(result.details?.xdev);
-    if (xdev.success) {
-      return xdev.data.tool;
-    }
-  }
-
-  if (toolCall.toolName !== "mcp") {
-    return toolCall.toolName;
-  }
-
-  if (result && typeof result !== "string") {
-    const serverName = readNonEmptyString(result.details?.server);
-    const toolName = readNonEmptyString(result.details?.tool);
-    if (serverName && toolName) {
-      return `${serverName}.${toolName}`;
-    }
-  }
-
-  if (isRecord(toolCall.args)) {
-    const requestedTool = readNonEmptyString(toolCall.args.tool);
-    const requestedServer = readNonEmptyString(toolCall.args.server);
-    if (requestedTool && requestedServer) {
-      return `${requestedServer}.${stripMcpProxyPrefix(requestedTool, requestedServer)}`;
-    }
-    if (requestedTool) {
-      const [serverName, ...toolParts] = requestedTool.split("_");
-      if (serverName && toolParts.length > 0) {
-        return `${serverName}.${toolParts.join("_")}`;
-      }
-    }
-  }
-
-  return toolCall.toolName;
-}
-
 export function mapToolDetail(toolCall: PiTrackedToolCall, result?: PiToolResult): ToolCallDetail {
   const parsedResult = result ?? null;
-
-  if (isTaskToolCall(toolCall)) {
-    return mapTaskToolDetail(toolCall.args, parsedResult);
-  }
+  if (isTaskToolCall(toolCall)) return mapTaskToolDetail(toolCall.args, parsedResult);
 
   switch (toolCall.kind) {
     case "bash": {

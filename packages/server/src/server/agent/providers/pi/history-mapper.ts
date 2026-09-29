@@ -1,4 +1,9 @@
 import type { AgentStreamEvent, AgentTimelineItem, ToolCallDetail } from "../../agent-sdk-types.js";
+import {
+  createPiExtensionHost,
+  type PiExtensionEventOutput,
+  type PiExtensionHost,
+} from "./extensions/index.js";
 import type { PiAgentMessage, PiImageContent, PiTextContent } from "./rpc-types.js";
 import { mapPiTodoWrite } from "./todo-mapper.js";
 import {
@@ -6,9 +11,9 @@ import {
   mapToolDetail,
   parseToolArgs,
   parseToolResult,
-  resolveToolCallName,
   type PiToolResult,
   type PiTrackedToolCall,
+  resolveToolCallName,
 } from "./tool-call-mapper.js";
 
 export interface PiCapturedUserMessageEntry {
@@ -56,6 +61,7 @@ export function getUserMessageText(content: string | (PiTextContent | PiImageCon
 export class PiHistoryMapper {
   private readonly pendingToolCalls = new Map<string, PiTrackedToolCall>();
   private lastTodoItem: Extract<AgentTimelineItem, { type: "todo" }> | null = null;
+  private readonly hydrations: Promise<AgentStreamEvent[]>[] = [];
   private userIndex = 0;
   private assistantIndex = 0;
 
@@ -63,6 +69,7 @@ export class PiHistoryMapper {
     private readonly provider: string,
     private readonly userEntries: readonly PiCapturedUserMessageEntry[] = [],
     private readonly hooks: PiHistoryMapperHooks = {},
+    private readonly extensionHost: PiExtensionHost = createPiExtensionHost(),
   ) {}
 
   mapMessages(messages: readonly PiAgentMessage[]): AgentStreamEvent[] {
@@ -91,6 +98,10 @@ export class PiHistoryMapper {
     return events;
   }
 
+  async hydrate(): Promise<AgentStreamEvent[]> {
+    return (await Promise.all(this.hydrations)).flat();
+  }
+
   private mapUserMessage(message: Extract<PiAgentMessage, { role: "user" }>): AgentStreamEvent[] {
     const text = getUserMessageText(message.content);
     this.userIndex += 1;
@@ -114,20 +125,25 @@ export class PiHistoryMapper {
   private mapCustomMessage(
     message: Extract<PiAgentMessage, { role: "custom" }>,
   ): AgentStreamEvent[] {
+    const extensionMapping = this.extensionHost.mapCustomMessage(message);
+    const extensionEvents = this.extensionEvents(extensionMapping);
     const text = getUserMessageText(message.content);
     const mappedEvent = text ? this.hooks.mapCustomMessage?.(text, this.provider) : null;
     if (mappedEvent) {
-      return [mappedEvent];
+      return [...extensionEvents, mappedEvent];
     }
-    return text
-      ? [
-          {
-            type: "timeline",
-            provider: this.provider,
-            item: { type: "assistant_message", text },
-          },
-        ]
-      : [];
+    return [
+      ...extensionEvents,
+      ...(text
+        ? [
+            {
+              type: "timeline",
+              provider: this.provider,
+              item: { type: "assistant_message", text },
+            } as AgentStreamEvent,
+          ]
+        : []),
+    ];
   }
 
   private mapAssistantMessage(
@@ -157,24 +173,30 @@ export class PiHistoryMapper {
       if (content.type === "toolCall") {
         const tracked = parseToolArgs(content.name, content.arguments);
         this.pendingToolCalls.set(content.id, tracked);
+        const mapping = this.extensionHost.mapToolCall({
+          callId: content.id,
+          toolName: tracked.toolName,
+          args: tracked.args,
+          status: "running",
+          result: null,
+        });
         if (!mapPiTodoWrite(tracked.toolName, tracked.args)) {
-          const detail = this.mapToolDetail(content.id, tracked, null);
-          if (!detail) {
-            continue;
-          }
-          events.push({
-            type: "timeline",
-            provider: this.provider,
-            item: {
-              type: "tool_call",
-              callId: this.resolveToolCallId(content.id, tracked),
-              name: tracked.toolName,
-              status: "running",
-              detail,
-              error: null,
-            },
-          });
+          const detail = this.mapToolDetail(content.id, tracked, null, mapping?.detail);
+          if (detail)
+            events.push({
+              type: "timeline",
+              provider: this.provider,
+              item: {
+                type: "tool_call",
+                callId: this.resolveToolCallId(content.id, tracked),
+                name: mapping?.name ?? tracked.toolName,
+                status: "running",
+                detail,
+                error: null,
+              },
+            });
         }
+        events.push(...this.extensionEvents(mapping));
       }
     }
     return events;
@@ -187,31 +209,42 @@ export class PiHistoryMapper {
       this.pendingToolCalls.get(message.toolCallId) ?? parseToolArgs(message.toolName, null);
     this.pendingToolCalls.delete(message.toolCallId);
     const result = parseToolResult({ content: message.content, details: message.details });
-    const events: AgentStreamEvent[] = [];
+    const mapping = this.extensionHost.mapToolCall({
+      callId: message.toolCallId,
+      toolName: tracked.toolName,
+      args: tracked.args,
+      status: message.isError ? "failed" : "completed",
+      result,
+    });
+    const extensionEvents = this.extensionEvents(mapping);
     const todo = message.isError ? null : mapPiTodoWrite(tracked.toolName, tracked.args);
     if (todo) {
-      if (JSON.stringify(todo) !== JSON.stringify(this.lastTodoItem)) {
-        this.lastTodoItem = todo;
-        events.push({ type: "timeline", provider: this.provider, item: todo });
-      }
-      return events;
+      if (JSON.stringify(todo) === JSON.stringify(this.lastTodoItem)) return extensionEvents;
+      this.lastTodoItem = todo;
+      return [{ type: "timeline", provider: this.provider, item: todo }, ...extensionEvents];
     }
-
-    const detail = this.mapToolDetail(message.toolCallId, tracked, result);
-    if (detail) {
-      events.push({
+    const detail = this.mapToolDetail(message.toolCallId, tracked, result, mapping?.detail);
+    if (!detail) return extensionEvents;
+    return [
+      {
         type: "timeline",
         provider: this.provider,
         item: toToolResultTimelineItem({
           callId: this.resolveToolCallId(message.toolCallId, tracked),
-          name: resolveToolCallName(tracked, result),
+          name: mapping?.name ?? resolveToolCallName(tracked, result),
           isError: Boolean(message.isError),
           detail,
           errorText: extractTextFromToolResult(result) ?? "Tool call failed",
         }),
-      });
-    }
-    return events;
+      },
+      ...extensionEvents,
+    ];
+  }
+
+  private extensionEvents(mapping: PiExtensionEventOutput | undefined): AgentStreamEvent[] {
+    if (!mapping) return [];
+    this.hydrations.push(mapping.hydration);
+    return mapping.events;
   }
 
   private mapBashExecutionMessage(
@@ -245,9 +278,12 @@ export class PiHistoryMapper {
     toolCallId: string,
     toolCall: PiTrackedToolCall,
     result: PiToolResult,
+    extensionDetail?: ToolCallDetail,
   ): ToolCallDetail | null {
     const hook = this.hooks.mapToolDetail;
-    return hook ? hook(toolCall, result, { toolCallId }) : mapToolDetail(toolCall, result);
+    return hook
+      ? hook(toolCall, result, { toolCallId })
+      : (extensionDetail ?? mapToolDetail(toolCall, result));
   }
 }
 
@@ -256,12 +292,20 @@ export async function* streamPiHistory(
   messages: PiAgentMessage[],
   userEntries: readonly PiCapturedUserMessageEntry[] = [],
   hooks: PiHistoryMapperHooks = {},
+  // At most eight 2 MiB child files per replay; remaining cards keep their summaries.
+  extensionHost: PiExtensionHost = createPiExtensionHost(undefined, undefined, 16 * 1024 * 1024),
+  signal?: AbortSignal,
 ): AsyncGenerator<AgentStreamEvent> {
-  const mapper = new PiHistoryMapper(provider, userEntries, hooks);
+  const mapper = new PiHistoryMapper(provider, userEntries, hooks, extensionHost);
   for (const event of mapper.mapMessages(messages)) {
+    if (signal?.aborted) return;
     if (event) {
       yield event;
     }
+  }
+  for (const event of await mapper.hydrate()) {
+    if (signal?.aborted) return;
+    yield event;
   }
 }
 
