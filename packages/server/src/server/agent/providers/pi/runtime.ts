@@ -41,6 +41,7 @@ export interface PiStartSessionInput {
 }
 
 export interface PiRuntimeSession {
+  readonly environment: Record<string, string>;
   onEvent(callback: (event: PiRuntimeEvent) => void): () => void;
   prompt(
     message: string,

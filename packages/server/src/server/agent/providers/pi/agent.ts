@@ -1,3 +1,4 @@
+import { mapCustomMessageToToolCall } from "../custom-message.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -497,7 +498,6 @@ function buildResumeStartInput(input: {
     cwd: input.resumeConfig.cwd,
     env: input.launchContext?.env,
     session: input.sessionFile,
-    model: input.resumeConfig.model,
     thinkingOptionId: normalizePiThinkingOption(input.resumeConfig.thinkingOptionId) ?? undefined,
     mcpConfigPath: input.mcpConfigFile?.path,
     extensionPaths: input.paseoExtension ? [input.paseoExtension.path] : undefined,
@@ -1637,6 +1637,19 @@ export class PiRpcAgentSession implements AgentSession {
   private interruptedTerminalError: { turnId: string; error: string } | null = null;
   private readonly closeController = new AbortController();
   private readonly pendingExtensionHydrations = new Set<Promise<void>>();
+
+  private readonly usageSessionKey = randomUUID();
+
+  usageSession() {
+    const env = this.runtimeSession.environment;
+    if (this.closed) return null;
+    return {
+      provider: "pi",
+      model: modelToId(this.state.model) ?? undefined,
+      env,
+      sessionKey: this.usageSessionKey,
+    };
+  }
 
   constructor(options: PiRpcAgentSessionOptions) {
     this.runtimeSession = options.runtimeSession;
@@ -3158,12 +3171,16 @@ export class PiRpcAgentSession implements AgentSession {
       const customMapping = this.extensionHost.mapCustomMessage(event.message);
       this.emitExtensionOutput(customMapping, turnId);
       const text = getUserMessageText(event.message.content);
-      if (text) {
+      if (event.message.display !== false && text) {
         this.emit({
           type: "timeline",
           provider: this.provider,
           turnId,
-          item: { type: "assistant_message", text },
+          item: mapCustomMessageToToolCall(
+            event.message,
+            text,
+            `${this.provider}-custom-${randomUUID()}`,
+          ),
         });
       }
       // A custom message can either be the whole result of an extension command
@@ -3395,10 +3412,14 @@ export class PiRpcAgentClient implements AgentClient {
       throw error;
     }
     try {
+      const initialState = await this.applyResumeModel(runtimeSession, resumeConfig.model);
       return new PiRpcAgentSession({
         runtimeSession,
-        config: resumeConfig.config,
-        initialState: await runtimeSession.getState(),
+        config: {
+          ...resumeConfig.config,
+          model: modelToId(initialState.model) ?? resumeConfig.config.model,
+        },
+        initialState,
         capabilities: capabilitiesForSession(mcp !== null),
         cleanup: combineCleanup([mcpConfigFile?.cleanup, paseoExtension?.cleanup]),
         extensionTimeoutMs: providerOptions.extensionTimeoutMs,
@@ -3411,6 +3432,35 @@ export class PiRpcAgentClient implements AgentClient {
       paseoExtension?.cleanup();
       throw error;
     }
+  }
+
+  // Pi resumes a session on the model it recorded, or on its default when that model
+  // is gone. Switching afterwards keeps a removed model from blocking the resume.
+  private async applyResumeModel(
+    runtimeSession: PiRuntimeSession,
+    requestedModel: string | undefined,
+  ): Promise<PiSessionState> {
+    const state = await runtimeSession.getState();
+    const reference = parseModelReference(requestedModel ?? null);
+    if (!reference?.provider) {
+      return state;
+    }
+    const { provider, id } = reference;
+    const isRequested = (model: PiModel | null | undefined) =>
+      model?.provider === provider && model.id === id;
+    if (isRequested(state.model)) {
+      return state;
+    }
+    const availableModels = await runtimeSession.getAvailableModels();
+    if (!availableModels.some(isRequested)) {
+      this.logger.warn(
+        { requestedModel, sessionModel: modelToId(state.model) },
+        "Pi resumed on the session's model because the requested model is unavailable",
+      );
+      return state;
+    }
+    await runtimeSession.setModel(provider, id);
+    return runtimeSession.getState();
   }
 
   async fetchCatalog(
