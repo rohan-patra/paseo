@@ -840,6 +840,8 @@ export const AgentSnapshotPayloadSchema = z.object({
   attentionTimestamp: z.string().nullable().optional(),
   archivedAt: z.string().nullable().optional(),
   providerUnavailable: z.boolean().optional(),
+  // Private helper marker, retained for exact-ID snapshots and older wire messages.
+  internal: z.boolean().optional(),
 });
 
 export type AgentSnapshotPayload = z.infer<typeof AgentSnapshotPayloadSchema>;
@@ -911,6 +913,9 @@ const AgentDirectoryFilterSchema = z.object({
   includeArchived: z.boolean().optional(),
   requiresAttention: z.boolean().optional(),
   thinkingOptionId: z.string().nullable().optional(),
+  // Retained for wire parsing; private helpers are excluded from public discovery.
+  includeInternal: z.boolean().optional(),
+  includeBackground: z.boolean().optional(),
 });
 
 export const DeleteAgentRequestMessageSchema = z.object({
@@ -1238,6 +1243,7 @@ export const FetchAgentsRequestMessageSchema = z.object({
   type: z.literal("fetch_agents_request"),
   requestId: z.string(),
   scope: z.enum(["active"]).optional(),
+  includeBackground: z.boolean().optional(),
   filter: AgentDirectoryFilterSchema.optional(),
   sort: z
     .array(
@@ -1271,6 +1277,7 @@ const WorkspaceStateBucketSchema = z.enum([
 ]);
 
 export const FetchWorkspacesRequestMessageSchema = z.object({
+  includeBackground: z.boolean().optional(),
   type: z.literal("fetch_workspaces_request"),
   requestId: z.string(),
   filter: z
@@ -1279,6 +1286,9 @@ export const FetchWorkspacesRequestMessageSchema = z.object({
       projectId: z.string().optional(),
       // Unused: accepted so older clients still parse, but the server does not filter on it.
       idPrefix: z.string().optional(),
+      // Retained for wire parsing of older requests.
+      includeInternal: z.boolean().optional(),
+      includeBackground: z.boolean().optional(),
     })
     .optional(),
   sort: z
@@ -1715,6 +1725,13 @@ export const CreateAgentRequestMessageSchema = z.object({
   git: GitSetupOptionsSchema.optional(),
   worktree: CreateAgentWorktreeTargetSchema.optional(),
   autoArchive: z.boolean().optional(),
+  // An ephemeral helper: the daemon never persists, lists, flags or announces
+  // it, and plugin lifecycle hooks skip it. Lives on the request rather than
+  // in the config schema, which is reused for updates. Retained for wire parsing;
+  // public internal creation is no longer supported.
+  internal: z.boolean().optional(),
+  // Workspace creation intent, rejected when selecting an existing workspace.
+  background: z.boolean().optional(),
   labels: z.record(z.string(), z.string()).default({}),
   requestId: z.string(),
 });
@@ -2634,6 +2651,10 @@ export const WorkspaceCreateRequestSchema = z.object({
   title: z.string().optional(),
   // Optional prompt context for workspace-level name/branch generation.
   firstAgentContext: FirstAgentContextSchema.optional(),
+  // Retained for wire parsing; public internal creation is no longer supported.
+  internal: z.boolean().optional(),
+  background: z.boolean().optional(),
+  callerAgentId: z.string().optional(),
   source: z.discriminatedUnion("kind", [
     z.object({
       kind: z.literal("directory"),
@@ -3559,6 +3580,11 @@ export const ServerInfoStatusPayloadSchema = z
         creationLifecycle: z.boolean().optional(),
         // COMPAT(hubAgentRpc): added in v0.8.0; remove gate after 2027-03-05.
         hubAgentRpc: z.boolean().optional(),
+        // COMPAT(internalAgents): added in v0.9.0; remove gate after 2027-03-17.
+        internalAgents: z.boolean().optional(),
+        // COMPAT(internalWorkspaces): added in v0.9.0; remove gate after 2027-03-17.
+        internalWorkspaces: z.boolean().optional(),
+        backgroundWorkspaces: z.boolean().optional(),
         providersSnapshot: z.boolean().optional(),
         usageSources: z.boolean().optional(),
         // COMPAT(providersSnapshotCwd): added in v0.3.2, remove gate after 2027-02-10.
@@ -3685,6 +3711,8 @@ export const ServerInfoStatusPayloadSchema = z
         commitBaseClassification: z.boolean().optional(),
         // COMPAT(providerRemoval): added in v0.1.105, drop the gate when floor >= v0.1.105.
         providerRemoval: z.boolean().optional(),
+        // COMPAT(hopliteProvider): added after v0.11.2, remove after 2027-04-15 once host floor includes the bundled adapter.
+        hopliteProvider: z.boolean().optional(),
         // COMPAT(importSessionWorkspaceTarget): added in v0.1.110, remove gate after 2027-01-16.
         importSessionWorkspaceTarget: z.boolean().optional(),
         // COMPAT(importSessionSearch): added in v0.8.0, remove gate after 2027-03-02.
@@ -4025,6 +4053,9 @@ export const WorkspaceDescriptorPayloadSchema = z
     pinnedAt: z.string().nullable().optional(),
     // COMPAT(workspaceLabels): added in v0.5.0, remove optional after 2027-08-14.
     labels: z.array(z.string()).optional(),
+    // Retained for wire parsing of older daemon descriptors.
+    internal: z.boolean().optional(),
+    background: z.boolean().optional(),
     archivingAt: z.string().nullable().optional().default(null),
     status: WorkspaceStateBucketSchema,
     // Best-effort workspace status entry timestamp. Old daemons omit the

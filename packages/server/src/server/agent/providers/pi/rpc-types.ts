@@ -159,6 +159,7 @@ export type PiAssistantMessageEvent =
     };
 
 export type PiAgentSessionEvent =
+  | { type: "thinking_level_changed"; level: PiThinkingLevel }
   // `runId` is optional for compatibility with current Pi RPC. New Pi runtimes
   // must attach one stable id to every lifecycle event for one agent run.
   | { type: "agent_start"; runId?: string }
