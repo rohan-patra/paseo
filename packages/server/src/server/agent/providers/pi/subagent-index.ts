@@ -182,6 +182,13 @@ export class PiSubagentIndex {
     return this.states.size > 0;
   }
 
+  get hasRunning(): boolean {
+    for (const state of this.states.values()) {
+      if (state.status === "running") return true;
+    }
+    return false;
+  }
+
   private stateFor(id: string): PiSubagentState {
     const existing = this.states.get(id);
     if (existing) return existing;
