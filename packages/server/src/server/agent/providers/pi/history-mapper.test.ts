@@ -257,3 +257,125 @@ describe("Pi history mapper", () => {
     ]);
   });
 });
+
+describe("Pi tool-result image replay", () => {
+  test("recreates an image from native tool-result history without its source file", async () => {
+    const events = await collectHistory([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "image-read",
+            name: "read",
+            arguments: { path: "missing-preview.png" },
+          },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "image-read",
+        toolName: "read",
+        content: [
+          { type: "text", text: "Read image file [image/png]" },
+          { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+        ],
+      },
+    ]);
+    expect(events.map((event) => event.item?.type)).toEqual([
+      "tool_call",
+      "tool_call",
+      "assistant_message",
+    ]);
+    const image = events.find(
+      (event) => event.type === "timeline" && event.item.type === "assistant_message",
+    );
+    expect(image).toMatchObject({
+      type: "timeline",
+      item: { type: "assistant_message", text: expect.stringContaining("![Image](file://") },
+    });
+    if (image?.type !== "timeline" || image.item.type !== "assistant_message")
+      throw new Error("Missing image");
+    const url = image.item.text.match(/\((file:[^)]+)\)/)![1];
+    const { readFile, unlink } = await import("node:fs/promises");
+    expect(await readFile(new URL(url))).toEqual(Buffer.from("hello"));
+    await unlink(new URL(url));
+    const replay = await collectHistory([
+      {
+        role: "toolResult",
+        toolCallId: "image-read",
+        toolName: "read",
+        content: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+      },
+    ]);
+    expect(replay).toContainEqual(image);
+    expect(await readFile(new URL(url))).toEqual(Buffer.from("hello"));
+  });
+});
+
+test("replayed Pi images keep their position before the following reply", async () => {
+  const events = await collectHistory([
+    {
+      role: "toolResult",
+      toolCallId: "image-position",
+      toolName: "read",
+      content: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+    },
+    { role: "assistant", content: [{ type: "text", text: "Image read complete." }] },
+  ]);
+  expect(
+    events.map((event) =>
+      event.item?.type === "assistant_message" ? event.item.text : event.item?.type,
+    ),
+  ).toEqual(["tool_call", expect.stringContaining("![Image]("), "Image read complete."]);
+});
+
+test("replays xdev tool names and image output without leaking base64 into details", async () => {
+  const events = await collectHistory([
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          id: "xdev-image",
+          name: "write",
+          arguments: { path: "xd://browser", content: "{}" },
+        },
+      ],
+    },
+    {
+      role: "toolResult",
+      toolCallId: "xdev-image",
+      toolName: "write",
+      content: [
+        { type: "text", text: "Captured page" },
+        { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+      ],
+      details: {
+        xdev: {
+          tool: "browser",
+          mode: "execute",
+          args: { action: "screenshot" },
+          inner: { content: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }] },
+        },
+      },
+    },
+    { role: "assistant", content: [{ type: "text", text: "Screenshot complete." }] },
+  ]);
+
+  expect(events.map((event) => event.item?.type)).toEqual([
+    "tool_call",
+    "tool_call",
+    "assistant_message",
+    "assistant_message",
+  ]);
+  expect(events[1]).toMatchObject({
+    type: "timeline",
+    item: { type: "tool_call", name: "browser", status: "completed" },
+  });
+  expect(events[2]).toMatchObject({
+    type: "timeline",
+    item: { type: "assistant_message", text: expect.stringContaining("![Image](file://") },
+  });
+  expect(JSON.stringify(events)).not.toContain("aGVsbG8=");
+});

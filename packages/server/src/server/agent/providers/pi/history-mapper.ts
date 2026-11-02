@@ -1,6 +1,10 @@
 import { mapCustomMessageToToolCall } from "../custom-message.js";
 import type { AgentStreamEvent, AgentTimelineItem, ToolCallDetail } from "../../agent-sdk-types.js";
 import {
+  materializeProviderImage,
+  renderProviderImageOutputAsAssistantMarkdown,
+} from "../provider-image-output.js";
+import {
   createPiExtensionHost,
   type PiExtensionEventOutput,
   type PiExtensionHost,
@@ -12,6 +16,7 @@ import {
   mapToolDetail,
   parseToolArgs,
   parseToolResult,
+  splitPiToolResultImages,
   type PiToolResult,
   type PiTrackedToolCall,
   resolveToolCallName,
@@ -74,7 +79,7 @@ export class PiHistoryMapper {
     private readonly extensionHost: PiExtensionHost = createPiExtensionHost(),
   ) {}
 
-  mapMessages(messages: readonly PiAgentMessage[]): AgentStreamEvent[] {
+  async mapMessages(messages: readonly PiAgentMessage[]): Promise<AgentStreamEvent[]> {
     const events: AgentStreamEvent[] = [];
 
     for (const message of messages) {
@@ -89,7 +94,7 @@ export class PiHistoryMapper {
           events.push(...this.mapAssistantMessage(message));
           break;
         case "toolResult":
-          events.push(...this.mapToolResultMessage(message));
+          events.push(...(await this.mapToolResultMessage(message)));
           break;
         case "bashExecution":
           events.push(this.mapBashExecutionMessage(message));
@@ -209,13 +214,15 @@ export class PiHistoryMapper {
     return events;
   }
 
-  private mapToolResultMessage(
+  private async mapToolResultMessage(
     message: Extract<PiAgentMessage, { role: "toolResult" }>,
-  ): AgentStreamEvent[] {
+  ): Promise<AgentStreamEvent[]> {
     const tracked =
       this.pendingToolCalls.get(message.toolCallId) ?? parseToolArgs(message.toolName, null);
     this.pendingToolCalls.delete(message.toolCallId);
-    const result = parseToolResult({ content: message.content, details: message.details });
+    const { images, result } = splitPiToolResultImages(
+      parseToolResult({ content: message.content, details: message.details }),
+    );
     const mapping = this.extensionHost.mapToolCall({
       callId: message.toolCallId,
       toolName: tracked.toolName,
@@ -224,14 +231,27 @@ export class PiHistoryMapper {
       result,
     });
     const extensionEvents = this.extensionEvents(mapping);
+    const imageEvents: AgentStreamEvent[] = [];
+    for (const image of images) {
+      const item = await renderProviderImageOutputAsAssistantMarkdown(image, {
+        materialize: materializeProviderImage,
+      });
+      if (item) imageEvents.push({ type: "timeline", provider: this.provider, item });
+    }
     const todo = message.isError ? null : mapPiTodoWrite(tracked.toolName, tracked.args);
     if (todo) {
-      if (JSON.stringify(todo) === JSON.stringify(this.lastTodoItem)) return extensionEvents;
+      if (JSON.stringify(todo) === JSON.stringify(this.lastTodoItem)) {
+        return [...imageEvents, ...extensionEvents];
+      }
       this.lastTodoItem = todo;
-      return [{ type: "timeline", provider: this.provider, item: todo }, ...extensionEvents];
+      return [
+        { type: "timeline", provider: this.provider, item: todo },
+        ...imageEvents,
+        ...extensionEvents,
+      ];
     }
     const detail = this.mapToolDetail(message.toolCallId, tracked, result, mapping?.detail);
-    if (!detail) return extensionEvents;
+    if (!detail) return [...imageEvents, ...extensionEvents];
     return [
       {
         type: "timeline",
@@ -244,6 +264,7 @@ export class PiHistoryMapper {
           errorText: extractTextFromToolResult(result) ?? "Tool call failed",
         }),
       },
+      ...imageEvents,
       ...extensionEvents,
     ];
   }
@@ -304,9 +325,10 @@ export async function* streamPiHistory(
   signal?: AbortSignal,
 ): AsyncGenerator<AgentStreamEvent> {
   const mapper = new PiHistoryMapper(provider, userEntries, hooks, extensionHost);
-  for (const event of mapper.mapMessages(messages)) {
+  for (const message of messages) {
     if (signal?.aborted) return;
-    if (event) {
+    for (const event of await mapper.mapMessages([message])) {
+      if (signal?.aborted) return;
       yield event;
     }
   }

@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import type { ToolCallDetail } from "../../agent-sdk-types.js";
 import { truncateDiffText } from "../tool-call-mapper-utils.js";
+import type { ProviderImageOutput } from "../provider-image-output.js";
 
 interface BashToolInput {
   command: string;
@@ -53,6 +54,7 @@ interface PiToolResultObject {
   stdout?: string;
   text?: string;
   content?: PiToolResultContent[];
+  structuredContent?: unknown;
   exitCode?: number;
   code?: number;
   details?: PiToolResultDetails;
@@ -69,6 +71,12 @@ interface PiToolResultTextContent {
   type: "text";
   text: string;
 }
+
+const PiToolResultImageContentSchema = z.object({
+  type: z.literal("image"),
+  data: z.string().min(1),
+  mimeType: z.string().optional(),
+});
 
 interface PiToolResultUnknownContent {
   type: string;
@@ -264,6 +272,64 @@ export function parseToolResult(rawResult: unknown): PiToolResult {
   return null;
 }
 
+// Pi returns images inside tool-result content as base64 blocks. Left in place they reach the
+// tool-output stringifier, which dumps base64 into the tool output. We pull those blocks out to
+// render them as image markdown and leave a "[image]" placeholder so image-only results still
+// produce non-empty output (mirroring splitClaudeToolResultImages).
+export function splitPiToolResultImages(result: PiToolResult): {
+  images: ProviderImageOutput[];
+  result: PiToolResult;
+} {
+  if (!result || typeof result === "string" || !result.content) {
+    return { images: [], result };
+  }
+  const images: ProviderImageOutput[] = [];
+  let replaced = false;
+  const content = result.content.map((block) => {
+    const image = toPiImageOutput(block);
+    if (image) {
+      images.push(image);
+      replaced = true;
+      return { type: "text", text: "[image]" } satisfies PiToolResultTextContent;
+    }
+    return block;
+  });
+  if (!replaced) {
+    return { images: [], result };
+  }
+  return {
+    images,
+    result: {
+      ...result,
+      content,
+      ...(result.structuredContent === undefined
+        ? {}
+        : { structuredContent: withoutImageData(result.structuredContent) }),
+      ...(result.details === undefined
+        ? {}
+        : { details: PiToolResultDetailsSchema.parse(withoutImageData(result.details)) }),
+    },
+  };
+}
+
+function withoutImageData(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutImageData);
+  if (value === null || typeof value !== "object") return value;
+  const image = toPiImageOutput(value);
+  return Object.fromEntries(
+    Object.entries(value).map(([key, child]) => [
+      key,
+      image && key === "data" ? "[image]" : withoutImageData(child),
+    ]),
+  );
+}
+
+function toPiImageOutput(block: unknown): ProviderImageOutput | null {
+  const parsed = PiToolResultImageContentSchema.safeParse(block);
+  if (!parsed.success) return null;
+  return { data: parsed.data.data, mimeType: parsed.data.mimeType ?? null };
+}
+
 export function extractTextFromToolResult(result: PiToolResult): string | undefined {
   if (typeof result === "string") {
     return result;
@@ -306,7 +372,6 @@ export function parseToolArgs(toolName: string, rawArgs: unknown): PiTrackedTool
 
 export function mapToolDetail(toolCall: PiTrackedToolCall, result?: PiToolResult): ToolCallDetail {
   const parsedResult = result ?? null;
-  if (isTaskToolCall(toolCall)) return mapTaskToolDetail(toolCall.args, parsedResult);
 
   switch (toolCall.kind) {
     case "bash": {
@@ -348,30 +413,6 @@ export function mapToolDetail(toolCall: PiTrackedToolCall, result?: PiToolResult
     default:
       return mapUnknownToolDetail(toolCall, parsedResult);
   }
-}
-
-function isTaskToolCall(toolCall: PiTrackedToolCall): boolean {
-  if (toolCall.toolName === "task") {
-    return true;
-  }
-  if (toolCall.toolName !== "subagent" || !isRecord(toolCall.args)) {
-    return false;
-  }
-  return (
-    toolCall.args.action === undefined &&
-    (readNonEmptyString(toolCall.args.agent) !== undefined ||
-      readNonEmptyString(toolCall.args.task) !== undefined)
-  );
-}
-
-function mapTaskToolDetail(args: unknown, result: PiToolResult): ToolCallDetail {
-  const argRecord = isRecord(args) ? args : {};
-  return {
-    type: "sub_agent",
-    subAgentType: readNonEmptyString(argRecord.agent),
-    description: readNonEmptyString(argRecord.task),
-    log: extractTextFromToolResult(result)?.trim() ?? "",
-  };
 }
 
 function mapWriteToolDetail(args: WriteToolInput, result: PiToolResult): ToolCallDetail {

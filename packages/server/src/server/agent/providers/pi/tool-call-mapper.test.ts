@@ -1,10 +1,12 @@
 import { describe, expect, test } from "vitest";
 
 import {
+  extractTextFromToolResult,
   mapToolDetail,
   parseToolArgs,
   parseToolResult,
   resolveToolCallName,
+  splitPiToolResultImages,
 } from "./tool-call-mapper.js";
 
 describe("Pi tool call mapper", () => {
@@ -174,21 +176,20 @@ describe("Pi tool call mapper", () => {
     });
   });
 
-  test("maps task calls to sub-agent detail while running", () => {
+  test("preserves generic task input while running", () => {
     const toolCall = parseToolArgs("task", {
       agent: "explore",
       task: "Trace the Pi provider tool mapper",
     });
 
     expect(mapToolDetail(toolCall, null)).toEqual({
-      type: "sub_agent",
-      subAgentType: "explore",
-      description: "Trace the Pi provider tool mapper",
-      log: "",
+      type: "unknown",
+      input: { agent: "explore", task: "Trace the Pi provider tool mapper" },
+      output: null,
     });
   });
 
-  test("maps completed subagent calls with task input to sub-agent detail", () => {
+  test("preserves completed generic subagent input and result", () => {
     const toolCall = parseToolArgs("subagent", {
       agent: "reviewer",
       task: "Review the Pi mapper change",
@@ -198,10 +199,83 @@ describe("Pi tool call mapper", () => {
     });
 
     expect(mapToolDetail(toolCall, result)).toEqual({
-      type: "sub_agent",
-      subAgentType: "reviewer",
-      description: "Review the Pi mapper change",
-      log: "The mapper change preserves provider status.",
+      type: "unknown",
+      input: { agent: "reviewer", task: "Review the Pi mapper change" },
+      output: result,
     });
+  });
+});
+
+describe("splitPiToolResultImages", () => {
+  test("extracts image blocks and replaces them with [image] placeholders", () => {
+    const parsed = parseToolResult({
+      content: [
+        { type: "text", text: "shot taken" },
+        { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+      ],
+    });
+    const { images, result } = splitPiToolResultImages(parsed);
+
+    expect(images).toEqual([{ data: "aGVsbG8=", mimeType: "image/png" }]);
+    expect(result).toEqual({
+      content: [
+        { type: "text", text: "shot taken" },
+        { type: "text", text: "[image]" },
+      ],
+    });
+  });
+
+  test("replaces image-only results with a non-empty placeholder", () => {
+    const parsed = parseToolResult({
+      content: [{ type: "image", data: "aGVsbG8=", mimeType: "image/jpeg" }],
+    });
+    const { images, result } = splitPiToolResultImages(parsed);
+
+    expect(images).toHaveLength(1);
+    expect(extractTextFromToolResult(result)).toBe("[image]");
+  });
+
+  test("passes through string results and results without images", () => {
+    expect(splitPiToolResultImages("plain output")).toEqual({
+      images: [],
+      result: "plain output",
+    });
+    const textOnly = parseToolResult({ content: [{ type: "text", text: "no images" }] });
+    expect(splitPiToolResultImages(textOnly)).toEqual({ images: [], result: textOnly });
+    expect(splitPiToolResultImages(null)).toEqual({ images: [], result: null });
+  });
+
+  test("keeps other fields on the result object", () => {
+    const parsed = parseToolResult({
+      exitCode: 0,
+      content: [{ type: "image", data: "aGVsbG8=" }],
+    });
+    const { result } = splitPiToolResultImages(parsed);
+    expect(result).toMatchObject({ exitCode: 0 });
+  });
+});
+
+test("tool-result images remove nested structured image data while preserving metadata", () => {
+  const data = Buffer.from("nested screenshot bytes").toString("base64");
+  const result = parseToolResult({
+    content: [{ type: "image", data, mimeType: "image/png" }],
+    structuredContent: {
+      content: [{ type: "image", data, mimeType: "image/png", width: 64 }],
+      captureId: "capture-1",
+      read: { type: "image", data, mimeType: "image/png", note: "Read image file" },
+      extra: { data: "keep ordinary data" },
+    },
+  });
+  const split = splitPiToolResultImages(result);
+  const detail = mapToolDetail(parseToolArgs("screenshot", {}), split.result);
+  expect(JSON.stringify(detail)).not.toContain(data);
+  expect(split.images).toEqual([{ data, mimeType: "image/png" }]);
+  expect(split.result).toMatchObject({
+    structuredContent: {
+      content: [{ type: "image", data: "[image]", mimeType: "image/png", width: 64 }],
+      captureId: "capture-1",
+      read: { type: "image", data: "[image]", mimeType: "image/png", note: "Read image file" },
+      extra: { data: "keep ordinary data" },
+    },
   });
 });
