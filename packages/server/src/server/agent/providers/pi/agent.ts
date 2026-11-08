@@ -1648,6 +1648,7 @@ export class PiRpcAgentSession implements AgentSession {
   private readonly logger: Logger;
   private readonly usagePoller: PiUsagePoller;
   private closed = false;
+  private runtimeDead = false;
   // Pi reports an aborted OpenAI Responses stream before the abort RPC resolves.
   // Identifies the turn an in-flight interrupt() targets so late aborted
   // terminal responses are suppressed instead of surfacing as failures.
@@ -1741,6 +1742,9 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   async startTurn(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<StartTurnResult> {
+    if (this.runtimeDead) {
+      throw new Error("Pi process exited. Reload agent before sending another message.");
+    }
     const abortGeneration = this.abortGeneration;
     if (this.abortInFlight) {
       // A rejected abort propagates here so the turn fails visibly instead of
@@ -1749,6 +1753,9 @@ export class PiRpcAgentSession implements AgentSession {
     }
     if (abortGeneration !== this.abortGeneration) {
       throw new Error("Turn was canceled before it could start");
+    }
+    if (this.runtimeDead) {
+      throw new Error("Pi process exited. Reload agent before sending another message.");
     }
     if (this.activeTurnId) {
       throw new Error("A Pi turn is already active");
@@ -2243,10 +2250,10 @@ export class PiRpcAgentSession implements AgentSession {
     return null;
   }
 
-  async setModel(modelId: string | null): Promise<void> {
+  async setModel(modelId: string | null): Promise<{ model: string | null }> {
     const parsedReference = parseModelReference(modelId);
     if (!parsedReference) {
-      return;
+      return { model: modelToId(this.state.model) };
     }
     if (!parsedReference.provider) {
       throw new Error(`Pi model id must include a provider: ${modelId}`);
@@ -2255,6 +2262,7 @@ export class PiRpcAgentSession implements AgentSession {
     const model = await this.runtimeSession.setModel(parsedReference.provider, parsedReference.id);
     await this.refreshState();
     this.config.model = `${model.provider}/${model.id}`;
+    return { model: modelToId(this.state.model) };
   }
 
   async setThinkingOption(thinkingOptionId: string | null): Promise<void | AgentProviderNotice> {
@@ -2956,6 +2964,7 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   private handleProcessExit(error: string): void {
+    this.runtimeDead = true;
     // Children are separate OS processes the parent extension kills on shutdown,
     // so a row left running against a dead parent would never resolve. State is
     // kept, not cleared: a restarted runtime republishes from the same ids and

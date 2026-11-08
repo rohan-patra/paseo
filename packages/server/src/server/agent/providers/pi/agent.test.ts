@@ -2258,6 +2258,36 @@ describe("PiRpcAgentSession", () => {
     expect(fakeSession.prompts.map((p) => p.message)).toEqual(["stop this turn", "fresh request"]);
   });
 
+  test("rejects a queued prompt when Pi exits while an abort is settling", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+    let releaseAbort: (() => void) | null = null;
+    fakeSession.abort = () =>
+      new Promise<void>((resolve) => {
+        releaseAbort = resolve;
+      });
+
+    try {
+      await session.startTurn("stop this turn");
+      await session.interrupt();
+      const pendingTurn = session.startTurn("fresh request");
+      const rejection = expect(pendingTurn).rejects.toThrow(
+        "Pi process exited. Reload agent before sending another message.",
+      );
+      fakeSession.emit({ type: "process_exit", error: "Pi exited" });
+      await expect(session.startTurn("after crash")).rejects.toThrow(
+        "Pi process exited. Reload agent before sending another message.",
+      );
+      releaseAbort?.();
+
+      await rejection;
+      expect(fakeSession.prompts.map((prompt) => prompt.message)).toEqual(["stop this turn"]);
+    } finally {
+      releaseAbort?.();
+      await session.close();
+    }
+  });
+
   test("canceling a pending start during a settling abort prevents the prompt from launching", async () => {
     const { pi, session } = await createSession();
     const fakeSession = pi.latestSession();
@@ -3355,6 +3385,33 @@ describe("PiRpcAgentSession", () => {
       error: "Pi exited",
     });
   });
+
+  test.each([false, true])(
+    "rejects new turns with Reload guidance after the Pi process exits (active: %s)",
+    async (active) => {
+      const { pi, session, events } = await createSession();
+      try {
+        if (active) {
+          await session.startTurn("before crash");
+        }
+        const runtime = pi.latestSession();
+        runtime.emit({ type: "process_exit", error: "Pi exited" });
+        if (active) {
+          await expect(events.nextTurnFailure()).resolves.toMatchObject({ error: "Pi exited" });
+        }
+        const promptCount = runtime.prompts.length;
+
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          await expect(session.startTurn("after crash")).rejects.toThrow(
+            "Pi process exited. Reload agent before sending another message.",
+          );
+        }
+        expect(runtime.prompts).toHaveLength(promptCount);
+      } finally {
+        await session.close();
+      }
+    },
+  );
 
   test("fails an autonomous turn when the Pi process exits before settlement", async () => {
     const { pi, events } = await createSession();
