@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { ToolCallDetail } from "../../agent-sdk-types.js";
 import { truncateDiffText } from "../tool-call-mapper-utils.js";
 import type { ProviderImageOutput } from "../provider-image-output.js";
+import { omitNullArgs } from "../tool-call-args.js";
 
 interface BashToolInput {
   command: string;
@@ -362,7 +363,7 @@ export function parseToolArgs(toolName: string, rawArgs: unknown): PiTrackedTool
   }
   const schema = SIMPLE_TOOL_SCHEMAS[toolName as SimpleToolKind];
   if (schema) {
-    const parsed = schema.safeParse(rawArgs);
+    const parsed = schema.safeParse(omitNullArgs(rawArgs));
     if (parsed.success) {
       return { kind: toolName as SimpleToolKind, toolName, args: parsed.data } as PiTrackedToolCall;
     }
