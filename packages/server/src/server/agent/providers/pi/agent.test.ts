@@ -472,6 +472,55 @@ class SessionEvents {
   }
 }
 
+test("delivers saved Pi worker registrations in order to the first subscriber after resume", async () => {
+  const pi = new FakePi();
+  pi.queueSessionSetup((fake) => {
+    const getState = fake.getState.bind(fake);
+    vi.spyOn(fake, "getState").mockImplementationOnce(() => {
+      emitSubagentMarker(fake, { id: "saved-worker", status: "running" });
+      fake.emit({
+        type: "extension_ui_request",
+        id: "startup-notice",
+        method: "notify",
+        message: "Restored settings",
+        notifyType: "info",
+      });
+      return getState();
+    });
+  });
+  const session = await createClient(pi).resumeSession({
+    provider: "pi",
+    sessionId: "pi-session-1",
+    nativeHandle: "/tmp/native-pi-session",
+    metadata: { cwd: tmpdir() },
+  });
+  onTestFinished(() => session.close());
+  const fake = pi.latestSession();
+  emitSubagentMarker(fake, { id: "second-worker", status: "running" });
+
+  const first: AgentStreamEvent[] = [];
+  session.subscribe((event) => first.push(event));
+  const registrations = [
+    { type: "upsert", id: "saved-worker", title: "saved-worker", status: "running" },
+    { type: "upsert", id: "second-worker", title: "second-worker", status: "running" },
+  ];
+  expect(providerSubagentEvents(first)).toEqual(registrations);
+  expect(first.filter((event) => event.type === "timeline")).toEqual([]);
+
+  const later: AgentStreamEvent[] = [];
+  session.subscribe((event) => later.push(event));
+  emitSubagentMarker(fake, { id: "saved-worker", status: "completed" });
+  const completion = {
+    type: "upsert",
+    id: "saved-worker",
+    title: "saved-worker",
+    status: "completed",
+  };
+  expect(providerSubagentEvents(first)).toEqual([...registrations, completion]);
+  expect(providerSubagentEvents(later)).toEqual([completion]);
+  expect(later.filter((event) => event.type === "timeline")).toEqual([]);
+});
+
 describe("PiRpcAgentSession", () => {
   test("relays subagent updates from the injected extension into provider subagent events", async () => {
     const { pi, session, events } = await createSession();

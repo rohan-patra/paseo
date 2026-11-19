@@ -133,6 +133,7 @@ const PASEO_PI_ENTRY_CAPTURE_MARKER = "PASEO_ENTRY_CAPTURE";
 const PASEO_PI_SUBMITTED_USER_ENTRY_MARKER = "PASEO_SUBMITTED_USER_ENTRY";
 const PASEO_PI_COMMAND_RESULT_MARKER = "PASEO_COMMAND_RESULT";
 const PASEO_PI_SUBAGENT_MARKER = "PASEO_SUBAGENT";
+const MAX_PI_STARTUP_SUBAGENT_UPDATES = 256;
 const DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS = 30_000;
 const DEFAULT_PI_RPC_TIMEOUT_MS = 60_000;
 const QUESTION_RESPONSE_HEADER = "Response";
@@ -282,6 +283,7 @@ interface PiRpcAgentSessionOptions {
   runtimeSession: PiRuntimeSession;
   config: AgentSessionConfig;
   initialState: PiSessionState;
+  startupSubagents: PiStartupSubagentUpdates;
   capabilities: AgentCapabilityFlags;
   currentModeId?: string | null;
   persistedSessionFile?: string;
@@ -1021,6 +1023,44 @@ function parseExtensionMarkerPayload(
   }
 }
 
+function parsePiSubagentMarker(message: string): { update: PiSubagentUpdate | null } | null {
+  const payload = parseExtensionMarkerPayload(message, PASEO_PI_SUBAGENT_MARKER);
+  if (!payload) return null;
+  return {
+    update: typeof payload.id === "string" ? (payload as unknown as PiSubagentUpdate) : null,
+  };
+}
+
+class PiStartupSubagentUpdates {
+  readonly updates: PiSubagentUpdate[] = [];
+  private overflowLogged = false;
+
+  constructor(private readonly logger: Logger) {}
+
+  push(update: PiSubagentUpdate): void {
+    if (this.updates.length === MAX_PI_STARTUP_SUBAGENT_UPDATES) {
+      if (!this.overflowLogged) {
+        this.overflowLogged = true;
+        this.logger.warn(
+          { limit: MAX_PI_STARTUP_SUBAGENT_UPDATES },
+          "Pi startup subagent buffer overflow",
+        );
+      }
+      // Keep later updates, which can settle a child discovered earlier.
+      this.updates.shift();
+    }
+    this.updates.push(update);
+  }
+
+  capture(event: PiRuntimeEvent): void {
+    if (!isExtensionUiRequestEvent(event) || event.method !== "notify") return;
+    const message = optionalString(event.message);
+    if (!message) return;
+    const marker = parsePiSubagentMarker(message);
+    if (marker?.update) this.push(marker.update);
+  }
+}
+
 function parseCapturedEntries(value: unknown): PiCapturedEntry[] {
   if (!Array.isArray(value)) {
     return [];
@@ -1592,6 +1632,7 @@ export class PiRpcAgentSession implements AgentSession {
   private readonly activeToolCalls = new Map<string, PiTrackedToolCall>();
   private lastTodoItem: Extract<AgentTimelineItem, { type: "todo" }> | null = null;
   private readonly subagentIndex = new PiSubagentIndex();
+  private startupSubagents: PiStartupSubagentUpdates | null;
   private readonly pendingExtensionUiRequests = new Map<string, AgentPermissionRequest>();
   private readonly backgroundWorkIncarnation = randomUUID();
   private backgroundWorkEpoch = 1;
@@ -1677,6 +1718,7 @@ export class PiRpcAgentSession implements AgentSession {
     this.persistedSessionFile = options.persistedSessionFile;
     this.cleanup = options.cleanup;
     this.closeAfterHistory = options.closeAfterHistory ?? false;
+    this.startupSubagents = this.closeAfterHistory ? null : options.startupSubagents;
     this.extensionTimeoutMs = options.extensionTimeoutMs ?? DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS;
     this.logger = options.logger;
     this.extensionHost = createPiExtensionHost(this.logger);
@@ -1887,6 +1929,24 @@ export class PiRpcAgentSession implements AgentSession {
 
   subscribe(callback: (event: AgentStreamEvent) => void): () => void {
     this.subscribers.add(callback);
+    const startup = this.startupSubagents;
+    this.startupSubagents = null;
+    if (startup) {
+      // The manager drains its event queue as soon as subscribe returns.
+      const firstSubscriber = [callback];
+      for (const update of startup.updates) {
+        if (this.closed) break;
+        for (const event of this.subagentIndex.apply(update)) {
+          if (this.closed) break;
+          this.publish(event, firstSubscriber);
+        }
+      }
+      if (this.runtimeDead && !this.closed) {
+        for (const event of this.subagentIndex.terminalizeRunning()) {
+          this.publish(event, firstSubscriber);
+        }
+      }
+    }
     return () => {
       this.subscribers.delete(callback);
     };
@@ -2179,6 +2239,7 @@ export class PiRpcAgentSession implements AgentSession {
       return;
     }
     this.closed = true;
+    this.startupSubagents = null;
     this.closeController.abort();
     this.extensionHost.close();
     this.usagePoller.close();
@@ -2289,8 +2350,11 @@ export class PiRpcAgentSession implements AgentSession {
     this.publish(event);
   }
 
-  private publish(event: AgentStreamEvent): void {
-    for (const subscriber of this.subscribers) subscriber(event);
+  private publish(
+    event: AgentStreamEvent,
+    subscribers: Iterable<(event: AgentStreamEvent) => void> = this.subscribers,
+  ): void {
+    for (const subscriber of subscribers) subscriber(event);
   }
 
   // Keep timeline order while images are materialized, without delaying provider state changes.
@@ -2866,15 +2930,14 @@ export class PiRpcAgentSession implements AgentSession {
    * subscribes to the extension bus and republishes each task update here.
    */
   private handleSubagentMarker(message: string): boolean {
-    const payload = parseExtensionMarkerPayload(message, PASEO_PI_SUBAGENT_MARKER);
-    if (!payload) {
-      return false;
-    }
-    if (typeof payload.id !== "string") {
-      return true;
-    }
-    for (const event of this.subagentIndex.apply(payload as unknown as PiSubagentUpdate)) {
-      this.emit(event);
+    const marker = parsePiSubagentMarker(message);
+    if (!marker) return false;
+    const { update } = marker;
+    if (!update || this.closed) return true;
+    if (this.startupSubagents) {
+      this.startupSubagents.push(update);
+    } else {
+      for (const event of this.subagentIndex.apply(update)) this.emit(event);
     }
     return true;
   }
@@ -3475,15 +3538,11 @@ export class PiRpcAgentClient implements AgentClient {
       throw error;
     }
     try {
-      return new PiRpcAgentSession({
-        runtimeSession,
+      return await this.initializeSession(runtimeSession, () => runtimeSession.getState(), {
         config,
-        initialState: await runtimeSession.getState(),
         capabilities: capabilitiesForSession(mcp !== null),
         cleanup: combineCleanup([mcpConfigFile?.cleanup, paseoExtension?.cleanup]),
         extensionTimeoutMs: providerOptions.extensionTimeoutMs,
-        logger: this.logger,
-        usagePollScheduler: this.usagePollScheduler,
       });
     } catch (error) {
       await runtimeSession.close().catch(() => undefined);
@@ -3553,27 +3612,55 @@ export class PiRpcAgentClient implements AgentClient {
       throw error;
     }
     try {
-      const initialState = await this.applyResumeModel(runtimeSession, resumeConfig.model);
-      return new PiRpcAgentSession({
+      return await this.initializeSession(
         runtimeSession,
-        config: {
-          ...resumeConfig.config,
-          model: modelToId(initialState.model) ?? resumeConfig.config.model,
+        () => this.applyResumeModel(runtimeSession, resumeConfig.model),
+        {
+          config: resumeConfig.config,
+          capabilities: capabilitiesForSession(mcp !== null),
+          persistedSessionFile: sessionCopy ? sessionFile : undefined,
+          cleanup: cleanupTempFiles,
+          closeAfterHistory: options?.purpose === "history",
+          extensionTimeoutMs: providerOptions.extensionTimeoutMs,
         },
-        initialState,
-        capabilities: capabilitiesForSession(mcp !== null),
-        persistedSessionFile: sessionCopy ? sessionFile : undefined,
-        cleanup: cleanupTempFiles,
-        closeAfterHistory: options?.purpose === "history",
-        extensionTimeoutMs: providerOptions.extensionTimeoutMs,
-        logger: this.logger,
-        usagePollScheduler: this.usagePollScheduler,
-      });
+        (state) => modelToId(state.model) ?? resumeConfig.config.model,
+      );
     } catch (error) {
       await runtimeSession.close().catch(() => undefined);
       cleanupTempFiles();
       throw error;
     }
+  }
+
+  private async initializeSession(
+    runtimeSession: PiRuntimeSession,
+    readInitialState: () => Promise<PiSessionState>,
+    options: Omit<
+      PiRpcAgentSessionOptions,
+      "runtimeSession" | "initialState" | "startupSubagents" | "logger" | "usagePollScheduler"
+    >,
+    resolveModel?: (state: PiSessionState) => string | undefined,
+  ): Promise<PiRpcAgentSession> {
+    const startupSubagents = new PiStartupSubagentUpdates(this.logger);
+    const unsubscribe = runtimeSession.onEvent((event) => startupSubagents.capture(event));
+    let initialState: PiSessionState;
+    try {
+      initialState = await readInitialState();
+    } finally {
+      unsubscribe();
+    }
+    // Attach the live listener in the same synchronous continuation as the detach.
+    return new PiRpcAgentSession({
+      ...options,
+      config: resolveModel
+        ? { ...options.config, model: resolveModel(initialState) }
+        : options.config,
+      runtimeSession,
+      initialState,
+      startupSubagents,
+      logger: this.logger,
+      usagePollScheduler: this.usagePollScheduler,
+    });
   }
 
   // Pi resumes a session on the model it recorded, or on its default when that model
