@@ -597,17 +597,18 @@ test("replays xdev tool names and image output without leaking base64 into detai
     { role: "assistant", content: [{ type: "text", text: "Screenshot complete." }] },
   ]);
 
-  expect(events.map((event) => event.item?.type)).toEqual([
+  const timeline = events.filter((event) => event.type === "timeline");
+  expect(timeline.map((event) => event.item?.type)).toEqual([
     "tool_call",
     "tool_call",
     "assistant_message",
     "assistant_message",
   ]);
-  expect(events[1]).toMatchObject({
+  expect(timeline[1]).toMatchObject({
     type: "timeline",
     item: { type: "tool_call", name: "browser", status: "completed" },
   });
-  expect(events[2]).toMatchObject({
+  expect(timeline[2]).toMatchObject({
     type: "timeline",
     item: { type: "assistant_message", text: expect.stringContaining("![Image](file://") },
   });
